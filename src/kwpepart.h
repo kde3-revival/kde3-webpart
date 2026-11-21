@@ -71,7 +71,6 @@ private slots:
     void slotUnsupportedContent( const QString& url, const QString& mimeType );
     void slotHistoryNavigationRequested( int steps );
     void slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
-    void slotCopyAvailable( bool available );
     void slotFind();
     void slotFindDialogOk();
     void slotFindNext();

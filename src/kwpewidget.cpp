@@ -135,7 +135,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), canCopy( false ), cancellable( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), cancellable( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -162,7 +162,6 @@ public:
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
-    static void onEditorStateChanged( WebKitEditorState* state, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
     static void onFoundText( WebKitFindController*, guint matchCount, gpointer data );
     static void onFailedToFindText( WebKitFindController*, gpointer data );
@@ -186,7 +185,6 @@ public:
     QString menuLink;
     QString menuImage;
     bool menuSelection;
-    bool canCopy;
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
     gint64 lastCrashReload;      // when the page was reloaded after a crash
@@ -263,7 +261,6 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
     g_signal_connect( view, "web-process-terminated", G_CALLBACK( onWebProcessTerminated ), this );
     g_signal_connect( view, "permission-request", G_CALLBACK( onPermissionRequest ), this );
-    g_signal_connect( webkit_web_view_get_editor_state( view ), "changed", G_CALLBACK( onEditorStateChanged ), this );
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
     g_signal_connect( finder, "found-text", G_CALLBACK( onFoundText ), this );
@@ -285,7 +282,6 @@ void KWPEWidgetPrivate::destroy()
     if ( !view )
         return;
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
-    g_signal_handlers_disconnect_by_data( webkit_web_view_get_editor_state( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
     g_object_unref( cancellable );
@@ -574,16 +570,6 @@ gboolean KWPEWidgetPrivate::onContextMenu( WebKitWebView*, WebKitContextMenu*, W
     return TRUE;   // WPE has no menu of its own
 }
 
-void KWPEWidgetPrivate::onEditorStateChanged( WebKitEditorState* state, gpointer data )
-{
-    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
-    bool canCopy = webkit_editor_state_is_copy_available( state );
-    if ( canCopy != d->canCopy ) {
-        d->canCopy = canCopy;
-        emit d->q->copyAvailable( canCopy );
-    }
-}
-
 void KWPEWidgetPrivate::onSelectionText( GObject* view, GAsyncResult* result, gpointer )
 {
     GError* error = 0;
@@ -773,15 +759,22 @@ void KWPEWidget::findNext( bool forward )
 void KWPEWidget::copySelection()
 {
     // The selected text into the X clipboard.  (WebKit's own copy goes
-    // to WPE's clipboard, which is not the X one yet.)
+    // to WPE's clipboard, which is not the X one yet.)  In a script world
+    // of our own: the page cannot replace getSelection() or toString()
+    // to choose what is copied.  Selections in text fields are not in
+    // getSelection(); password fields are not copied.
+    static const char script[] =
+        "(function() {"
+        "  var e = document.activeElement;"
+        "  if (e && (e.tagName == 'INPUT' || e.tagName == 'TEXTAREA')) {"
+        "    if (e.type == 'password') return '';"
+        "    try { return e.value.substring(e.selectionStart, e.selectionEnd); } catch (x) { return ''; }"
+        "  }"
+        "  return window.getSelection().toString();"
+        "})()";
     if ( d->view )
-        webkit_web_view_evaluate_javascript( d->view, "window.getSelection().toString()", -1, 0, 0, d->cancellable,
+        webkit_web_view_evaluate_javascript( d->view, script, -1, "kwpepart", 0, d->cancellable,
                                              KWPEWidgetPrivate::onSelectionText, 0 );
-}
-
-bool KWPEWidget::hasSelection() const
-{
-    return d->canCopy;
 }
 
 void KWPEWidget::reloadAfterCrash()

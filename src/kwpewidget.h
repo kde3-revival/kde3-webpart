@@ -62,9 +62,7 @@ public:
     bool canZoomIn() const;
     bool canZoomOut() const;
 
-    /** Text is selected (in the page or in a field). */
-    bool hasSelection() const;
-    /** The selected text into the clipboard. */
+    /** The selected text (in the page or in a field) into the clipboard. */
     void copySelection();
 
     QString url() const;
@@ -125,8 +123,6 @@ signals:
     void webProcessFailed( bool crashed );
     /** zoom() changed (setZoom(), Ctrl+wheel). */
     void zoomChanged( int percent );
-    /** hasSelection() changed. */
-    void copyAvailable( bool available );
 
 protected:
     virtual bool event( QEvent* e );

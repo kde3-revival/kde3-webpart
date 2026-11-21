@@ -121,17 +121,25 @@ void KWPEDownload::askDestination()
     start.setFileName( name );
     name = start.url();
 
+    // The dialogs run event loops: WebKit may end the download meanwhile
+    // and finish() delete this (deleteLater() runs in nested loops too).
+    QGuardedPtr<KWPEDownload> self( this );
     QWidget* parent = m_window ? m_window->topLevelWidget() : 0;
     KURL destination;
     for ( ;; ) {
         destination = KFileDialog::getSaveURL( name, QString::null, parent,
                                                i18n( "Save As - %1" ).arg( m_source.prettyURL() ) );
+        if ( !self )
+            return;
         if ( !destination.isValid() || !destination.isLocalFile() || !QFile::exists( destination.path() ) )
             break;
-        if ( KMessageBox::warningContinueCancel( parent,
+        int answer = KMessageBox::warningContinueCancel( parent,
                  i18n( "A file named \"%1\" already exists. Are you sure you want to overwrite it?" )
                      .arg( destination.fileName() ),
-                 i18n( "Overwrite File?" ), i18n( "Overwrite" ) ) == KMessageBox::Continue )
+                 i18n( "Overwrite File?" ), i18n( "Overwrite" ) );
+        if ( !self )
+            return;
+        if ( answer == KMessageBox::Continue )
             break;
         name = destination.url();
     }

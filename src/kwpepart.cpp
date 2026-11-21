@@ -75,8 +75,9 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( historyNavigationRequested( int ) ), SLOT( slotHistoryNavigationRequested( int ) ) );
     connect( m_view, SIGNAL( contextMenuRequested( const QString&, const QString&, bool, const QPoint& ) ),
              SLOT( slotContextMenu( const QString&, const QString&, bool, const QPoint& ) ) );
-    connect( m_view, SIGNAL( copyAvailable( bool ) ), SLOT( slotCopyAvailable( bool ) ) );
-    m_ext->enableAction( "copy", false );
+    // Always: WPE does not report selection changes (WebKitEditorState
+    // never changes with the WPE platform API); copying nothing does nothing.
+    m_ext->enableAction( "copy", true );
     connect( m_view, SIGNAL( findResult( bool, unsigned ) ), SLOT( slotFindResult( bool, unsigned ) ) );
 
     KStdAction::find( this, SLOT( slotFind() ), actionCollection(), "find" );
@@ -384,11 +385,6 @@ void KWPEPart::slotZoomChanged( int percent )
     m_zoomOut->setEnabled( m_view->canZoomOut() );
     m_zoomNormal->setEnabled( percent != 100 );
     emit setStatusBarText( i18n( "Zoom: %1%" ).arg( percent ) );
-}
-
-void KWPEPart::slotCopyAvailable( bool available )
-{
-    m_ext->enableAction( "copy", available );
 }
 
 // ---------------------------------------------------------------------
