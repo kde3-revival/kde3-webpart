@@ -445,6 +445,14 @@ struct ViewState
     KWPE::FrameStats stats;
     double latencySum;
     gint64 lastFrameTime;
+    // input -> frame on screen (noteInput())
+    bool pendingBigDamage;      // the pending frame changed a quarter of the view or more
+    gint64 inputPending;        // oldest input not answered by a frame yet
+    gint64 lastInput;           // the last input of the current burst
+    gint64 lastFrameAfterInput;
+    double inputLatencySum;
+    double settleSum;
+    unsigned settleCount;
 };
 
 std::vector<ViewState*> s_views;
@@ -481,6 +489,21 @@ static void releaseBuffer( ViewState* st, WPEBuffer* buffer )
     g_object_unref( buffer );
 }
 
+// A burst of input is over when nothing was shown for 300 ms: its last
+// frame is when the page came to rest.
+static void endInputBurst( ViewState* st, gint64 now )
+{
+    if ( !st->lastInput || !st->lastFrameAfterInput || st->inputPending || now - st->lastFrameAfterInput < 300000 )
+        return;
+    double settle = ( st->lastFrameAfterInput - st->lastInput ) / 1000.0;
+    st->settleSum += settle;
+    st->settleCount++;
+    if ( settle > st->stats.settleMaxMs )
+        st->stats.settleMaxMs = settle;
+    st->lastInput = 0;
+    st->lastFrameAfterInput = 0;
+}
+
 static void frameDone( ViewState* st, gint64 now )
 {
     if ( !st->framePending )
@@ -499,6 +522,19 @@ static void frameDone( ViewState* st, gint64 now )
             st->stats.maxIntervalMs = interval;
     }
     st->lastFrameTime = now;
+    if ( st->inputPending && st->pendingBigDamage ) {
+        double latency = ( now - st->inputPending ) / 1000.0;
+        st->stats.inputFrames++;
+        st->inputLatencySum += latency;
+        if ( latency > st->stats.inputLatencyMaxMs )
+            st->stats.inputLatencyMaxMs = latency;
+        st->inputPending = 0;
+    }
+    // A frame long after the last one (an overlay scrollbar fading out)
+    // ends the burst instead of belonging to it.
+    endInputBurst( st, now );
+    if ( st->lastInput && st->pendingBigDamage )
+        st->lastFrameAfterInput = now;
 
     WPEBuffer* buffer = st->pending;
     st->pending = 0;
@@ -780,8 +816,13 @@ static gboolean kwpeViewRenderBuffer( WPEView* view, WPEBuffer* buffer, const WP
     if ( s_debugLevel > 2 )
         for ( size_t i = 0; i < damage.size(); ++i )
             debugLog( "damage %d,%d %dx%d", damage[i].x, damage[i].y, damage[i].width, damage[i].height );
+    unsigned damaged = 0;
     for ( size_t i = 0; i < damage.size(); ++i )
-        st->stats.damagePixels += unsigned( damage[i].width ) * damage[i].height;
+        damaged += unsigned( damage[i].width ) * damage[i].height;
+    st->stats.damagePixels += damaged;
+    // Statistics: a frame that answers scrolling changes much of the view
+    // (not an overlay scrollbar fading out, a caret blinking).
+    st->pendingBigDamage = damaged >= unsigned( width ) * unsigned( height ) / 4;
     st->pendingSince = g_get_monotonic_time();
 
     if ( WPE_IS_BUFFER_DMA_BUF( buffer ) ) {
@@ -1167,12 +1208,34 @@ FrameStats takeFrameStats( WPEView* view )
     ViewState* st = viewState( view );
     if ( !st )
         return result;
+    endInputBurst( st, g_get_monotonic_time() );
     result = st->stats;
     if ( result.frames )
         result.latencyMs = st->latencySum / result.frames;
+    if ( result.inputFrames )
+        result.inputLatencyMs = st->inputLatencySum / result.inputFrames;
+    if ( st->settleCount )
+        result.settleMs = st->settleSum / st->settleCount;
+    result.bursts = st->settleCount;
     st->stats = FrameStats();
     st->latencySum = 0;
+    st->inputLatencySum = 0;
+    st->settleSum = 0;
+    st->settleCount = 0;
     return result;
+}
+
+void noteInput( WPEView* view )
+{
+    ViewState* st = viewState( view );
+    if ( !st )
+        return;
+    gint64 now = g_get_monotonic_time();
+    endInputBurst( st, now );
+    if ( !st->inputPending )
+        st->inputPending = now;
+    st->lastInput = now;
+    st->lastFrameAfterInput = 0;
 }
 
 }

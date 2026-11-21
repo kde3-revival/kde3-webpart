@@ -71,6 +71,12 @@ struct FrameStats
     double latencyMs;       /// average render_buffer -> PresentCompleteNotify
     double maxIntervalMs;   /// longest gap between two shown frames
     unsigned damagePixels;  /// damaged pixels (total)
+    unsigned inputFrames;   /// frames that answered input (noteInput())
+    double inputLatencyMs;  /// average input -> first frame on screen
+    double inputLatencyMaxMs;
+    unsigned bursts;        /// bursts of input that ended (nothing shown for 300 ms)
+    double settleMs;        /// average last input of a burst -> its last frame
+    double settleMaxMs;
 };
 
 /**
@@ -111,6 +117,12 @@ bool handleXEvent( XEvent* ev );
 bool sendKeyEvent( WPEView* view, bool press );
 
 FrameStats takeFrameStats( WPEView* view );
+
+/**
+ * Statistics: input (a wheel event) was sent to @p view; the next frame
+ * on screen answers it (FrameStats::inputLatencyMs, settleMs).
+ */
+void noteInput( WPEView* view );
 
 }
 

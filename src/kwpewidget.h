@@ -91,6 +91,9 @@ public:
     /** "DMA-BUF" or "SHM": how frames reach the X server. */
     static QString bufferPathName();
 
+    /** The settings of kwpepartrc (smooth scrolling) for every view. */
+    static void applySettings();
+
 signals:
     void loadStarted();
     /**

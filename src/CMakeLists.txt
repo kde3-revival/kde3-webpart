@@ -4,6 +4,7 @@ kde3_add_module(libkwpepart
     wpex11platform.cpp
     kwpewidget.cpp
     kwpedownload.cpp
+    kwpesettings.cpp
     kwpepart.cpp
   MOC
     kwpewidget.h

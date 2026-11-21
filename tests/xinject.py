@@ -3,7 +3,8 @@
 # the command line, with python-xlib.
 #
 #   xinject.py DISPLAY move X Y | click X Y [BUTTON] | wheel X Y NOTCHES
-#              | key KEYSYM [MODIFIER...] | type TEXT | sleep MS ...
+#              | wheelms X Y NOTCHES MS | key KEYSYM [MODIFIER...]
+#              | type TEXT | sleep MS ...
 #
 # The display is always given explicitly and must not be :0 (the real
 # desktop): XTest input goes wherever DISPLAY points.
@@ -99,8 +100,12 @@ def main(args):
             xtest.fake_input(d, X.ButtonPress, button)
             xtest.fake_input(d, X.ButtonRelease, button)
             flush()
-        elif cmd == 'wheel':
+        elif cmd in ('wheel', 'wheelms'):
             x, y, n = int(args[i + 1]), int(args[i + 2]), int(args[i + 3])
+            interval = 0.03
+            if cmd == 'wheelms':
+                interval = int(args[i + 4]) / 1000.0
+                i += 1
             i += 4
             xtest.fake_input(d, X.MotionNotify, x=x, y=y)
             flush()
@@ -109,7 +114,7 @@ def main(args):
                 xtest.fake_input(d, X.ButtonPress, button)
                 xtest.fake_input(d, X.ButtonRelease, button)
                 flush()
-                time.sleep(0.03)
+                time.sleep(interval)
         elif cmd == 'key':
             sym = XK.string_to_keysym(args[i + 1])
             i += 2

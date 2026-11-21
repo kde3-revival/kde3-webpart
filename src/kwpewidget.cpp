@@ -34,6 +34,7 @@
 #include <kstandarddirs.h>
 
 #include "kwpedownload.h"
+#include "kwpesettings.h"
 #include "kwpewidget.h"
 #include "wpex11platform.h"
 
@@ -116,7 +117,7 @@ static bool ensureWebKit()
     webkit_web_context_set_cache_model( s_context, WEBKIT_CACHE_MODEL_WEB_BROWSER );
 
     s_settings = webkit_settings_new();
-    webkit_settings_set_enable_smooth_scrolling( s_settings, TRUE );
+    KWPEWidget::applySettings();
     webkit_settings_set_enable_developer_extras( s_settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
     // Explicit, whatever WebKit's defaults: file: pages read no other
     // files, scripts open no windows by themselves.
@@ -985,6 +986,19 @@ KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString
     return HistoryNavigating;
 }
 
+void KWPEWidget::applySettings()
+{
+    if ( !s_settings )
+        return;
+    // Animated scrolling lags behind a fast wheel (every notch extends the
+    // animation): off unless asked for.  "When efficient": with the GPU
+    // path, where frames cost little.
+    KWPESettings::SmoothScrolling smooth = KWPESettings::smoothScrolling();
+    bool on = smooth == KWPESettings::SmoothAlways
+              || ( smooth == KWPESettings::SmoothWhenEfficient && KWPE::bufferPath() == KWPE::PathDMABuf );
+    webkit_settings_set_enable_smooth_scrolling( s_settings, on );
+}
+
 QString KWPEWidget::bufferPathName()
 {
     return KWPE::bufferPath() == KWPE::PathDMABuf ? QString::fromLatin1( "DMA-BUF" ) : QString::fromLatin1( "SHM" );
@@ -1221,14 +1235,20 @@ void KWPEWidget::wheelEvent( QWheelEvent* e )
         return;
     }
     // Wheel notches (120 per notch, positive away from the user) as
-    // WebKit's discrete steps (positive: scroll up/left); WebKit animates
-    // them (smooth scrolling).  Pixel-precise XI2.1 scrolling: later.
-    double steps = e->delta() / 120.0;
+    // WebKit's discrete steps (positive: scroll up/left), which it scrolls
+    // by a "line step" of view height^(2/3) pixels (100 for a 1000 pixel
+    // high view) and animates if smooth scrolling is on.  KDE's "scroll by
+    // N lines" (3 by default) scales them.  Not precise deltas: WebKit
+    // would report 120 * delta / 2.5 as the DOM's wheelDelta.  Pixel-
+    // precise XI2.1 scrolling: later.
+    double steps = e->delta() / 120.0 * QApplication::wheelScrollLines() / 3.0;
     bool horizontal = e->orientation() == Qt::Horizontal;
     WPEEvent* event = wpe_event_scroll_new( d->wpeView, WPE_INPUT_SOURCE_MOUSE, d->eventTime(),
                                             WPEModifiers( wpeModifiers( e->state() ) ),
                                             horizontal ? steps : 0.0, horizontal ? 0.0 : steps,
                                             FALSE, FALSE, e->x(), e->y() );
+    if ( d->statsEnabled )
+        KWPE::noteInput( d->wpeView );
     wpe_view_event( d->wpeView, event );
     wpe_event_unref( event );
     e->accept();
@@ -1261,11 +1281,16 @@ void KWPEWidget::printFrameStats()
     if ( !d->wpeView )
         return;
     KWPE::FrameStats s = KWPE::takeFrameStats( d->wpeView );
-    if ( !s.frames )
-        return;
-    fprintf( stderr, "kwpe: %s %u fps (%u DMA-BUF), latency %.1f ms, max gap %.1f ms, copy %.2f ms, damage %.2f Mpx\n",
-             bufferPathName().latin1(), s.frames, s.dmabufFrames, s.latencyMs, s.maxIntervalMs, s.copyMs,
-             s.damagePixels / 1e6 );
+    if ( s.frames )
+        fprintf( stderr, "kwpe: %s %u fps (%u DMA-BUF), latency %.1f ms, max gap %.1f ms, copy %.2f ms, damage %.2f Mpx\n",
+                 bufferPathName().latin1(), s.frames, s.dmabufFrames, s.latencyMs, s.maxIntervalMs, s.copyMs,
+                 s.damagePixels / 1e6 );
+    if ( s.inputFrames )
+        fprintf( stderr, "kwpe: wheel -> frame on screen: %.1f ms average, %.1f ms max (%u frames)\n",
+                 s.inputLatencyMs, s.inputLatencyMaxMs, s.inputFrames );
+    if ( s.bursts )
+        fprintf( stderr, "kwpe: last wheel event -> page at rest: %.1f ms average, %.1f ms max (%u bursts)\n",
+                 s.settleMs, s.settleMaxMs, s.bursts );
 }
 
 #include "kwpewidget.moc"

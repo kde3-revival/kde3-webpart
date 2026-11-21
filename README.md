@@ -6,7 +6,7 @@ pages with [WPE WebKit](https://wpewebkit.org/): `KWPEPart`, a
 
 Status: **stage 2 in progress.**  Pages load and render, links, forms,
 scripts, back/forward through Konqueror's history, title, progress,
-padlock, status bar text and smooth (animated) wheel scrolling work, on
+padlock, status bar text and wheel scrolling work, on
 the GPU (DMA-BUF) or through shared memory.  Stage 2 so far: downloads
 through KDE's save dialog and KIO's progress window, Konqueror's context
 menus, find in page, zoom, persistent cookies, HTTP authentication,
@@ -104,7 +104,20 @@ One `WebKitWebContext` and `WebKitNetworkSession` per process (data in
 `WebKitWebView` and one WPE toplevel per widget.  Qt events become WPE
 events: resize, show/hide (map/unmap), focus, window activation, mouse
 buttons (WPE counts double clicks), motion, enter/leave, wheel notches
-as discrete scroll steps (WebKit animates them: smooth scrolling), keys.
+as discrete scroll steps, keys.
+
+**Wheel scrolling**: a notch is one discrete WebKit step (WebKit
+scrolls by a "line step" of view height^(2/3) pixels: 100 for a view
+1000 pixels high), scaled by KDE's "scroll by N lines" (3: one step).
+Not as precise (pixel) deltas: WebKit would then report 120 × delta /
+2.5 as the DOM's `wheelDelta`.  WebKit's smooth scrolling (an animation
+of every step) is **off** by default: with a fast wheel every notch
+extends the animation and the page lags behind the wheel (see the
+measurements).  `[Settings] SmoothScrolling` in `kwpepartrc` = `Never`
+(default), `WhenEfficient` (on the GPU/DMA-BUF path only) or `Always`;
+without it the same key of `khtmlrc` (`[KHTML Settings]`, KDE 4's name)
+is read.  The settings are read again in every Konqueror process when
+one changes them (DCOP signal `KWPEPartSettings changed()`).
 While the page has the focus, keys without Ctrl/Alt/Meta go to the page
 rather than to Konqueror's single-key shortcuts (`AccelOverride`), F-keys
 and Escape stay Konqueror's; Tab moves inside the page.
@@ -210,7 +223,7 @@ Environment variables:
 | --- | --- |
 | `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports |
 | `KWPE_DEBUG=2` / `3` | also every Present completion / every damage rectangle |
-| `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; time to commit, first paint and load end |
+| `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel event → first frame on screen, last wheel event of a burst → page at rest; time to commit, first paint and load end |
 | `KWPE_FORCE_SHM=1` | shared memory even when DRI3 is there (to compare) |
 | `KWPE_EPHEMERAL=1` | no data or cache directories |
 | `KWPE_CANVAS_ACCELERATION=1` | GPU 2D canvas (off by default, see below) |
@@ -257,6 +270,19 @@ The SHM path costs a full-frame GPU read-back in the web process and a
 copy of the damage in the part; the DMA-BUF path costs neither.  In
 Xephyr (SHM, software X server) wheel scrolling of Wikipedia also runs
 at 55–60 fps.
+
+### Wheel latency (2026-11-21)
+
+Xephyr (SHM path, software X server), kwpeview 1600×1000, `long.html`,
+`tests/scrollbench.sh`: the time from Qt's wheel event to the first
+frame on screen that changed a quarter of the view or more, and from the
+last wheel event of a burst to the last such frame (the page at rest).
+
+| | smooth scrolling on (before) | off (now the default) |
+| --- | --- | --- |
+| single notch: first frame | 39 ms | 40 ms |
+| single notch: page at rest | 141 ms | 40 ms |
+| 25 notches 12 ms apart: page at rest after the last one | 261 ms | 56 ms |
 
 ## Known problems
 
