@@ -14,9 +14,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <qdir.h>
 #include <qfile.h>
+#include <qfileinfo.h>
 #include <qmap.h>
 #include <qregexp.h>
 #include <qtimer.h>
@@ -74,7 +76,7 @@ struct Download
 struct State
 {
     State() : enabled( true ), rules( 0 ), store( 0 ), setSerial( 0 ), loadSerial( 0 ), loadStart( 0 ), loadPending( 0 ),
-              loadFailed( false ), loadFromUpdate( false ), updating( false ), job( 0 ), includes( 0 ), process( 0 ) {}
+              loadFailed( false ), loadFromUpdate( false ), updating( false ), job( 0 ), total( 0 ), includes( 0 ), process( 0 ) {}
 
     bool enabled;
     QValueList<KWPEAdBlock::List> lists;
@@ -109,6 +111,7 @@ struct State
     KIO::Job* job;
     Download current;
     QByteArray data;
+    KIO::filesize_t total;      // announced size of the download (0: unknown)
     unsigned includes;
     QStringList files;          // the lists for the converter
     QStringList errors;
@@ -308,7 +311,11 @@ void KWPEAdBlock::readConfig()
         l.custom = true;
         s.lists.append( l );
     }
-    s.sites = c->readListEntry( "DisabledSites" );
+    s.sites.clear();
+    QStringList sites = c->readListEntry( "DisabledSites" );
+    for ( QStringList::ConstIterator it = sites.begin(); it != sites.end(); ++it )
+        if ( !normalizedHost( *it ).isEmpty() )
+            s.sites.append( normalizedHost( *it ) );
     s.filterIds = c->readListEntry( "Filters" );
     s.lastUpdate = readTime( c, "LastUpdate" );
     s.lastAttempt = readTime( c, "LastAttempt" );
@@ -402,7 +409,7 @@ void KWPEAdBlock::setSiteDisabled( const QString& host, bool disabled )
     if ( disabled ) {
         if ( isSiteDisabled( h ) )
             return;
-        s.sites.append( h.startsWith( "www." ) ? h.mid( 4 ) : h );
+        s.sites.append( h );
     } else {
         // every entry that covers the host (a parent domain too)
         QStringList keep;
@@ -534,7 +541,10 @@ void KWPEAdBlock::filtersLoaded( unsigned )
             finishUpdate( false, i18n( "The compiled filters could not be loaded." ) );
         } else {
             if ( !s.updating ) {
-                // The store lost them (deleted, another WebKit version): anew.
+                // The store lost them (deleted, another WebKit version
+                // that does not read them): compile anew, now.
+                s.filterIds.clear();
+                s.lastUpdate = QDateTime();
                 s.lastAttempt = QDateTime();
                 QTimer::singleShot( 0, this, SLOT( checkSchedule() ) );
             }
@@ -598,7 +608,13 @@ void KWPEAdBlock::updateNow()
     if ( s.updating )
         return;
     // One process at a time (Konqueror may run several).
-    s.lock = new KLockFile( baseDir() + "update.lock" );
+    // A lock older than an update can take (a crashed process whose PID
+    // was given to another one, another host): gone.
+    QString lockPath = baseDir() + "update.lock";
+    QFileInfo lockInfo( lockPath );
+    if ( lockInfo.exists() && lockInfo.lastModified().addSecs( 1800 ) < QDateTime::currentDateTime() )
+        QFile::remove( lockPath );
+    s.lock = new KLockFile( lockPath );
     s.lock->setStaleTime( 1800 );
     // With LockNoBlock a first look only reads who holds the lock; the
     // second one takes it over if that process is gone.
@@ -615,7 +631,10 @@ void KWPEAdBlock::updateNow()
     s.files.clear();
     s.queue.clear();
     s.includes = 0;
-    s.newPrefix = QString( filterPrefix ) + QString::number( QDateTime::currentDateTime().toTime_t() );
+    s.newPrefix = QString( filterPrefix ) + QString::number( QDateTime::currentDateTime().toTime_t() ) + "p"
+                  + QString::number( getpid() );
+    if ( s.filterIds.grep( s.newPrefix + "-" ).count() )
+        s.newPrefix += "b";
     s.lastAttempt = QDateTime::currentDateTime();
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
@@ -645,6 +664,7 @@ void KWPEAdBlock::downloadNext()
     s.current = s.queue.first();
     s.queue.remove( s.queue.begin() );
     s.data = QByteArray();
+    s.total = 0;
     if ( !isAllowedURL( s.current.url ) ) {
         s.errors.append( i18n( "%1: neither an https URL nor a local file" ).arg( s.current.listName ) );
         downloadNext();
@@ -663,6 +683,7 @@ void KWPEAdBlock::downloadNext()
     connect( job, SIGNAL( data( KIO::Job*, const QByteArray& ) ), SLOT( slotData( KIO::Job*, const QByteArray& ) ) );
     connect( job, SIGNAL( redirection( KIO::Job*, const KURL& ) ), SLOT( slotRedirection( KIO::Job*, const KURL& ) ) );
     connect( job, SIGNAL( result( KIO::Job* ) ), SLOT( slotResult( KIO::Job* ) ) );
+    connect( job, SIGNAL( totalSize( KIO::Job*, KIO::filesize_t ) ), SLOT( slotTotalSize( KIO::Job*, KIO::filesize_t ) ) );
 }
 
 void KWPEAdBlock::slotData( KIO::Job* job, const QByteArray& data )
@@ -681,12 +702,18 @@ void KWPEAdBlock::slotData( KIO::Job* job, const QByteArray& data )
     memcpy( s.data.data() + size, data.data(), data.size() );
 }
 
+void KWPEAdBlock::slotTotalSize( KIO::Job* job, KIO::filesize_t size )
+{
+    if ( job == s.job )
+        s.total = size;
+}
+
 void KWPEAdBlock::slotRedirection( KIO::Job* job, const KURL& url )
 {
     if ( job != s.job )
         return;
     // https only; an included file stays on the host of its list
-    if ( isAllowedURL( url ) && ( !s.current.include || url.host() == s.current.url.host() ) )
+    if ( url.protocol() == "https" && isAllowedURL( url ) && ( !s.current.include || url.host() == s.current.url.host() ) )
         return;
     s.job = 0;
     job->kill( true );
@@ -707,9 +734,21 @@ void KWPEAdBlock::slotResult( KIO::Job* job )
         for ( unsigned i = 0; ok && i < s.data.size(); ++i )
             if ( s.data[i] == 0 )
                 ok = false;
+        // All of it: a body cut short (a connection closed early, no
+        // length) would end in half a filter, which blocks more.
+        if ( s.total && KIO::filesize_t( s.data.size() ) < s.total )
+            ok = false;
         text = QString::fromUtf8( s.data.data(), s.data.size() );
-        QString head = text.left( 512 ).lower();
-        if ( head.contains( "<html" ) || head.contains( "<!doctype" ) || text.stripWhiteSpace().isEmpty() )
+        if ( ok && !text.endsWith( "\n" ) ) {
+            int last = text.findRev( '\n' );
+            text.truncate( last < 0 ? 0 : last + 1 );
+            s.data.resize( text.utf8().length() );
+            memcpy( s.data.data(), text.utf8().data(), s.data.size() );
+        }
+        // a filter list starts with its header ("[Adblock Plus 2.0]",
+        // "! Title: ..."), not with HTML (a captive portal)
+        QString head = text.left( 512 ).stripWhiteSpace();
+        if ( !( head.startsWith( "[" ) || head.startsWith( "!" ) ) || head.lower().contains( "<html" ) )
             ok = false;
         if ( !ok )
             s.errors.append( i18n( "%1: not a filter list" ).arg( s.current.listName ) );
@@ -856,7 +895,9 @@ void KWPEAdBlock::finishUpdate( bool ok, const QString& message )
     }
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
-    if ( ok ) {
+    // A download that failed (offline) is tried again in an hour, not in
+    // a week, even though the last copies were used.
+    if ( ok && s.errors.isEmpty() ) {
         s.lastUpdate = QDateTime::currentDateTime();
         c->writeEntry( "LastUpdate", s.lastUpdate.toTime_t() );
     }

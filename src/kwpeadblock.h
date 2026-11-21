@@ -17,6 +17,8 @@
 #include <qstringlist.h>
 #include <qvaluelist.h>
 
+#include <kio/global.h>
+
 // WebKit's type, without GLib (Qt 3's "signals" macro, see kwpewidget.h)
 typedef struct _WebKitUserContentManager WebKitUserContentManager;
 
@@ -72,7 +74,7 @@ public:
 
     /** The site list contains @p host or a parent domain of it. */
     bool isSiteDisabled( const QString& host ) const;
-    /** Blocking off (on) for @p host; "www." is left out. */
+    /** Blocking off (on) for @p host (and its subdomains). */
     void setSiteDisabled( const QString& host, bool disabled );
     QStringList disabledSites() const;
     void setDisabledSites( const QStringList& sites );
@@ -106,6 +108,7 @@ private slots:
     void checkSchedule();
     void slotData( KIO::Job* job, const QByteArray& data );
     void slotRedirection( KIO::Job* job, const KURL& url );
+    void slotTotalSize( KIO::Job* job, KIO::filesize_t size );
     void slotResult( KIO::Job* job );
     void slotConverterOutput( KProcess* process, char* buffer, int length );
     void slotConverterExited( KProcess* process );

@@ -139,7 +139,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 {
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
-        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -185,6 +185,7 @@ public:
     QString title;
     QString deferredURL;   // load() waits for the ad blocker's filters
     bool reloadForFilters; // the ad blocker switched for this page after it was requested
+    bool redirected;       // the load was redirected (no reload for the filters)
     bool loading;
     bool failed;           // the current load failed (WebKit still sends LOAD_FINISHED)
     bool ownBackForward;   // goToHistoryToken() asked for this back/forward navigation
@@ -393,12 +394,14 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     switch ( event ) {
     case WEBKIT_LOAD_STARTED:
         d->reloadForFilters = false;
+        d->redirected = false;
         d->loading = true;
         d->failed = false;
         d->loadStart = g_get_monotonic_time();
         emit d->q->loadStarted();
         break;
     case WEBKIT_LOAD_REDIRECTED:
+        d->redirected = true;
         break;
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
@@ -582,12 +585,16 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
         // one where it is on, or the other way round: the filters switch
         // before WebKit commits the page and loads what it needs.  Its
         // element hiding was decided with the previous ones: reloaded
-        // after the commit (not an answer to POST).
+        // after the commit, unless a second request could do harm: an
+        // answer to POST, the end of a redirect (logins, payments: one-
+        // time codes).  (Pages Konqueror opens, typed or from another
+        // program, get the right filters before they are requested.)
         if ( webkit_response_policy_decision_is_main_frame_main_resource( response ) ) {
-            bool switched = KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8(
-                webkit_uri_response_get_uri( webkit_response_policy_decision_get_response( response ) ) ) ).host() );
+            QString uri = QString::fromUtf8( webkit_uri_response_get_uri( webkit_response_policy_decision_get_response( response ) ) );
+            KURL responseURL( uri );
+            bool switched = KWPEAdBlock::self()->setViewHost( d->contentManager, responseURL.host() );
             const char* method = webkit_uri_request_get_http_method( webkit_response_policy_decision_get_request( response ) );
-            if ( switched && ( !method || g_ascii_strcasecmp( method, "GET" ) == 0 ) )
+            if ( switched && ( !method || g_ascii_strcasecmp( method, "GET" ) == 0 ) && !d->redirected )
                 d->reloadForFilters = true;
         }
         if ( webkit_response_policy_decision_is_main_frame_main_resource( response )

@@ -188,8 +188,24 @@ int main()
         // the excluded site is a parent of the included one: no site left
         dropped( "||x.com^$domain=sub.a.com|~a.com", "domain-empty" );
     }
-    dropped( "||x.com^$domain=example.*", "domain-unsupported" );
-    dropped( "||x.com^$domain=~example.*", "domain-unsupported" );
+    {
+        // uBlock entities: the name with any public suffix
+        std::vector<Rule> r = convert( "||x.com^$domain=example.*" );
+        const Rule* b = findRule( r, "block" );
+        expectEq( "entity site", b ? join( b->ifDomain ) : "", "example.*" );
+        Rule top;
+        top.urlFilter = "^[a-z][a-z0-9.+-]*://([^/?#]*\\.)?example\\.[^/:?#]+[:/]";
+        ++checks;
+        if ( ABP::toJSON( r ).find( "example\\\\.[^/:?#]+[:/]" ) == std::string::npos || !matches( top, "https://www.example.co.uk/" )
+             || matches( top, "https://example/" ) || matches( top, "https://myexample.com/" ) )
+            fail( "entity site pattern: " + ABP::toJSON( r ) );
+    }
+    {
+        // an exception with entities stays tied to them (not global)
+        std::vector<Rule> r = convert( "||gpt.example^$script\n@@||gpt.example/tag.js$script,domain=gentside.*|ohmymag.*" );
+        const Rule* e = findRule( r, "ignore-previous-rules" );
+        expectEq( "exception with entities", e ? join( e->ifDomain ) : "", "gentside.*,ohmymag.*" );
+    }
     dropped( "||x.com^$redirect=noopjs", "option-redirect" );
     dropped( "||x.com^$csp=script-src 'none'", "option-csp" );
     dropped( "||x.com^$removeparam=utm_source", "option-removeparam" );
@@ -248,6 +264,43 @@ int main()
     }
     dropped( "@@*$document", "exception-everything" );
 
+    // --- from the review ----------------------------------------------
+    {
+        // the carve-out of an $important block comes after it
+        std::vector<Rule> r = convert( "||ads.example^$important,domain=a.com|~b.a.com" );
+        expectEq( "important carve-out order", r.size() == 2 ? r[0].action + " " + r[1].action : std::to_string( r.size() ),
+                  "block ignore-previous-rules" );
+    }
+    dropped( "||track.example^$elemhide", "hide-option-on-block" );
+    dropped( "/x{,3}/$image", "regex-syntax" );
+    dropped( "/(ads)?/$script", "matches-everything" );
+    dropped( "^$script,third-party", "matches-everything" );
+    dropped( "||void.example/rec$method=post", "option-method" );
+    {
+        std::vector<Rule> r = convert( "||x.com^$script\n@@||x.com/ok$method=post" );
+        const Rule* e = findRule( r, "ignore-previous-rules" );
+        expectEq( "exception $method: any method", e ? "[" + e->requestMethod + "]" : "", "[]" );
+    }
+    network( "/[\\w-.]+\\.example\\//", "https://a-b.example/", true );
+    network( "/[\\w-~]x/", "https://a/{x", false );
+    {
+        ABP::Stats stats;
+        std::vector<Rule> r = convert( "||baz.example^$script,third-party\n||baz.example^$third-party,script,badfilter", &stats );
+        expectEq( "badfilter, other option order", std::to_string( r.size() ) + " " + std::to_string( stats.badfiltered ), "0 2" );
+    }
+    {
+        std::vector<Rule> r = convert( "!#if env_safari\n||safari.example^\n!#else\n||other.example^\n!#endif" );
+        expectEq( "env_safari", r.size() == 1 ? r[0].urlFilter.substr( r[0].urlFilter.rfind( ")?" ) + 2 ) : std::to_string( r.size() ),
+                  "safari\\.example[^a-zA-Z0-9_.%-]" );
+    }
+    {
+        // exceptions: what cannot be said matches more (blocks less)
+        std::vector<Rule> r = convert( "||img.example^\n@@/img\\.example\\/[a-z0-9]{32}\\b/$image" );
+        const Rule* e = findRule( r, "ignore-previous-rules" );
+        expectEq( "widened exception", e ? e->urlFilter : "", "img\\.example/[a-z0-9][a-z0-9]*" );
+        dropped( "/[a-z0-9]{32}\\b/$image", "regex-repeat" );
+    }
+
     // --- cosmetic -------------------------------------------------------
     {
         std::vector<Rule> r = convert( "##.ad\na.com#@#.ad" );
@@ -283,7 +336,11 @@ int main()
     dropped( "a.com##^script:has-text(ad)", "html-filter" );
     dropped( "a.com#?#.x:-abp-contains(Ad)", "extended-css" );
     dropped( "a.com#$#abort-on-property-read x", "snippet-or-css-injection" );
-    dropped( "example.*##.ad", "cosmetic-domain" );
+    {
+        std::vector<Rule> r = convert( "example.*##.ad" );
+        const Rule* c = findRule( r, "css-display-none" );
+        expectEq( "entity cosmetic", c ? join( c->ifDomain ) : "", "example.*" );
+    }
     dropped( "a.com##.x[", "cosmetic-syntax" );
 
     // --- sites as top URL patterns (not WebKit's if-domain) -----------

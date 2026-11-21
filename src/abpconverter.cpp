@@ -80,17 +80,19 @@ static bool domainWithin( const std::string& a, const std::string& b )
     return a == b || ( a.size() > b.size() && endsWith( a, b ) && a[a.size() - b.size() - 1] == '.' );
 }
 
-// A domain WebKit accepts in if-domain/unless-domain: punycode, lower case.
-// uBlock's entities ("example.*") and regular expressions cannot be said.
+// A site: punycode, lower case; uBlock's entities ("example.*": any
+// public suffix) too, they become a top URL pattern (siteFilters()).
+// Regular expressions cannot be said.
 static bool normalizeDomain( std::string& domain )
 {
     domain = lower( trim( domain ) );
     if ( startsWith( domain, "*." ) )
         domain = domain.substr( 2 );
-    if ( domain.empty() || domain.size() > 253 || domain[0] == '.' || domain[domain.size() - 1] == '.' )
+    std::string name = endsWith( domain, ".*" ) ? domain.substr( 0, domain.size() - 2 ) : domain;
+    if ( name.empty() || name.size() > 253 || name[0] == '.' || name[name.size() - 1] == '.' )
         return false;
-    for ( size_t i = 0; i < domain.size(); ++i ) {
-        char c = domain[i];
+    for ( size_t i = 0; i < name.size(); ++i ) {
+        char c = name[i];
         if ( !( ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) || c == '.' || c == '-' || c == '_' ) )
             return false;
     }
@@ -141,11 +143,15 @@ static std::vector<std::string> siteFilters( const std::vector<std::string>& dom
     filters.reserve( domains.size() );
     for ( size_t i = 0; i < domains.size(); ++i ) {
         std::string f = "^[a-z][a-z0-9.+-]*://([^/?#]*\\.)?";
-        for ( size_t k = 0; k < domains[i].size(); ++k ) {
-            if ( domains[i][k] == '.' )
+        bool entity = endsWith( domains[i], ".*" );
+        std::string name = entity ? domains[i].substr( 0, domains[i].size() - 2 ) : domains[i];
+        for ( size_t k = 0; k < name.size(); ++k ) {
+            if ( name[k] == '.' )
                 f += '\\';
-            f += domains[i][k];
+            f += name[k];
         }
+        if ( entity )
+            f += "\\.[^/:?#]+";   // example.* : example.com, example.co.uk, ...
         f += "[:/]";
         filters.push_back( f );
     }
@@ -302,7 +308,9 @@ struct RegexParser
     size_t i;
     std::string whyNot;
 
-    RegexParser( const std::string& source ) : s( source ), i( 0 ) {}
+    bool widen;   // an exception: what cannot be said matches more
+
+    RegexParser( const std::string& source, bool wider ) : s( source ), i( 0 ), widen( wider ) {}
 
     bool fail( const char* why )
     {
@@ -363,7 +371,7 @@ struct RegexParser
                 if ( e == 'd' )
                     out += "0-9";
                 else if ( e == 'w' )
-                    out += "a-zA-Z0-9_";
+                    out += "_a-zA-Z0-9";   // ends with a range: "[\\w-.]" stays a "-"
                 else if ( ( e >= 'a' && e <= 'z' ) || ( e >= 'A' && e <= 'Z' ) || ( e >= '0' && e <= '9' ) )
                     return fail( "regex-class-escape" );
                 else {
@@ -421,6 +429,7 @@ struct RegexParser
             else if ( e == 'D' ) alts.push_back( "[^0-9]" );
             else if ( e == 'w' ) alts.push_back( "[a-zA-Z0-9_]" );
             else if ( e == 'W' ) alts.push_back( "[^a-zA-Z0-9_]" );
+            else if ( ( e == 'b' || e == 'B' ) && widen ) { alts.push_back( std::string() ); return true; }
             else if ( e == 'b' || e == 'B' ) return fail( "regex-word-boundary" );
             else if ( ( e >= 'a' && e <= 'z' ) || ( e >= 'A' && e <= 'Z' ) || ( e >= '0' && e <= '9' ) )
                 return fail( "regex-escape" );
@@ -502,7 +511,8 @@ struct RegexParser
                 unsigned lo = 0, hi = 0;
                 bool open = false;
                 size_t comma = spec.find( ',' );
-                if ( spec.empty() || spec.find_first_not_of( "0123456789," ) != std::string::npos )
+                // "{,3}" is three characters in JavaScript, not a repeat
+                if ( spec.empty() || spec[0] == ',' || spec.find_first_not_of( "0123456789," ) != std::string::npos )
                     return fail( "regex-syntax" );
                 if ( comma == std::string::npos ) {
                     lo = hi = unsigned( atoi( spec.c_str() ) );
@@ -513,7 +523,14 @@ struct RegexParser
                     else
                         hi = unsigned( atoi( spec.substr( comma + 1 ).c_str() ) );
                 }
-                if ( lo > maxRepeat || ( !open && ( hi < lo || hi > maxRepeat ) ) || alts.size() != 1 )
+                if ( alts.size() != 1 || ( !open && hi < lo ) )
+                    return fail( "regex-repeat" );
+                if ( widen && ( lo > maxRepeat || hi > maxRepeat ) ) {
+                    // an exception: "one or more" (or "any") instead
+                    open = true;
+                    lo = lo ? 1 : 0;
+                }
+                if ( lo > maxRepeat || ( !open && hi > maxRepeat ) )
                     return fail( "regex-repeat" );
                 std::string a = alts[0];
                 std::string r;
@@ -541,13 +558,13 @@ struct RegexParser
     }
 };
 
-bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlFilters, std::string& whyNot )
+bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlFilters, std::string& whyNot, bool widen )
 {
     if ( !isASCII( regex ) ) {
         whyNot = "non-ascii";
         return false;
     }
-    RegexParser p( regex );
+    RegexParser p( regex, widen );
     std::vector<std::string> alts;
     if ( !p.parseAlternatives( alts, 0 ) || p.i != regex.size() ) {
         whyNot = p.whyNot.empty() ? "regex-syntax" : p.whyNot;
@@ -561,6 +578,52 @@ bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlF
             return false;
         }
         urlFilters.push_back( f );
+    }
+    return true;
+}
+
+// Can the url-filter (WebKit's subset, as written here) match an empty
+// string?  WebKit then applies the rule to every load.
+bool canMatchEmpty( const std::string& filterIn )
+{
+    std::string f = filterIn;
+    if ( !f.empty() && f[0] == '^' )
+        f.erase( 0, 1 );
+    if ( !f.empty() && f[f.size() - 1] == '$' && ( f.size() < 2 || f[f.size() - 2] != '\\' ) )
+        f.erase( f.size() - 1 );
+    size_t i = 0;
+    while ( i < f.size() ) {
+        size_t start = i;
+        std::string inner;
+        bool group = false;
+        if ( f[i] == '\\' ) {
+            i += 2;
+        } else if ( f[i] == '[' ) {
+            ++i;
+            if ( i < f.size() && f[i] == '^' ) ++i;
+            if ( i < f.size() && f[i] == ']' ) ++i;
+            while ( i < f.size() && f[i] != ']' )
+                i += f[i] == '\\' ? 2 : 1;
+            ++i;
+        } else if ( f[i] == '(' ) {
+            int depth = 0;
+            for ( ; i < f.size(); ++i ) {
+                if ( f[i] == '\\' ) { ++i; continue; }
+                if ( f[i] == '[' ) { while ( i < f.size() && f[i] != ']' ) i += f[i] == '\\' ? 2 : 1; continue; }
+                if ( f[i] == '(' ) ++depth;
+                else if ( f[i] == ')' && --depth == 0 ) { ++i; break; }
+            }
+            inner = f.substr( start + 1, i - start - 2 );
+            group = true;
+        } else {
+            ++i;
+        }
+        char q = i < f.size() ? f[i] : 0;
+        if ( q == '?' || q == '*' || q == '+' )
+            ++i;
+        bool optional = q == '?' || q == '*';
+        if ( !optional && !( group && canMatchEmpty( inner ) ) )
+            return false;
     }
     return true;
 }
@@ -608,8 +671,9 @@ bool Converter::active() const
     return true;
 }
 
-// uBlock's "!#if": every environment token is false here (we are none of
-// the browsers it knows), "!" negates; && and || from left to right.
+// uBlock's "!#if": env_safari is true (its Safari variants are written
+// for WebKit's content blockers), every other token false; "!" negates;
+// && and || from left to right.
 static bool evalCondition( const std::string& expr )
 {
     std::string e;
@@ -636,7 +700,7 @@ static bool evalCondition( const std::string& expr )
             neg = !neg;
             tok.erase( 0, 1 );
         }
-        bool v = neg;   // every token is false
+        bool v = ( tok == "env_safari" ) != neg;
         if ( op == 0 )
             result = v;
         else if ( op == '&' )
@@ -735,6 +799,12 @@ static size_t cosmeticSeparator( const std::string& f, std::string& kind )
         ++pos;
     }
     return std::string::npos;
+}
+
+static size_t cosmeticSeparatorPos( const std::string& f )
+{
+    std::string kind;
+    return cosmeticSeparator( f, kind );
 }
 
 // uBlock's procedural cosmetic operators, ABP's extended selectors: they
@@ -991,10 +1061,12 @@ void Converter::convertNetwork( const std::string& filterIn )
             } else if ( opt == "all" ) {
                 types |= defaultTypes | TPopup | TDocument;
             } else if ( opt == "method" ) {
-                if ( value.find( '|' ) != std::string::npos || value.empty() || value[0] == '~' )
-                    methodUnsupported = true;
-                else
-                    method = lower( value );
+                // WebKit compares request-method with the method of the
+                // document, not of the request: blocks are dropped, an
+                // exception applies to every method.
+                methodUnsupported = true;
+            } else if ( exception && ( opt == "to" || opt == "denyallow" ) ) {
+                // narrows an exception: without it, it applies more widely
             } else if ( opt == "_" || opt == "badfilter" ) {
                 // uBlock's no-op option; badfilter was handled before
             } else {
@@ -1006,6 +1078,13 @@ void Converter::convertNetwork( const std::string& filterIn )
                 return;
             }
         }
+    }
+
+    // $elemhide & co. say something only about exceptions; on a blocking
+    // filter (an error in a list) they must not leave a block of everything
+    if ( !exception && ( elemhide || generichide || specifichide ) ) {
+        drop( "hide-option-on-block" );
+        return;
     }
 
     // document-level exceptions
@@ -1020,7 +1099,7 @@ void Converter::convertNetwork( const std::string& filterIn )
         if ( !patternEmpty ) {
             if ( isRegex ) {
                 std::vector<std::string> filters;
-                if ( !regexToURLFilters( pattern, filters, why ) ) {
+                if ( !regexToURLFilters( pattern, filters, why, true ) ) {
                     drop( why.c_str() );
                     return;
                 }
@@ -1112,7 +1191,7 @@ void Converter::convertNetwork( const std::string& filterIn )
                 unlessDomain.push_back( exclude[e] );
         }
         if ( methodUnsupported ) {
-            drop( "method" );
+            drop( "option-method" );
             return;
         }
     } else {
@@ -1133,7 +1212,7 @@ void Converter::convertNetwork( const std::string& filterIn )
     std::vector<std::string> urlFilters;
     std::string why;
     if ( isRegex ) {
-        if ( !regexToURLFilters( pattern, urlFilters, why ) ) {
+        if ( !regexToURLFilters( pattern, urlFilters, why, exception ) ) {
             drop( why.c_str() );
             return;
         }
@@ -1152,6 +1231,14 @@ void Converter::convertNetwork( const std::string& filterIn )
     if ( !exception && urlFilters.size() == 1 && urlFilters[0] == ".*" && ifDomain.empty() && ( effective & ~TPing ) ) {
         drop( "matches-everything" );
         return;
+    }
+    // A pattern that can match nothing at all ("/(ads)?/", "^"): WebKit
+    // applies it to every load.
+    for ( size_t k = 0; !exception && k < urlFilters.size(); ++k ) {
+        if ( urlFilters[k] != ".*" && canMatchEmpty( urlFilters[k] ) ) {
+            drop( "matches-everything" );
+            return;
+        }
     }
 
     for ( size_t k = 0; k < urlFilters.size(); ++k ) {
@@ -1176,42 +1263,53 @@ void Converter::convertNetwork( const std::string& filterIn )
                 spare.action = "ignore-previous-rules";
                 spare.ifDomain = carveOut;
                 spare.unlessDomain.clear();
-                m_exceptions.push_back( spare );
+                // after the block it spares ($important ones come after
+                // every other exception)
+                ( important ? m_importantCarveOuts : m_exceptions ).push_back( spare );
             }
         }
     }
 }
 
+// A network filter with its options sorted and "badfilter" left out
+// (*badfilter: it was there).
+static std::string canonicalFilter( const std::string& f, bool* badfilter )
+{
+    *badfilter = false;
+    size_t dollar = f.rfind( '$' );
+    if ( dollar == std::string::npos || cosmeticSeparatorPos( f ) != std::string::npos )
+        return f;
+    std::vector<std::string> opts = split( f.substr( dollar + 1 ), ',' ), keep;
+    for ( size_t k = 0; k < opts.size(); ++k ) {
+        std::string o = trim( opts[k] );
+        if ( lower( o ) == "badfilter" )
+            *badfilter = true;
+        else
+            keep.push_back( o );
+    }
+    std::sort( keep.begin(), keep.end() );
+    std::string key = f.substr( 0, dollar );
+    for ( size_t k = 0; k < keep.size(); ++k )
+        key += ( k ? "," : "$" ) + keep[k];
+    return key;
+}
+
 std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRules )
 {
-    // $badfilter: the filter it names (without the option) is disabled.
+    // $badfilter: the filter it names (without the option, options in any
+    // order) is disabled, and itself.
     for ( size_t i = 0; i < m_filters.size(); ++i ) {
-        const std::string& f = m_filters[i];
-        size_t dollar = f.rfind( '$' );
-        if ( dollar == std::string::npos || f.find( "badfilter", dollar ) == std::string::npos )
-            continue;
-        std::vector<std::string> opts = split( f.substr( dollar + 1 ), ',' );
-        std::string rest;
         bool bad = false;
-        for ( size_t k = 0; k < opts.size(); ++k ) {
-            if ( trim( opts[k] ) == "badfilter" ) {
-                bad = true;
-                continue;
-            }
-            if ( !rest.empty() )
-                rest += ',';
-            rest += opts[k];
-        }
-        if ( !bad )
-            continue;
-        m_badfilters.insert( f );
-        m_badfilters.insert( rest.empty() ? f.substr( 0, dollar ) : f.substr( 0, dollar + 1 ) + rest );
+        std::string key = canonicalFilter( m_filters[i], &bad );
+        if ( bad )
+            m_badfilters.insert( key );
     }
-
     for ( size_t i = 0; i < m_filters.size(); ++i ) {
         const std::string& f = m_filters[i];
         m_current = f;
-        if ( m_badfilters.count( f ) ) {
+        bool isBadfilter = false;
+        std::string key = m_badfilters.empty() ? std::string() : canonicalFilter( f, &isBadfilter );
+        if ( isBadfilter || ( !m_badfilters.empty() && m_badfilters.count( key ) ) ) {
             stats.badfiltered++;
             continue;
         }
@@ -1285,6 +1383,7 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
     // exceptions (which do)
     std::vector<Rule> tail = m_exceptions;
     tail.insert( tail.end(), m_important.begin(), m_important.end() );
+    tail.insert( tail.end(), m_importantCarveOuts.begin(), m_importantCarveOuts.end() );
     tail.insert( tail.end(), m_documentExceptions.begin(), m_documentExceptions.end() );
     // css: generic ones before any ignore-previous-rules: WebKit puts those
     // into one style sheet for every page

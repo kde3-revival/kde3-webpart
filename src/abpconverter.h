@@ -113,6 +113,7 @@ private:
     // results
     std::vector<Rule> m_block;              // network blocks
     std::vector<Rule> m_important;          // $important blocks: after the exceptions
+    std::vector<Rule> m_importantCarveOuts; // ~sub.site of an $important block: after it
     std::vector<Rule> m_exceptions;         // network exceptions (any list)
     std::vector<Rule> m_documentExceptions; // $document: whole pages, cancels everything
     std::vector<Rule> m_elemhideExceptions; // $elemhide: no cosmetic filtering on the page
@@ -140,8 +141,15 @@ private:
  */
 bool patternToURLFilter( const std::string& pattern, std::string& urlFilter, std::string& whyNot );
 
-/** A "/regex/" filter as WebKit url-filters (alternatives expanded). */
-bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlFilters, std::string& whyNot );
+/**
+ * A "/regex/" filter as WebKit url-filters (alternatives expanded).
+ * @p widen (exceptions): \b is left out, a long {n,m} becomes + or *.
+ */
+bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlFilters, std::string& whyNot,
+                        bool widen = false );
+
+/** The url-filter can match an empty string (WebKit: every URL). */
+bool canMatchEmpty( const std::string& urlFilter );
 
 /** The rules as a WebKit JSON array. */
 std::string toJSON( const std::vector<Converter::Rule>& rules );

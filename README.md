@@ -208,9 +208,17 @@ in the web process; the part is not called per request.
   (a rule that blocks more than its list says breaks sites):
   `$redirect`, `$csp`, `$removeparam`, `$denyallow`, `$to`, scriptlets
   (`##+js`), procedural cosmetics (`:has-text`, `:upward`, `:style`, ...),
-  HTML filters, regular expressions with `\b`, look-around or long
-  `{n,m}`, uBlock's `example.*` entities, unknown options.  Exceptions
-  that cannot be read completely apply more widely (blocking less).
+  HTML filters, `$method` (WebKit compares it with the *page's* method),
+  regular expressions with `\b`, look-around or long `{n,m}`, patterns
+  that could match an empty URL, `$elemhide` & co. on blocking filters,
+  unknown options.  Exceptions that cannot be read completely apply more
+  widely (blocking less): sites they cannot name are left out, `\b` is
+  left out and a long `{n,m}` becomes `+`/`*`, `$to`/`$denyallow`/
+  `$method` are ignored; other unknown options (`$genericblock`, ...)
+  drop the exception.  uBlock's `example.*` entities become a site
+  pattern with any suffix; in `!#if` blocks `env_safari` is true (those
+  variants are written for WebKit's content blockers), every other
+  token false; `$badfilter` matches whatever the order of options.
   Network patterns become WebKit's regex subset (`||` host anchor, `^`
   separator also at the end of the address, `|` anchors, escaping);
   `/regex/` filters are rewritten (`\d`, `\w`, small `{n,m}`, alternatives
@@ -248,7 +256,17 @@ in the web process; the part is not called per request.
   *requests* a page, so the part sets the filters before the loads it
   starts (typed URLs, history); a link or redirect that crosses between
   a site with and one without blocking switches them when the response
-  arrives (before the page commits) and loads the page once more.
+  arrives (before the page commits) and loads the page once more —
+  not an answer to POST and not the end of a redirect (a login or
+  payment callback must not be requested twice), those keep the element
+  hiding of the previous site.  The site entry is the host as shown
+  (`www.google.com`, not all of `google.com`).
+* **Downloads** must be complete: a body shorter than announced fails,
+  an unterminated last line is dropped (half a filter blocks more), a
+  list must start with its header (`[Adblock ...]` or `! ...`).  A
+  failed download is tried again in an hour even if the last copy was
+  used.  A failed load of the stored set (another WebKit version)
+  compiles anew at once.
 * **UI**: Settings → "Configure WPE WebKit..." (smooth scrolling; ad
   blocking on/off, lists with checkboxes, another list by URL, Update
   Now, last update and rule count, the sites where it is off) and a
@@ -363,12 +381,12 @@ last wheel event of a burst to the last such frame (the page at rest).
 
 `kwpe-filterconv`, EasyList + EasyPrivacy (135 486 filters): 108 995
 network blocks, 1 606 exceptions, 13 638 generic and 10 268 site
-element hiding rules, 685 dropped (0.5 %: extended CSS 289, unsupported
-sites 244, redirect 30, ...); 5 rule lists, 137 401 rules with the
+element hiding rules, 444 dropped (0.3 %: extended CSS 289, procedural
+50, redirect 30, ...); 5 rule lists, 137 401 rules with the
 repeated exceptions.  Converting 0.18 s, compiling 4.4–5.2 s, peak RSS
 of the converter 510 MiB (it exits), store 74 MB on disk (WebKit keeps
-the source too).  All five lists (163 002 filters): 16 883 dropped
-(11 593 of them uBlock scriptlets), compiling 5.9 s, 535 MiB.  The
+the source too).  All five lists (163 002 filters): 15 751 dropped
+(11 593 of them uBlock scriptlets), compiling 6.1 s, 535 MiB.  The
 first update (downloads included) takes about 6 s.
 
 In use: the set is read from the store in 20 ms; kwpeview with a still
@@ -407,7 +425,10 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 * Ad blocking: no count of blocked requests (WebKit does not report
   them); uBlock's scriptlets, procedural cosmetics, `$redirect` and
   `$removeparam` are not supported; a link between a site where ad
-  blocking is off and one where it is on loads the page twice.
+  blocking is off and one where it is on loads the page twice (after a
+  redirect it keeps the previous site's element hiding instead);
+  `$document`/`$elemhide` exceptions and site element hiding follow the
+  top page, also inside frames of other sites.
 * The DMA-BUF path was tested on Xwayland (AMD), not yet on a real Xorg
   (Fedora 44 does not package WPE WebKit; the Arch build needs glibc
   2.44).

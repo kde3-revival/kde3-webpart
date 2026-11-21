@@ -139,6 +139,11 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
 KWPEPart::~KWPEPart()
 {
     delete m_findDialog;
+    // a child of Konqueror's status bar, which outlives the part
+    if ( m_adblockLabel ) {
+        m_statusBar->removeStatusBarItem( m_adblockLabel );
+        delete static_cast<QLabel*>( m_adblockLabel );
+    }
 }
 
 KAboutData* KWPEPart::createAboutData()

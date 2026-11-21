@@ -114,7 +114,7 @@ private:
     KToggleAction* m_adblockSite;
     KAction* m_configure;
     KParts::StatusBarExtension* m_statusBar;
-    QLabel* m_adblockLabel;   // in Konqueror's status bar (made when first shown)
+    QGuardedPtr<QLabel> m_adblockLabel;   // in Konqueror's status bar (made when first shown)
 };
 
 class KWPEBrowserExtension : public KParts::BrowserExtension
