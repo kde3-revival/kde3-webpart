@@ -17,6 +17,7 @@
 #include <kdemacros.h>
 #include <klocale.h>
 #include <kparts/browserinterface.h>
+#include <kparts/event.h>
 #include <kparts/genericfactory.h>
 
 #include "kwpepart.h"
@@ -102,6 +103,13 @@ bool KWPEPart::openFile()
 {
     // openURL() hands URLs to WebKit, no local copy is ever made.
     return false;
+}
+
+void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
+{
+    // ReadOnlyPart's shows the URL.
+    if ( event->activated() )
+        emit setWindowCaption( m_view->title().isEmpty() ? m_url.prettyURL() : m_view->title() );
 }
 
 void KWPEPart::restore( const KURL& url, int token )

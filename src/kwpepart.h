@@ -51,6 +51,8 @@ public:
 
 protected:
     virtual bool openFile();
+    /** The page title as caption when the part becomes active (a tab). */
+    virtual void guiActivateEvent( KParts::GUIActivateEvent* event );
 
 private slots:
     void slotLoadStarted();
