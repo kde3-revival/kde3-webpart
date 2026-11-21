@@ -91,11 +91,16 @@ static bool ensureWebKit()
     if ( envFlag( "KWPE_EPHEMERAL" ) ) {
         s_session = webkit_network_session_new_ephemeral();
     } else {
-        // $KDEHOME/share/apps/kwpepart and the KDE cache directory
-        // (cookies stay in memory for now: KDE's cookie jar comes later).
-        QCString dataDir = QFile::encodeName( KGlobal::dirs()->saveLocation( "data", "kwpepart/" ) );
+        // Website data (local storage, IndexedDB, service workers, HSTS,
+        // ...) and cookies in $KDEHOME/share/apps/kwpepart, the HTTP cache
+        // in KDE's cache directory.  KDE's cookie policy (kcookiejar)
+        // does not apply: WebKit's default (no third-party cookies).
+        QString dataDir = KGlobal::dirs()->saveLocation( "data", "kwpepart/" );
         QCString cacheDir = QFile::encodeName( KGlobal::dirs()->saveLocation( "cache", "kwpepart/" ) );
-        s_session = webkit_network_session_new( dataDir.data(), cacheDir.data() );
+        s_session = webkit_network_session_new( QFile::encodeName( dataDir ).data(), cacheDir.data() );
+        webkit_cookie_manager_set_persistent_storage( webkit_network_session_get_cookie_manager( s_session ),
+                                                      QFile::encodeName( dataDir + "cookies.sqlite" ).data(),
+                                                      WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE );
     }
 
     g_signal_connect( s_session, "download-started", G_CALLBACK( onDownloadStarted ), 0 );
