@@ -27,6 +27,7 @@
 #include <qevent.h>
 
 #include <kglobal.h>
+#include <kurl.h>
 #include <kstandarddirs.h>
 
 #include "kwpedownload.h"
@@ -126,7 +127,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          nextToken( 1 ), menuSelection( false ), canCopy( false ), cancellable( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), canCopy( false ), cancellable( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -170,7 +171,6 @@ public:
     // history tokens <-> WebKit back/forward items (referenced)
     QMap<int, WebKitBackForwardListItem*> itemOfToken;
     QMap<WebKitBackForwardListItem*, int> tokenOfItem;
-    int nextToken;
 
     // the context menu WebKit asked for (shown outside its signal)
     QString menuLink;
@@ -302,6 +302,9 @@ int KWPEWidgetPrivate::tokenForItem( WebKitBackForwardListItem* item, bool* isNe
     QMap<WebKitBackForwardListItem*, int>::ConstIterator it = tokenOfItem.find( item );
     if ( it != tokenOfItem.end() )
         return it.data();
+    // Unique in the process: Konqueror copies history entries (with
+    // their tokens) between views, i.e. between part instances.
+    static int nextToken = 1;
     int token = nextToken++;
     g_object_ref( item );
     itemOfToken.insert( token, item );
@@ -349,6 +352,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         break;
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
+        d->ownBackForward = false;
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
         d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
@@ -360,6 +364,10 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         break;
     }
     case WEBKIT_LOAD_FINISHED:
+        // The end of a load replaced by a newer one (still loading): not
+        // the end of the newer one.
+        if ( webkit_web_view_is_loading( view ) )
+            break;
         d->loading = false;
         if ( d->failed )
             break;
@@ -370,9 +378,13 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     }
 }
 
-gboolean KWPEWidgetPrivate::onLoadFailed( WebKitWebView*, WebKitLoadEvent, gchar*, GError* error, gpointer data )
+gboolean KWPEWidgetPrivate::onLoadFailed( WebKitWebView* view, WebKitLoadEvent, gchar*, GError* error, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // A load cancelled by a newer one (openURL(), a click while loading):
+    // nothing ended for Konqueror, the newer load reports.
+    if ( g_error_matches( error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED ) && webkit_web_view_is_loading( view ) )
+        return TRUE;
     // Stopped by the user, or a response given to somebody else (see
     // onDecidePolicy): no error page, no message.
     bool quiet = g_error_matches( error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED )
@@ -391,8 +403,11 @@ void KWPEWidgetPrivate::onUriChanged( GObject*, GParamSpec*, gpointer data )
     QString uri = QString::fromUtf8( webkit_web_view_get_uri( d->view ) );
     // While loading, the URI is the provisional one: the commit reports
     // it.  Otherwise it is a navigation inside the document.
-    if ( d->loading || uri == d->url )
+    // webkit_web_view_load_uri() changes the URI at once (before
+    // LOAD_STARTED): is_loading() counts that pending request.
+    if ( d->loading || webkit_web_view_is_loading( d->view ) || uri == d->url )
         return;
+    d->ownBackForward = false;
     bool isNew = false;
     d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( d->view ) );
     d->tokenForItem( d->shownItem, &isNew );
@@ -753,7 +768,7 @@ QString KWPEWidget::title() const
 
 bool KWPEWidget::isLoading() const
 {
-    return d->loading;
+    return d->loading || ( d->view && webkit_web_view_is_loading( d->view ) );
 }
 
 bool KWPEWidget::isSecure() const
@@ -770,17 +785,21 @@ int KWPEWidget::currentHistoryToken()
     return d->tokenForItem( webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( d->view ) ), 0 );
 }
 
-bool KWPEWidget::goToHistoryToken( int token )
+KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString& url )
 {
     QMap<int, WebKitBackForwardListItem*>::ConstIterator it = d->itemOfToken.find( token );
     if ( !d->view || it == d->itemOfToken.end() )
-        return false;
+        return HistoryUnknown;
+    // A token of another page (should not happen: tokens are unique in
+    // the process): load the URL instead.
+    if ( !urlcmp( QString::fromUtf8( webkit_back_forward_list_item_get_uri( it.data() ) ), url, true, false ) )
+        return HistoryUnknown;
     WebKitBackForwardList* list = webkit_web_view_get_back_forward_list( d->view );
     if ( it.data() == webkit_back_forward_list_get_current_item( list ) )
-        return true;
+        return HistoryCurrent;
     d->ownBackForward = true;
     webkit_web_view_go_to_back_forward_list_item( d->view, it.data() );
-    return true;
+    return HistoryNavigating;
 }
 
 QString KWPEWidget::bufferPathName()

@@ -30,6 +30,7 @@
 #include <kparts/browserinterface.h>
 #include <kparts/event.h>
 #include <kparts/genericfactory.h>
+#include <kparts/partmanager.h>
 
 #include "kwpepart.h"
 #include "kwpewidget.h"
@@ -112,6 +113,10 @@ KAboutData* KWPEPart::createAboutData()
 
 bool KWPEPart::openURL( const KURL& url )
 {
+    if ( !m_view->isValid() ) {
+        emit canceled( i18n( "WPE WebKit could not be set up." ) );
+        return false;
+    }
     KParts::URLArgs args = m_ext->urlArgs();
     m_url = url;
     m_historyToken = 0;
@@ -119,7 +124,7 @@ bool KWPEPart::openURL( const KURL& url )
     emit setWindowCaption( url.prettyURL() );
 
     // Konqueror's Reload (F5): revalidate with the server, like KHTML.
-    if ( args.reload && m_view->url() == url.url() )
+    if ( args.reload && urlcmp( m_view->url(), url.url(), true, false ) )
         m_view->reload();
     else
         m_view->load( url.url() );
@@ -149,7 +154,8 @@ void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 
 void KWPEPart::restore( const KURL& url, int token )
 {
-    if ( token && token == m_view->currentHistoryToken() && m_view->url() == url.url() ) {
+    KWPEWidget::HistoryResult result = token ? m_view->goToHistoryToken( token, url.url() ) : KWPEWidget::HistoryUnknown;
+    if ( result == KWPEWidget::HistoryCurrent ) {
         // Already there (the view was not switched away).
         m_url = url;
         m_historyToken = token;
@@ -158,7 +164,7 @@ void KWPEPart::restore( const KURL& url, int token )
         emit completed();
         return;
     }
-    if ( token && m_view->goToHistoryToken( token ) ) {
+    if ( result == KWPEWidget::HistoryNavigating ) {
         m_url = url;
         m_historyToken = token;
         m_ownNavigation = true;
@@ -177,6 +183,7 @@ void KWPEPart::slotLoadStarted()
 void KWPEPart::slotUrlChanged( const QString& url, bool newItem )
 {
     KURL u( url );
+    m_lastUnsupported = QString::null;
     if ( m_ownNavigation )
         m_ownNavigation = false;
     else if ( newItem )
@@ -246,6 +253,10 @@ void KWPEPart::slotUnsupportedContent( const QString& url, const QString& mimeTy
 
 void KWPEPart::slotHistoryNavigationRequested( int steps )
 {
+    // Konqueror's goHistory() moves the active view: a script in a
+    // background tab must not move the tab the user looks at.
+    if ( manager() && manager()->activePart() != this )
+        return;
     KParts::BrowserInterface* iface = m_ext->browserInterface();
     if ( iface )
         iface->callMethod( "goHistory(int)", QVariant( steps ) );

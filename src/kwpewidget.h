@@ -80,7 +80,13 @@ public:
      * history entries.
      */
     int currentHistoryToken();
-    bool goToHistoryToken( int token );
+    enum HistoryResult { HistoryUnknown, HistoryCurrent, HistoryNavigating };
+    /**
+     * Go to the back/forward item of @p token if it shows @p url:
+     * HistoryNavigating (urlChanged() follows), HistoryCurrent (it is
+     * shown already) or HistoryUnknown (load the URL).
+     */
+    HistoryResult goToHistoryToken( int token, const QString& url );
 
     /** "DMA-BUF" or "SHM": how frames reach the X server. */
     static QString bufferPathName();
