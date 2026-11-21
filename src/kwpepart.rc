@@ -1,5 +1,5 @@
 <!DOCTYPE kpartgui SYSTEM "kpartgui.dtd">
-<kpartgui name="kwpepart" version="3">
+<kpartgui name="kwpepart" version="4">
 <MenuBar>
  <Menu name="edit"><text>&amp;Edit</text>
   <Separator />
@@ -11,6 +11,8 @@
   <Action name="zoomIn" />
   <Action name="zoomOut" />
   <Action name="zoomNormal" />
+  <Separator />
+  <Action name="viewDocumentSource" />
  </Menu>
  <Menu name="settings"><text>&amp;Settings</text>
   <Separator />

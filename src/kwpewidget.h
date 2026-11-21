@@ -65,6 +65,12 @@ public:
     /** The selected text (in the page or in a field) into the clipboard. */
     void copySelection();
 
+    /**
+     * Fetch the main resource's data as WebKit has it (no new request,
+     * also for answers to POST): sourceReady() follows.
+     */
+    void requestSource();
+
     QString url() const;
     QString title() const;
     bool isLoading() const;
@@ -140,6 +146,10 @@ signals:
     void insecureContentDetected();
     /** zoom() changed (setZoom(), Ctrl+wheel). */
     void zoomChanged( int percent );
+    /** The page's own icon (<link rel=icon>, http/https), after a load. */
+    void iconURLChanged( const QString& url );
+    /** The answer to requestSource(): the bytes of @p url. */
+    void sourceReady( const QString& url, const QByteArray& data );
 
 protected:
     virtual bool event( QEvent* e );

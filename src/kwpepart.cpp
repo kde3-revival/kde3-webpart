@@ -33,6 +33,11 @@
 #include <kparts/partmanager.h>
 #include <kparts/statusbarextension.h>
 #include <kpopupmenu.h>
+#include <krun.h>
+#include <kstandarddirs.h>
+#include <ktempfile.h>
+#include <qfile.h>
+#include <qregexp.h>
 #include <kstatusbar.h>
 #include <qlabel.h>
 #include <qtooltip.h>
@@ -121,6 +126,13 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_zoomNormal->setShortcut( KShortcut( "CTRL+0" ) );
     m_zoomNormal->setEnabled( false );
     connect( m_view, SIGNAL( zoomChanged( int ) ), SLOT( slotZoomChanged( int ) ) );
+    connect( m_view, SIGNAL( iconURLChanged( const QString& ) ), SLOT( slotIconURL( const QString& ) ) );
+
+    // KHTML's name and shortcut
+    new KAction( i18n( "View Do&cument Source" ), CTRL + Key_U, this, SLOT( slotViewSource() ),
+                 actionCollection(), "viewDocumentSource" );
+    connect( m_view, SIGNAL( sourceReady( const QString&, const QByteArray& ) ),
+             SLOT( slotSourceReady( const QString&, const QByteArray& ) ) );
     connect( m_view, SIGNAL( webProcessFailed( bool ) ), SLOT( slotWebProcessFailed( bool ) ) );
     connect( m_view, SIGNAL( insecureContentDetected() ), SLOT( updatePageSecurity() ) );
 
@@ -514,6 +526,38 @@ void KWPEPart::slotWebProcessFailed( bool crashed )
 {
     emit setStatusBarText( crashed ? i18n( "The page crashed again. Reload to try once more." )
                                    : i18n( "The page used too much memory and was stopped. Reload to show it again." ) );
+}
+
+void KWPEPart::slotIconURL( const QString& url )
+{
+    // Konqueror hands it to KDE's favicon cache (kded's favicons module),
+    // which downloads it for the location bar, the tab and bookmarks.
+    KURL icon( url );
+    if ( icon.protocol() == "http" || icon.protocol() == "https" )
+        emit m_ext->setIconURL( icon );
+}
+
+void KWPEPart::slotViewSource()
+{
+    m_view->requestSource();
+}
+
+// The page's bytes as WebKit loaded them (no second request, POST answers
+// too) in the text editor, from a temporary file KRun deletes afterwards.
+void KWPEPart::slotSourceReady( const QString& url, const QByteArray& data )
+{
+    KURL source( url );
+    QString name = source.fileName();
+    if ( name.isEmpty() )
+        name = source.host().isEmpty() ? QString::fromLatin1( "source" ) : source.host();
+    name.replace( QRegExp( "[^A-Za-z0-9._-]" ), "_" );
+    KTempFile file( locateLocal( "tmp", "kwpesource-" + name.left( 60 ) + "-" ), ".html", 0600 );
+    if ( file.status() != 0 || file.file()->writeBlock( data ) != Q_LONG( data.size() ) || !file.close() ) {
+        file.unlink();
+        emit setStatusBarText( i18n( "Could not save the page source." ) );
+        return;
+    }
+    KRun::runURL( KURL::fromPathOrURL( file.name() ), QString::fromLatin1( "text/plain" ), true );
 }
 
 void KWPEPart::slotZoomIn()

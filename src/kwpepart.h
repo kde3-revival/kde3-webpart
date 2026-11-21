@@ -87,6 +87,9 @@ private slots:
     void slotZoomOut();
     void slotZoomNormal();
     void slotZoomChanged( int percent );
+    void slotIconURL( const QString& url );
+    void slotViewSource();
+    void slotSourceReady( const QString& url, const QByteArray& data );
     void slotAdBlockSite();
     void slotConfigure();
     void updateAdBlockState();

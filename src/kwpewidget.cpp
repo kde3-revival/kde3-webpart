@@ -184,6 +184,9 @@ public:
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
+    static void onIconURL( GObject* view, GAsyncResult* result, gpointer data );
+    static void onSourceData( GObject* resource, GAsyncResult* result, gpointer data );
+    void findIcon();
     static void onFoundText( WebKitFindController*, guint matchCount, gpointer data );
     static void onFailedToFindText( WebKitFindController*, gpointer data );
 
@@ -461,6 +464,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         if ( d->statsEnabled )
             fprintf( stderr, "kwpe: finished after %.0f ms\n", ( g_get_monotonic_time() - d->loadStart ) / 1000.0 );
         emit d->q->loadFinished();
+        d->findIcon();
         break;
     }
 }
@@ -708,6 +712,80 @@ void KWPEWidgetPrivate::onSelectionText( GObject* view, GAsyncResult* result, gp
             QApplication::clipboard()->setText( selection, QClipboard::Clipboard );
     }
     g_object_unref( value );
+}
+
+// The page's icon for Konqueror (its location bar, tabs, bookmarks go
+// through KDE's favicon cache, which downloads it): of the page's
+// <link rel=icon> elements the best one for 16-32 pixels: a PNG or ICO
+// of about that size, one without sizes (an ICO has several), an SVG,
+// a large one, Apple's touch icon last; media queries are honoured.  In
+// our script world (the page cannot fake the DOM functions).  No link:
+// Konqueror asks for /favicon.ico itself.
+void KWPEWidgetPrivate::findIcon()
+{
+    static const char script[] =
+        "(function() {"
+        "  var best = '', bestScore = -1, links = document.querySelectorAll('link[rel]');"
+        "  for (var i = 0; i < links.length; i++) {"
+        "    var l = links[i], rel = (l.getAttribute('rel') || '').toLowerCase().split(/\\s+/);"
+        "    var icon = rel.indexOf('icon') >= 0;"
+        "    var apple = rel.indexOf('apple-touch-icon') >= 0 || rel.indexOf('apple-touch-icon-precomposed') >= 0;"
+        "    if (!icon && !apple) continue;"
+        "    var href = l.href;"
+        "    if (!/^https?:/i.test(href)) continue;"
+        "    var media = l.getAttribute('media');"
+        "    if (media) { try { if (!matchMedia(media).matches) continue; } catch (e) { continue; } }"
+        "    var type = (l.getAttribute('type') || '').toLowerCase();"
+        "    var sizes = (l.getAttribute('sizes') || '').toLowerCase();"
+        "    var m = sizes.match(/(\\d+)x\\d+/), size = m ? +m[1] : 0, score;"
+        "    if (apple) score = 1;"
+        "    else if (sizes == 'any' || type == 'image/svg+xml' || /\\.svgz?([?#]|$)/i.test(href)) score = 6;"
+        "    else if (!size) score = 7;"
+        "    else if (size <= 64) score = 9 - Math.abs(size - 32) / 100;"
+        "    else score = 5 - size / 10000;"
+        "    if (score > bestScore) { best = href; bestScore = score; }"
+        "  }"
+        "  return best;"
+        "})()";
+    if ( view )
+        webkit_web_view_evaluate_javascript( view, script, -1, "kwpepart", 0, cancellable, onIconURL, this );
+}
+
+void KWPEWidgetPrivate::onIconURL( GObject* view, GAsyncResult* result, gpointer data )
+{
+    GError* error = 0;
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish( WEBKIT_WEB_VIEW( view ), result, &error );
+    if ( !value ) {
+        // Cancelled: the widget is gone (data is too).
+        g_error_free( error );
+        return;
+    }
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( jsc_value_is_string( value ) ) {
+        char* text = jsc_value_to_string( value );
+        QString url = QString::fromUtf8( text );
+        g_free( text );
+        if ( !url.isEmpty() )
+            emit d->q->iconURLChanged( url );
+    }
+    g_object_unref( value );
+}
+
+void KWPEWidgetPrivate::onSourceData( GObject* resource, GAsyncResult* result, gpointer data )
+{
+    GError* error = 0;
+    gsize length = 0;
+    guchar* bytes = webkit_web_resource_get_data_finish( WEBKIT_WEB_RESOURCE( resource ), result, &length, &error );
+    if ( !bytes ) {
+        // Cancelled (the widget is gone) or no data.
+        g_clear_error( &error );
+        return;
+    }
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    QByteArray source;
+    source.duplicate( reinterpret_cast<const char*>( bytes ), length );
+    g_free( bytes );
+    emit d->q->sourceReady( QString::fromUtf8( webkit_web_resource_get_uri( WEBKIT_WEB_RESOURCE( resource ) ) ), source );
 }
 
 void KWPEWidgetPrivate::onFoundText( WebKitFindController*, guint matchCount, gpointer data )
@@ -1042,6 +1120,13 @@ void KWPEWidget::copySelection()
     if ( d->view )
         webkit_web_view_evaluate_javascript( d->view, script, -1, "kwpepart", 0, d->cancellable,
                                              KWPEWidgetPrivate::onSelectionText, 0 );
+}
+
+void KWPEWidget::requestSource()
+{
+    WebKitWebResource* resource = d->view ? webkit_web_view_get_main_resource( d->view ) : 0;
+    if ( resource )
+        webkit_web_resource_get_data( resource, d->cancellable, KWPEWidgetPrivate::onSourceData, d );
 }
 
 void KWPEWidget::askAuthentication()
