@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head><meta charset="utf-8"><title>Form test</title>
+<style>body{font-family:sans-serif;margin:2em} input,textarea{font-size:18px;width:30em}</style></head>
+<body>
+<h1>Formular</h1>
+<form action="form.html" method="get">
+<p><label>Nume: <input id="name" name="name" autofocus></label></p>
+<p><label>Text: <textarea id="text" name="text" rows="4"></textarea></label></p>
+<p><button id="send" type="submit">Trimite</button></p>
+</form>
+<p>Taste: <span id="keys"></span></p>
+<p>Valoare: <span id="value"></span></p>
+<script>
+  const keys = document.getElementById('keys');
+  document.addEventListener('keydown', e => { keys.textContent = (keys.textContent + ' ' + e.key + '/' + e.code).slice(-200); });
+  document.getElementById('name').addEventListener('input', e => { document.getElementById('value').textContent = e.target.value; document.title = 'Form: ' + e.target.value; });
+  const q = new URLSearchParams(location.search).get('name');
+  if (q) document.getElementById('value').textContent = 'trimis: ' + q;
+</script>
+</body></html>

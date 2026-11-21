@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<title>kwpepart test page</title>
+<style>
+  body { font-family: sans-serif; margin: 2em; background: #fafafa; color: #222; }
+  h1 { color: #2a5d9f; }
+  .box { width: 120px; height: 120px; background: linear-gradient(135deg, #e44, #44e); border-radius: 12px; }
+  .spin { animation: spin 2s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  nav a { margin-right: 1em; }
+  svg { border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h1>kwpepart test page</h1>
+<nav>
+  <a id="long" href="long.html">Long page</a>
+  <a id="form" href="form.html">Form (diacritice)</a>
+  <a id="anchor" href="#bottom">Anchor</a>
+  <a id="blank" href="long.html" target="_blank">New window</a>
+  <a id="still" href="still.html">Still page (idle CPU)</a>
+</nav>
+<p>Text: Șapte bănci înșiruite pe țărmul râului — ĂÂÎȘȚ ăâîșț. The quick brown fox jumps over the lazy dog.</p>
+<div style="display:flex; gap:2em; align-items:center">
+  <div class="box spin"></div>
+  <svg width="160" height="120"><circle cx="60" cy="60" r="50" fill="#3a3"/><rect x="100" y="20" width="50" height="80" fill="#fa0"/></svg>
+  <canvas id="c" width="160" height="120"></canvas>
+  <img src="img.png" width="160" height="120" alt="image">
+</div>
+<script>
+  const c = document.getElementById('c').getContext('2d');
+  c.fillStyle = '#08c'; c.fillRect(10, 10, 140, 100);
+  c.fillStyle = '#fff'; c.font = '20px sans-serif'; c.fillText('canvas', 40, 66);
+</script>
+<p style="height:1500px">Spacer.</p>
+<p id="bottom">Bottom of the page.</p>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Events</title>
+<style>body{font-family:monospace;font-size:16px;margin:1em} #log{white-space:pre}</style></head>
+<body>
+<p><a id="link" href="still.html">a link to still.html</a> | <input id="field" size="40"></p>
+<div id="log"></div>
+<script>
+  const log = document.getElementById('log');
+  let lines = [];
+  function add(s) { lines.push(s); lines = lines.slice(-30); log.textContent = lines.join('\n'); }
+  for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'focus', 'blur'])
+    window.addEventListener(t, e => add(t + ' button=' + e.button + ' x=' + e.clientX + ' y=' + e.clientY + ' detail=' + e.detail), true);
+  window.addEventListener('wheel', e => add('wheel dy=' + e.deltaY + ' mode=' + e.deltaMode), true);
+  window.addEventListener('keydown', e => add('keydown key=' + e.key + ' code=' + e.code + ' keyCode=' + e.keyCode + ' mods=' + [e.ctrlKey && 'C', e.shiftKey && 'S', e.altKey && 'A'].filter(Boolean).join('')), true);
+  window.addEventListener('keyup', e => add('keyup key=' + e.key), true);
+  document.getElementById('field').addEventListener('input', e => add('input value=' + e.target.value));
+  let moves = 0; window.addEventListener('mousemove', () => { moves++; document.title = 'moves ' + moves; });
+</script>
+</body></html>
