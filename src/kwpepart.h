@@ -77,6 +77,7 @@ private slots:
     void slotFindPrevious();
     void slotFindResult( bool found, unsigned matches );
     void slotWebProcessFailed( bool crashed );
+    void updatePageSecurity();
     void slotZoomIn();
     void slotZoomOut();
     void slotZoomNormal();

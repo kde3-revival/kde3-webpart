@@ -70,6 +70,8 @@ public:
     bool isLoading() const;
     /** https with a certificate WebKit accepted. */
     bool isSecure() const;
+    /** The (https) page loaded or ran http content. */
+    bool hasInsecureContent() const;
 
     /**
      * A token for WebKit's current back/forward item (0 if none), valid
@@ -121,6 +123,8 @@ signals:
      * again within 30 s; otherwise: out of memory).  The last frame stays.
      */
     void webProcessFailed( bool crashed );
+    /** hasInsecureContent() became true. */
+    void insecureContentDetected();
     /** zoom() changed (setZoom(), Ctrl+wheel). */
     void zoomChanged( int percent );
 

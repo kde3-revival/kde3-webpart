@@ -135,7 +135,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), cancellable( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), cancellable( 0 ), insecureContent( false ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -160,6 +160,7 @@ public:
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
+    static void onInsecureContent( WebKitWebView*, WebKitInsecureContentEvent, gpointer data );
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
@@ -187,6 +188,7 @@ public:
     bool menuSelection;
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
+    bool insecureContent;        // the page loaded http content (https page)
     gint64 lastCrashReload;      // when the page was reloaded after a crash
     unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
@@ -261,6 +263,7 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
     g_signal_connect( view, "web-process-terminated", G_CALLBACK( onWebProcessTerminated ), this );
     g_signal_connect( view, "permission-request", G_CALLBACK( onPermissionRequest ), this );
+    g_signal_connect( view, "insecure-content-detected", G_CALLBACK( onInsecureContent ), this );
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
     g_signal_connect( finder, "found-text", G_CALLBACK( onFoundText ), this );
@@ -366,6 +369,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
         d->ownBackForward = false;
+        d->insecureContent = false;
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
         d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
@@ -623,6 +627,15 @@ void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcess
     }
 }
 
+void KWPEWidgetPrivate::onInsecureContent( WebKitWebView*, WebKitInsecureContentEvent, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( d->insecureContent )
+        return;
+    d->insecureContent = true;
+    emit d->q->insecureContentDetected();
+}
+
 gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer )
 {
     // Geolocation, camera, microphone, notifications, ...: no UI to ask
@@ -817,6 +830,11 @@ QString KWPEWidget::title() const
 bool KWPEWidget::isLoading() const
 {
     return d->loading || ( d->view && webkit_web_view_is_loading( d->view ) );
+}
+
+bool KWPEWidget::hasInsecureContent() const
+{
+    return d->insecureContent;
 }
 
 bool KWPEWidget::isSecure() const

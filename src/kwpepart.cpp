@@ -45,7 +45,7 @@ KDE_EXPORT int __kde_do_not_unload = 1;
 }
 
 // Konqueror's KonqMainWindow::PageSecurity
-enum { NotCrypted = 0, Encrypted = 1 };
+enum { NotCrypted = 0, Encrypted = 1, Mixed = 2 };
 
 static const char stateMagic[] = "kwpepart-1";
 
@@ -96,6 +96,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_zoomNormal->setEnabled( false );
     connect( m_view, SIGNAL( zoomChanged( int ) ), SLOT( slotZoomChanged( int ) ) );
     connect( m_view, SIGNAL( webProcessFailed( bool ) ), SLOT( slotWebProcessFailed( bool ) ) );
+    connect( m_view, SIGNAL( insecureContentDetected() ), SLOT( updatePageSecurity() ) );
 
     setXMLFile( "kwpepart.rc" );
 }
@@ -196,7 +197,7 @@ void KWPEPart::slotUrlChanged( const QString& url, bool newItem )
     m_url = u;
     m_historyToken = m_view->currentHistoryToken();
     emit m_ext->setLocationBarURL( u.prettyURL() );
-    emit m_ext->setPageSecurity( u.protocol() == "https" && m_view->isSecure() ? Encrypted : NotCrypted );
+    updatePageSecurity();
 
     // A navigation inside the document has no load: Konqueror fills its
     // history entry on completed().
@@ -356,6 +357,14 @@ void KWPEPart::slotFindResult( bool found, unsigned matches )
         KNotifyClient::beep();
         emit setStatusBarText( i18n( "No matches found for '%1'." ).arg( m_findText ) );
     }
+}
+
+void KWPEPart::updatePageSecurity()
+{
+    int security = NotCrypted;
+    if ( m_url.protocol() == "https" && m_view->isSecure() )
+        security = m_view->hasInsecureContent() ? Mixed : Encrypted;
+    emit m_ext->setPageSecurity( security );
 }
 
 void KWPEPart::slotWebProcessFailed( bool crashed )
