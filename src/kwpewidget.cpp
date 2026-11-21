@@ -90,6 +90,10 @@ static bool ensureWebKit()
     s_settings = webkit_settings_new();
     webkit_settings_set_enable_smooth_scrolling( s_settings, TRUE );
     webkit_settings_set_enable_developer_extras( s_settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
+    // WebKit 2.54 drops the contents of GPU canvases of pages kept in the
+    // back/forward cache: going back shows them empty.  Skia's CPU canvas
+    // keeps them (KWPE_CANVAS_ACCELERATION=1 to compare).
+    webkit_settings_set_enable_2d_canvas_acceleration( s_settings, envFlag( "KWPE_CANVAS_ACCELERATION" ) );
     return true;
 }
 
@@ -100,7 +104,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 {
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
-        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ),
+        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           nextToken( 1 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -135,6 +139,7 @@ public:
     bool loading;
     bool failed;           // the current load failed (WebKit still sends LOAD_FINISHED)
     bool ownBackForward;   // goToHistoryToken() asked for this back/forward navigation
+    WebKitBackForwardListItem* shownItem;   // back/forward item of the page shown (no reference)
 
     // history tokens <-> WebKit back/forward items (referenced)
     QMap<int, WebKitBackForwardListItem*> itemOfToken;
@@ -264,6 +269,7 @@ int KWPEWidgetPrivate::tokenForItem( WebKitBackForwardListItem* item, bool* isNe
 void KWPEWidgetPrivate::forgetItems( GList* items )
 {
     if ( !items ) {
+        shownItem = 0;
         for ( QMap<int, WebKitBackForwardListItem*>::Iterator it = itemOfToken.begin(); it != itemOfToken.end(); ++it )
             g_object_unref( it.data() );
         itemOfToken.clear();
@@ -272,6 +278,8 @@ void KWPEWidgetPrivate::forgetItems( GList* items )
     }
     for ( GList* l = items; l; l = l->next ) {
         WebKitBackForwardListItem* item = WEBKIT_BACK_FORWARD_LIST_ITEM( l->data );
+        if ( item == shownItem )
+            shownItem = 0;
         QMap<WebKitBackForwardListItem*, int>::Iterator it = tokenOfItem.find( item );
         if ( it == tokenOfItem.end() )
             continue;
@@ -295,7 +303,8 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         break;
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
-        d->tokenForItem( webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) ), &isNew );
+        d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
+        d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
         d->firstPaintPending = true;
         if ( d->statsEnabled )
@@ -339,7 +348,8 @@ void KWPEWidgetPrivate::onUriChanged( GObject*, GParamSpec*, gpointer data )
     if ( d->loading || uri == d->url )
         return;
     bool isNew = false;
-    d->tokenForItem( webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( d->view ) ), &isNew );
+    d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( d->view ) );
+    d->tokenForItem( d->shownItem, &isNew );
     d->url = uri;
     emit d->q->urlChanged( uri, isNew );
 }
@@ -366,9 +376,23 @@ void KWPEWidgetPrivate::onMouseTargetChanged( WebKitWebView*, WebKitHitTestResul
     emit d->q->linkHovered( link );
 }
 
-// Steps from the current back/forward item to the nearest one with @p uri.
-static int historyStepsTo( WebKitBackForwardList* list, const char* uri )
+// How many steps a back/forward navigation to @p uri goes from @p shown,
+// the item on screen.  WebKit moved its current item to the target
+// already (and moves it back if the navigation is ignored); if it did
+// not, the nearest item with @p uri.
+static int historyStepsTo( WebKitBackForwardList* list, WebKitBackForwardListItem* shown, const char* uri )
 {
+    WebKitBackForwardListItem* current = webkit_back_forward_list_get_current_item( list );
+    if ( shown && current && shown != current ) {
+        for ( int i = 1; i <= 100; ++i ) {
+            if ( webkit_back_forward_list_get_nth_item( list, i ) == shown )
+                return -i;
+            if ( webkit_back_forward_list_get_nth_item( list, -i ) == shown )
+                return i;
+        }
+        return 0;
+    }
+
     int back = 0, forward = 0;
     GList* items = webkit_back_forward_list_get_back_list( list );   // nearest first
     int i = 1;
@@ -421,7 +445,7 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
             }
             // history.back() and friends: Konqueror owns the history, let
             // it go there (it comes back through goToHistoryToken()).
-            int steps = historyStepsTo( webkit_web_view_get_back_forward_list( view ), uri );
+            int steps = historyStepsTo( webkit_web_view_get_back_forward_list( view ), d->shownItem, uri );
             if ( steps ) {
                 webkit_policy_decision_ignore( decision );
                 emit d->q->historyNavigationRequested( steps );
