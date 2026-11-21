@@ -553,6 +553,48 @@ static void destroyShmImage( ViewState* st )
     st->backingWidth = st->backingHeight = 0;
 }
 
+// XShmAttach() reports failure (BadAccess: another IPC namespace, a
+// container) only as an asynchronous X error; this catches it.
+static int s_shmMajorOpcode = 0;
+static bool s_shmAttachFailed = false;
+static int ( *s_previousErrorHandler )( Display*, XErrorEvent* ) = 0;
+
+static int shmAttachErrorHandler( Display* dpy, XErrorEvent* error )
+{
+    if ( error->request_code == s_shmMajorOpcode && error->minor_code == 1 /* X_ShmAttach */ ) {
+        s_shmAttachFailed = true;
+        return 0;
+    }
+    return s_previousErrorHandler ? s_previousErrorHandler( dpy, error ) : 0;
+}
+
+static bool shmAttach( Display* dpy, XShmSegmentInfo* info )
+{
+    int event, error;
+    if ( !s_shmMajorOpcode && !XQueryExtension( dpy, "MIT-SHM", &s_shmMajorOpcode, &event, &error ) )
+        return false;
+    XSync( dpy, False );
+    s_shmAttachFailed = false;
+    s_previousErrorHandler = XSetErrorHandler( shmAttachErrorHandler );
+    bool ok = XShmAttach( dpy, info );
+    XSync( dpy, False );
+    XSetErrorHandler( s_previousErrorHandler );
+    if ( ok && s_shmAttachFailed ) {
+        // The server has no attachment, but Xlib's bookkeeping does.
+        XShmDetach( dpy, info );
+        XSync( dpy, False );
+    }
+    return ok && !s_shmAttachFailed;
+}
+
+// The copy below is a plain memcpy of WebKit's BGRA (little-endian
+// ARGB8888) pixels: the X image must have the same layout.
+static bool imageMatchesWebKit( const XImage* image )
+{
+    return image->bits_per_pixel == 32 && image->byte_order == LSBFirst && image->red_mask == 0xff0000
+        && image->green_mask == 0xff00 && image->blue_mask == 0xff;
+}
+
 static bool ensureShmImage( ViewState* st, int width, int height )
 {
     if ( st->image && st->backingWidth == width && st->backingHeight == height )
@@ -563,16 +605,15 @@ static bool ensureShmImage( ViewState* st, int width, int height )
     Display* dpy = d->dpy;
 
     if ( d->hasShm ) {
+        memset( &st->shmInfo, 0, sizeof( st->shmInfo ) );
         st->image = XShmCreateImage( dpy, d->visual, d->depth, ZPixmap, 0, &st->shmInfo, width, height );
         if ( st->image ) {
             st->shmInfo.shmid = shmget( IPC_PRIVATE, size_t( st->image->bytes_per_line ) * height, IPC_CREAT | 0600 );
             if ( st->shmInfo.shmid >= 0 ) {
                 st->shmInfo.shmaddr = st->image->data = static_cast<char*>( shmat( st->shmInfo.shmid, 0, 0 ) );
                 st->shmInfo.readOnly = True;
-                if ( st->shmInfo.shmaddr != reinterpret_cast<char*>( -1 ) && XShmAttach( dpy, &st->shmInfo ) ) {
-                    XSync( dpy, False );
+                if ( st->shmInfo.shmaddr != reinterpret_cast<char*>( -1 ) && shmAttach( dpy, &st->shmInfo ) )
                     st->shmAttached = true;
-                }
                 // Gone as soon as both sides detached.
                 shmctl( st->shmInfo.shmid, IPC_RMID, 0 );
             }
@@ -592,6 +633,16 @@ static bool ensureShmImage( ViewState* st, int width, int height )
         if ( !st->image )
             return false;
         st->image->data = static_cast<char*>( malloc( size_t( st->image->bytes_per_line ) * height ) );
+    }
+    if ( !imageMatchesWebKit( st->image ) ) {
+        // Depth 16 or 30, a big-endian server: would need a conversion.
+        static bool warned = false;
+        if ( !warned )
+            fprintf( stderr, "kwpe: the X visual (depth %d, %d bpp, red mask %06lx) is not 32-bit xRGB: cannot show pages\n",
+                     d->depth, st->image->bits_per_pixel, st->image->red_mask );
+        warned = true;
+        destroyShmImage( st );
+        return false;
     }
 
     st->backing = XCreatePixmap( dpy, d->root, width, height, d->depth );
@@ -651,11 +702,29 @@ static bool importDmaBuf( ViewState* st, WPEBuffer* buffer, GError** error )
         return false;
     }
 
-    // xcb sends the descriptors and closes them: give it copies.
+    // DRI3 takes no format: only what the X pixmap (depth 24, 32 bpp)
+    // means, the formats offered in the format list.
+    guint32 format = wpe_buffer_dma_buf_get_format( dmabuf );
+    if ( format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888 ) {
+        bx->importFailed = true;
+        g_set_error( error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "cannot import a DMA-BUF of format %08x", format );
+        return false;
+    }
+
+    // xcb sends the descriptors and closes them: give it copies.  A failed
+    // dup() must not reach xcb: a bad descriptor in SCM_RIGHTS shuts the
+    // whole X connection down.
     int32_t fds[4];
     guint32 strides[4] = { 0, 0, 0, 0 }, offsets[4] = { 0, 0, 0, 0 };
     for ( guint32 i = 0; i < planes; ++i ) {
         fds[i] = dup( wpe_buffer_dma_buf_get_fd( dmabuf, i ) );
+        if ( fds[i] < 0 ) {
+            for ( guint32 k = 0; k < i; ++k )
+                close( fds[k] );
+            bx->importFailed = true;
+            g_set_error( error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "cannot duplicate a DMA-BUF descriptor" );
+            return false;
+        }
         strides[i] = wpe_buffer_dma_buf_get_stride( dmabuf, i );
         offsets[i] = wpe_buffer_dma_buf_get_offset( dmabuf, i );
     }
@@ -896,6 +965,23 @@ void attachView( WPEView* view, unsigned long window, ViewHost* host )
     // A frame in flight belongs to the old window: done with it.
     if ( st->framePending )
         frameDone( st, g_get_monotonic_time() );
+    // IdleNotify of the old window never comes (the event selection died
+    // with it): its buffers are free, or WebKit runs out of them.
+    if ( st->current ) {
+        BufferX11* bx = bufferX11( st->current );
+        if ( bx )
+            bx->busy = false;
+    }
+    for ( size_t k = 0; k < st->waitingForIdle.size(); ++k ) {
+        BufferX11* bx = bufferX11( st->waitingForIdle[k] );
+        if ( bx ) {
+            bx->busy = false;
+            bx->releaseWhenIdle = false;
+        }
+        wpe_view_buffer_released( st->view, st->waitingForIdle[k] );
+        g_object_unref( st->waitingForIdle[k] );
+    }
+    st->waitingForIdle.clear();
 
     st->window = window;
     // The selection goes away with the window, no need to free it.
