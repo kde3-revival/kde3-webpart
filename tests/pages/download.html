@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>downloads</title>
+<style>body { font: 16px sans-serif; margin: 2em; } a, button, img { display: block; margin: 1em 0; }</style>
+</head>
+<body>
+<h1>Downloads</h1>
+<a id="att" href="/attachment/report.txt">Attachment (Content-Disposition)</a>
+<a id="dl" href="img.png" download="saved-image.png">&lt;a download&gt; of an image</a>
+<a id="blob" href="/blob?size=3000000">Slow 3 MB application/octet-stream (GET: Konqueror's own dialog)</a>
+<a id="slowdl" href="/blob?size=20000000" download="slow.bin">Slow 20 MB with &lt;a download&gt;</a>
+<form method="post" action="/post"><input name="field" value="ăîșț"><button id="post">POST download</button></form>
+<form method="post" action="/postraw"><input name="raw" value="x"><button id="postraw">POST, octet-stream without attachment</button></form>
+<img id="img" src="img.png" width="160" height="120" alt="image">
+<p>Find me: needle, NEEDLE, needle.</p>
+</body>
+</html>

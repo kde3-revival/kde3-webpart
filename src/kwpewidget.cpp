@@ -28,6 +28,7 @@
 #include <kglobal.h>
 #include <kstandarddirs.h>
 
+#include "kwpedownload.h"
 #include "kwpewidget.h"
 #include "wpex11platform.h"
 
@@ -51,6 +52,18 @@ static int kwpeX11EventFilter( XEvent* event )
     if ( KWPE::handleXEvent( event ) )
         return 1;
     return s_previousFilter ? s_previousFilter( event ) : 0;
+}
+
+// The KWPEWidget of a WebKitWebView (0 once the widget is gone).
+static const char widgetKey[] = "kwpe-widget";
+
+// A download WebKit starts (attachment, <a download>, downloadURL()):
+// KDE's save dialog and KIO's progress window.
+static void onDownloadStarted( WebKitNetworkSession*, WebKitDownload* download, gpointer )
+{
+    WebKitWebView* view = webkit_download_get_web_view( download );
+    QWidget* widget = view ? static_cast<QWidget*>( g_object_get_data( G_OBJECT( view ), widgetKey ) ) : 0;
+    KWPEDownload::start( download, widget );
 }
 
 static bool envFlag( const char* name )
@@ -83,6 +96,8 @@ static bool ensureWebKit()
         QCString cacheDir = QFile::encodeName( KGlobal::dirs()->saveLocation( "cache", "kwpepart/" ) );
         s_session = webkit_network_session_new( dataDir.data(), cacheDir.data() );
     }
+
+    g_signal_connect( s_session, "download-started", G_CALLBACK( onDownloadStarted ), 0 );
 
     s_context = webkit_web_context_new();
     webkit_web_context_set_cache_model( s_context, WEBKIT_CACHE_MODEL_WEB_BROWSER );
@@ -194,6 +209,7 @@ void KWPEWidgetPrivate::create()
                                           "settings", s_settings,
                                           NULL ) );
     wpeView = webkit_web_view_get_wpe_view( view );
+    g_object_set_data( G_OBJECT( view ), widgetKey, q );
 
     // One WPE toplevel per widget: the size and activity WebKit sees.
     toplevel = wpe_view_get_toplevel( wpeView );
@@ -231,6 +247,7 @@ void KWPEWidgetPrivate::destroy()
         return;
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( view, this );
+    g_object_set_data( G_OBJECT( view ), widgetKey, 0 );
     KWPE::attachView( wpeView, 0, 0 );
     forgetItems( 0 );
     webkit_web_view_try_close( view );
@@ -459,6 +476,13 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
         WebKitResponsePolicyDecision* response = WEBKIT_RESPONSE_POLICY_DECISION( decision );
         if ( webkit_response_policy_decision_is_main_frame_main_resource( response )
              && !webkit_response_policy_decision_is_mime_type_supported( response ) ) {
+            // The answer to a POST cannot be fetched again by Konqueror:
+            // WebKit downloads it.
+            const char* method = webkit_uri_request_get_http_method( webkit_response_policy_decision_get_request( response ) );
+            if ( method && g_ascii_strcasecmp( method, "GET" ) != 0 ) {
+                webkit_policy_decision_download( decision );
+                return TRUE;
+            }
             WebKitURIResponse* r = webkit_response_policy_decision_get_response( response );
             QString uri = QString::fromUtf8( webkit_uri_response_get_uri( r ) );
             QString mimeType = QString::fromLatin1( webkit_uri_response_get_mime_type( r ) );
@@ -516,6 +540,13 @@ void KWPEWidget::load( const QString& url )
 {
     if ( d->view )
         webkit_web_view_load_uri( d->view, url.utf8().data() );
+}
+
+void KWPEWidget::downloadURL( const QString& url )
+{
+    // WebKit's "download-started" takes it from here (onDownloadStarted).
+    if ( d->view )
+        g_object_unref( webkit_web_view_download_uri( d->view, url.utf8().data() ) );
 }
 
 void KWPEWidget::reload( bool bypassCache )

@@ -3,9 +3,11 @@ kde3_add_module(libkwpepart
   SOURCES
     wpex11platform.cpp
     kwpewidget.cpp
+    kwpedownload.cpp
     kwpepart.cpp
   MOC
     kwpewidget.h
+    kwpedownload.h
     kwpepart.h
   LINK
     KDE3::kparts

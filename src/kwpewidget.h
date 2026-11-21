@@ -39,6 +39,11 @@ public:
     void load( const QString& url );
     void reload( bool bypassCache = false );
     void stop();
+    /**
+     * Download @p url with WebKit (its cookies): KDE's save dialog, KIO's
+     * progress window (see KWPEDownload).
+     */
+    void downloadURL( const QString& url );
 
     QString url() const;
     QString title() const;
