@@ -225,6 +225,7 @@ public:
     bool suppressDialogs;        // "no more dialogs from this page" (until the next page)
     QValueList<WebKitScriptDialog*> quietDialogs;   // answered without asking, after WebKit's signal (ref)
     void answerQuietDialogs();
+    void closePageDialogs();
     QGuardedPtr<QWidget> pageDialog;   // file chooser or script dialog (KWPEFileChooser): the page takes no input
     bool insecureContent;        // the page loaded http content (https page)
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
@@ -335,8 +336,7 @@ void KWPEWidgetPrivate::destroy()
     if ( !view )
         return;
     // A dialog of the page answers WebKit (cancelled) while the view lives.
-    delete static_cast<QWidget*>( pageDialog );
-    answerQuietDialogs();
+    closePageDialogs();
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
@@ -443,6 +443,10 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         d->ownBackForward = false;
         d->insecureContent = false;
         d->suppressDialogs = false;
+        // Another page (also after a web process swap): the old page's
+        // dialogs must not stay over it (WebKit closes them only when the
+        // view goes).
+        d->closePageDialogs();
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
         d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
@@ -747,7 +751,9 @@ void KWPEWidgetPrivate::findIcon()
         "  }"
         "  return best;"
         "})()";
-    if ( view )
+    // KDE's favicon cache is on disk and fetched by kded: not for a
+    // session that keeps nothing.
+    if ( view && !envFlag( "KWPE_EPHEMERAL" ) )
         webkit_web_view_evaluate_javascript( view, script, -1, "kwpepart", 0, cancellable, onIconURL, this );
 }
 
@@ -801,6 +807,8 @@ void KWPEWidgetPrivate::onFailedToFindText( WebKitFindController*, gpointer data
 void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // Its dialogs died with it.
+    d->closePageDialogs();
     bool wasLoading = d->loading;
     d->loading = false;
     d->failed = true;
@@ -897,8 +905,18 @@ gboolean KWPEWidgetPrivate::onScriptDialog( WebKitWebView* view, WebKitScriptDia
     }
     KWPEScriptDialog* box = new KWPEScriptDialog( dialog, origin, d->q );
     QObject::connect( box, SIGNAL( suppressRequested() ), d->q, SLOT( suppressDialogs() ) );
+    // A navigation Konqueror asked for (openURL()) does not happen: the
+    // part shows the page's URL again.
+    QObject::connect( box, SIGNAL( stayedOnPage() ), d->q, SIGNAL( loadHandedOff() ) );
     d->showPageDialog( box );
     return TRUE;
+}
+
+// Answer (cancel) the page's open dialog and the queued ones.
+void KWPEWidgetPrivate::closePageDialogs()
+{
+    delete static_cast<QWidget*>( pageDialog );
+    answerQuietDialogs();
 }
 
 void KWPEWidgetPrivate::answerQuietDialogs()

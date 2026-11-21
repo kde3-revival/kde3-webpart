@@ -33,6 +33,8 @@
 #include <kparts/partmanager.h>
 #include <kparts/statusbarextension.h>
 #include <kpopupmenu.h>
+#include <kapplication.h>
+#include <kprotocolinfo.h>
 #include <krun.h>
 #include <kstandarddirs.h>
 #include <ktempfile.h>
@@ -403,10 +405,19 @@ void KWPEPart::slotUnsupportedContent( const QString& url, const QString& mimeTy
 void KWPEPart::slotExternalURL( const QString& url )
 {
     // Konqueror runs the mail program for mailto:, embeds KIO's view of
-    // ftp:, smb:, ... (as for links in KHTML).
+    // ftp:, smb:, ... (as for links in KHTML).  KDE's URL policy first
+    // (KHTML's check), and no local schemes (system:, settings:, help:,
+    // programs:, ...) from a page that is not local itself.
+    KURL target( url );
+    if ( !kapp->authorizeURLAction( "redirect", m_url, target )
+         || ( KProtocolInfo::protocolClass( target.protocol() ) == ":local"
+              && KProtocolInfo::protocolClass( m_url.protocol() ) != ":local" ) ) {
+        emit setStatusBarText( i18n( "This page may not open %1" ).arg( target.prettyURL() ) );
+        return;
+    }
     KParts::URLArgs args;
     args.metaData()["referrer"] = m_url.url();
-    emit m_ext->openURLRequest( KURL( url ), args );
+    emit m_ext->openURLRequest( target, args );
 }
 
 void KWPEPart::slotHistoryNavigationRequested( int steps )

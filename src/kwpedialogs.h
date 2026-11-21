@@ -84,6 +84,8 @@ public:
 
 signals:
     void suppressRequested();
+    /** "Stay on Page": the navigation that asked does not happen. */
+    void stayedOnPage();
 
 protected:
     virtual void done( int result );

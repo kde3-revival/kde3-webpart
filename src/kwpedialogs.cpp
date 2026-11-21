@@ -23,7 +23,6 @@
 
 #include <kiconloader.h>
 #include <klocale.h>
-#include <kmessagebox.h>
 #include <kmimetype.h>
 
 #include "kwpedialogs.h"
@@ -75,7 +74,14 @@ void KWPEFileChooser::done( int result )
                 refused = i18n( "This is not a file that can be uploaded:\n%1" ).arg( ( *it ).path( -1 ) );
                 break;
             }
-            paths.append( info.absFilePath() );
+            // WebKit takes UTF-8 and opens the path it decodes: a name it
+            // cannot express is refused.
+            QString path = info.absFilePath();
+            if ( QFile::encodeName( path ) != path.utf8() ) {
+                refused = i18n( "This file name cannot be uploaded:\n%1" ).arg( path );
+                break;
+            }
+            paths.append( path );
         }
         if ( webkit_file_chooser_request_get_select_multiple( request ) == FALSE && paths.count() > 1 )
             refused = i18n( "Only one file can be uploaded here." );
@@ -84,9 +90,11 @@ void KWPEFileChooser::done( int result )
     if ( result != Accepted || !refused.isEmpty() || paths.isEmpty() ) {
         webkit_file_chooser_request_cancel( request );
     } else {
+        // WebKit percent-decodes the paths (WebKitFileChooserRequest.cpp):
+        // a file named "%2e%2e%2fsecret" would be "../secret" for it.
         QValueList<QCString> encoded;
         for ( QStringList::ConstIterator it = paths.begin(); it != paths.end(); ++it )
-            encoded.append( QFile::encodeName( *it ) );
+            encoded.append( QString( *it ).replace( '%', "%25" ).utf8() );
         const gchar** files = g_new0( const gchar*, encoded.count() + 1 );
         unsigned i = 0;
         for ( QValueList<QCString>::ConstIterator it = encoded.begin(); it != encoded.end(); ++it )
@@ -96,10 +104,17 @@ void KWPEFileChooser::done( int result )
     }
     g_object_unref( request );
 
-    // Not modal: the message comes after the request is answered and
-    // nothing refers to this dialog any more.
-    if ( !refused.isEmpty() )
-        KMessageBox::queuedMessageBox( parentWidget(), KMessageBox::Sorry, refused, i18n( "Upload" ) );
+    // After the request is answered; not modal either (KMessageBox would
+    // run a nested event loop for the whole application).
+    if ( !refused.isEmpty() && parentWidget() ) {
+        KDialogBase* box = new KDialogBase( parentWidget(), "kwpeuploadrefused", false, i18n( "Upload" ), Ok, Ok, true );
+        QLabel* text = new QLabel( box );
+        text->setTextFormat( PlainText );
+        text->setText( refused );
+        box->setMainWidget( text );
+        connect( box, SIGNAL( finished() ), box, SLOT( delayedDestruct() ) );
+        box->show();
+    }
     deleteLater();
 }
 
@@ -223,10 +238,14 @@ void KWPEScriptDialog::done( int result )
     default:
         break;
     }
+    bool stayed = webkit_script_dialog_get_dialog_type( dialog ) == WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM
+                  && result != Accepted;
     webkit_script_dialog_close( dialog );
     webkit_script_dialog_unref( dialog );
     if ( m_suppress->isChecked() )
         emit suppressRequested();
+    if ( stayed )
+        emit stayedOnPage();
     deleteLater();
 }
 

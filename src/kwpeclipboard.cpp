@@ -32,9 +32,20 @@
 namespace
 {
 
+class WebKitContent;
+WebKitContent* s_forwarded = 0;   // what we put into the X CLIPBOARD (Qt owns it)
+
 class WebKitContent : public QMimeSource
 {
 public:
+    // Qt deletes it when the X CLIPBOARD changes hands: no stale pointer
+    // that a new object at the same address could match.
+    virtual ~WebKitContent()
+    {
+        if ( s_forwarded == this )
+            s_forwarded = 0;
+    }
+
     void add( const char* format, const QByteArray& data )
     {
         m_formats.append( QCString( format ) );
@@ -94,7 +105,7 @@ struct KWPEClipboardX11Class
 G_DEFINE_TYPE( KWPEClipboardX11, kwpe_clipboard_x11, WPE_TYPE_CLIPBOARD )
 
 static WPEClipboard* s_clipboard = 0;           // no reference: the display keeps it
-static QMimeSource* s_forwarded = 0;            // what we put into the X CLIPBOARD (Qt owns it)
+static WPEClipboardContent* s_localContent = 0; // WebKit's last copy (ref): pasted again from s_forwarded
 static QClipboard::Mode s_pasteMode = QClipboard::Clipboard;
 static gint64 s_pasteUntil = 0;                 // reads allowed until then (a user paste)
 static bool s_updating = false;                 // our own changed() call
@@ -105,11 +116,13 @@ static void kwpeClipboardChanged( WPEClipboard* clipboard, GPtrArray* formats, g
     WPE_CLIPBOARD_CLASS( kwpe_clipboard_x11_parent_class )->changed( clipboard, formats, isLocal, content );
     if ( s_updating || !isLocal || !qApp )
         return;
+    if ( s_localContent )
+        wpe_clipboard_content_unref( s_localContent );
+    s_localContent = content ? wpe_clipboard_content_ref( content ) : 0;
     QClipboard* cb = QApplication::clipboard();
     if ( !content ) {
-        if ( cb->data( QClipboard::Clipboard ) == s_forwarded )
+        if ( s_forwarded && cb->ownsClipboard() && cb->data( QClipboard::Clipboard ) == s_forwarded )
             cb->clear( QClipboard::Clipboard );
-        s_forwarded = 0;
         return;
     }
     WebKitContent* source = new WebKitContent;
@@ -163,8 +176,12 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
 
 static void kwpeClipboardDispose( GObject* object )
 {
-    if ( s_clipboard == reinterpret_cast<WPEClipboard*>( object ) )
+    if ( s_clipboard == reinterpret_cast<WPEClipboard*>( object ) ) {
         s_clipboard = 0;
+        if ( s_localContent )
+            wpe_clipboard_content_unref( s_localContent );
+        s_localContent = 0;
+    }
     G_OBJECT_CLASS( kwpe_clipboard_x11_parent_class )->dispose( object );
 }
 
@@ -196,9 +213,15 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
     QClipboard* cb = QApplication::clipboard();
     QMimeSource* source = cb->data( mode );
     // WebKit's own copy, still in the X CLIPBOARD: WebKit pastes it from
-    // its own content (with a page's custom formats).
-    if ( mode == QClipboard::Clipboard && source && source == s_forwarded ) {
+    // its own content (with a page's custom formats), given back to it in
+    // case a PRIMARY paste replaced it meanwhile.
+    if ( mode == QClipboard::Clipboard && s_forwarded && s_localContent && cb->ownsClipboard() && source == s_forwarded ) {
         s_pasteUntil = 0;
+        if ( wpe_clipboard_get_content( s_clipboard ) != s_localContent ) {
+            s_updating = true;
+            wpe_clipboard_set_content( s_clipboard, s_localContent );
+            s_updating = false;
+        }
         return true;
     }
 
