@@ -117,6 +117,7 @@ struct KWPEDisplayX11
 
     WPEDRMDevice* drmDevice;
     WPEScreen* screen;
+    WPEClipboard* clipboard;
 };
 
 struct KWPEDisplayX11Class
@@ -315,9 +316,19 @@ static WPEScreen* kwpeDisplayGetScreen( WPEDisplay* display, guint index )
     return index == 0 ? reinterpret_cast<KWPEDisplayX11*>( display )->screen : 0;
 }
 
+// WebKit's clipboard: the X selections (kwpeclipboard.cpp).
+static WPEClipboard* kwpeDisplayGetClipboard( WPEDisplay* display )
+{
+    KWPEDisplayX11* d = reinterpret_cast<KWPEDisplayX11*>( display );
+    if ( !d->clipboard )
+        d->clipboard = KWPE::createClipboard( display );
+    return d->clipboard;
+}
+
 static void kwpeDisplayDispose( GObject* object )
 {
     KWPEDisplayX11* d = reinterpret_cast<KWPEDisplayX11*>( object );
+    g_clear_object( &d->clipboard );
     if ( d->drmDevice ) {
         wpe_drm_device_unref( d->drmDevice );
         d->drmDevice = 0;
@@ -342,6 +353,7 @@ static void kwpe_display_x11_class_init( KWPEDisplayX11Class* klass )
     displayClass->get_preferred_buffer_formats = kwpeDisplayGetPreferredBufferFormats;
     displayClass->get_n_screens = kwpeDisplayGetNScreens;
     displayClass->get_screen = kwpeDisplayGetScreen;
+    displayClass->get_clipboard = kwpeDisplayGetClipboard;
 }
 
 // ---------------------------------------------------------------------

@@ -41,6 +41,7 @@ typedef struct _XDisplay Display;
 typedef union _XEvent XEvent;
 typedef struct _WPEDisplay WPEDisplay;
 typedef struct _WPEView WPEView;
+typedef struct _WPEClipboard WPEClipboard;
 
 namespace KWPE
 {
@@ -123,6 +124,13 @@ FrameStats takeFrameStats( WPEView* view );
  * on screen answers it (FrameStats::inputLatencyMs, settleMs).
  */
 void noteInput( WPEView* view );
+
+/**
+ * The display's clipboard (WebKit's copy and paste), made on first use:
+ * implemented by the Qt side (kwpeclipboard.cpp, the X CLIPBOARD and
+ * PRIMARY selections through QClipboard).  Returns a new reference.
+ */
+WPEClipboard* createClipboard( WPEDisplay* display );
 
 }
 

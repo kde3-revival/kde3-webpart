@@ -34,6 +34,7 @@
 #include <kstandarddirs.h>
 
 #include "kwpeadblock.h"
+#include "kwpeclipboard.h"
 #include "kwpedownload.h"
 #include "kwpesettings.h"
 #include "kwpewidget.h"
@@ -93,6 +94,9 @@ static bool ensureWebKit()
         return false;
 
     s_previousFilter = qt_set_x11_event_filter( kwpeX11EventFilter );
+    // The clipboard now, not at WebKit's first paste: KWPEClipboard tells
+    // it what the X selections offer before that.
+    wpe_display_get_clipboard( s_display );
 
     if ( envFlag( "KWPE_EPHEMERAL" ) ) {
         s_session = webkit_network_session_new_ephemeral();
@@ -125,6 +129,8 @@ static bool ensureWebKit()
     webkit_settings_set_allow_file_access_from_file_urls( s_settings, FALSE );
     webkit_settings_set_allow_universal_access_from_file_urls( s_settings, FALSE );
     webkit_settings_set_javascript_can_open_windows_automatically( s_settings, FALSE );
+    // Pages read the clipboard only when the user pastes (KWPEClipboard).
+    webkit_settings_set_javascript_can_access_clipboard( s_settings, FALSE );
     // WebKit 2.54 drops the contents of GPU canvases of pages kept in the
     // back/forward cache: going back shows them empty.  Skia's CPU canvas
     // keeps them (KWPE_CANVAS_ACCELERATION=1 to compare).
@@ -140,7 +146,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), overEditable( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -205,6 +211,7 @@ public:
     QString menuLink;
     QString menuImage;
     bool menuSelection;
+    bool overEditable;           // the pointer is over a text field (middle click pastes)
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
     bool insecureContent;        // the page loaded http content (https page)
@@ -499,6 +506,7 @@ void KWPEWidgetPrivate::onProgressChanged( GObject*, GParamSpec*, gpointer data 
 void KWPEWidgetPrivate::onMouseTargetChanged( WebKitWebView*, WebKitHitTestResult* hit, guint, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    d->overEditable = webkit_hit_test_result_context_is_editable( hit );
     QString link;
     if ( webkit_hit_test_result_context_is_link( hit ) )
         link = QString::fromUtf8( webkit_hit_test_result_get_link_uri( hit ) );
@@ -943,10 +951,11 @@ void KWPEWidget::findNext( bool forward )
 
 void KWPEWidget::copySelection()
 {
-    // The selected text into the X clipboard.  (WebKit's own copy goes
-    // to WPE's clipboard, which is not the X one yet.)  In a script world
-    // of our own: the page cannot replace getSelection() or toString()
-    // to choose what is copied.  Selections in text fields are not in
+    // The selected text into the X clipboard (Konqueror's Edit/Copy and
+    // Ctrl+C, which Konqueror takes before WebKit; WebKit's own copies,
+    // e.g. a page's execCommand("copy"), arrive through KWPEClipboard).
+    // In a script world of our own: the page cannot replace
+    // getSelection() or toString() to choose what is copied.  Selections in text fields are not in
     // getSelection(); password fields are not copied.
     static const char script[] =
         "(function() {"
@@ -1267,6 +1276,12 @@ void KWPEWidget::keyPressEvent( QKeyEvent* e )
 {
     if ( !d->wpeView )
         return;
+    // WebKit's paste keys (Ctrl+V, Ctrl+Shift+V, Shift+Insert): the X
+    // CLIPBOARD may be read now.
+    int mods = e->state() & ( ShiftButton | ControlButton | AltButton | MetaButton );
+    if ( ( e->key() == Key_V && ( mods == ControlButton || mods == ( ControlButton | ShiftButton ) ) )
+         || ( e->key() == Key_Insert && mods == ShiftButton ) )
+        KWPEClipboard::preparePaste( QClipboard::Clipboard );
     if ( !KWPE::sendKeyEvent( d->wpeView, true ) )
         sendQtKey( d->wpeView, e, true );
     e->accept();
@@ -1323,6 +1338,10 @@ void KWPEWidget::mouseReleaseEvent( QMouseEvent* e )
                                                     e->x(), e->y(), 0 );
     wpe_view_event( d->wpeView, event );
     wpe_event_unref( event );
+    // X's middle click paste into a text field (WebKit does it for GTK
+    // only): PRIMARY, at the caret the click placed.
+    if ( e->button() == MidButton && d->overEditable && KWPEClipboard::preparePaste( QClipboard::Selection ) )
+        webkit_web_view_execute_editing_command( d->view, WEBKIT_EDITING_COMMAND_PASTE );
 }
 
 static QPoint s_lastPointer;

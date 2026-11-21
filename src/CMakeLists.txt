@@ -3,6 +3,7 @@ kde3_add_module(libkwpepart
   SOURCES
     wpex11platform.cpp
     kwpewidget.cpp
+    kwpeclipboard.cpp
     kwpedownload.cpp
     kwpeadblock.cpp
     kwpeconfigdialog.cpp
