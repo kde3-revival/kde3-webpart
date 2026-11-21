@@ -4,11 +4,14 @@ A browser part for Konqueror (KDE 3.5, kde3-revival) that shows web
 pages with [WPE WebKit](https://wpewebkit.org/): `KWPEPart`, a
 `KParts::ReadOnlyPart` with a `BrowserExtension`, as KHTML's part.
 
-Status: **stage 1, prototype.**  Pages load and render, links, forms,
+Status: **stage 2 in progress.**  Pages load and render, links, forms,
 scripts, back/forward through Konqueror's history, title, progress,
 padlock, status bar text and smooth (animated) wheel scrolling work, on
-the GPU (DMA-BUF) or through shared memory.  See "Next stages" for
-what is missing.
+the GPU (DMA-BUF) or through shared memory.  Stage 2 so far: downloads
+through KDE's save dialog and KIO's progress window, Konqueror's context
+menus, find in page, zoom, persistent cookies, HTTP authentication,
+recovery from web process crashes.  See "Next stages" for what is
+missing.
 
 Why WPE WebKit: it is GLib based and embeddable without a toolkit (the
 embedder implements a small "platform": display, view, buffers,
@@ -129,7 +132,45 @@ same-document navigation and double every request, so:
   `createNewWindow()` (window or tab, Konqueror's settings);
 * main-frame responses WebKit cannot show (archives, PDF, ...) go back to
   Konqueror with `openURLRequest()` and their mime type: it embeds
-  another part, starts an application or offers to save.
+  another part, starts an application or offers to save (KIO fetches
+  them again); answers to POST requests cannot be fetched again and are
+  downloaded by WebKit;
+* tokens are unique in the process (Konqueror copies history entries
+  between views) and are checked against the item's URL.
+
+### Downloads, menus, find, zoom (`kwpedownload.cpp`, `kwpepart.cpp`)
+
+* **Downloads** WebKit makes (attachments, `<a download>`, POST
+  answers, "Save Link/Image As..."), with WebKit's cookies: KDE's save
+  dialog (any KIO URL, starts in the last download directory), a
+  `KIO::Job` that shows the transfer in KIO's progress window (Cancel
+  cancels it), WebKit writes local files itself (`<file>.wkdownload`
+  until complete), remote destinations get a temporary file that KIO
+  uploads.
+* **Context menus**: `BrowserExtension::popupMenu()` with a GUI client
+  like KHTML's.  Konqueror adds Open in New Window/Tab, bookmarks, Open
+  With/Preview In and Back/Forward/Reload; the part adds Save Link As,
+  Copy Link Address, Save Image As, Copy Image Location, View Image,
+  Copy Text.  Copy (also Konqueror's Edit/Copy) reads the selection in a
+  script world of its own and puts it into the X clipboard.
+* **Find** (`kwpepart.rc`): Edit/Find (Ctrl+F, KDE's find dialog), Find
+  Next/Previous (F3/Shift+F3) with WebKit's find controller (all matches
+  highlighted, wrap around, match count in the status bar).
+* **Zoom**: View/Zoom In (Ctrl++, Ctrl+=), Zoom Out (Ctrl+-), Reset
+  Zoom (Ctrl+0), Ctrl+wheel; 30–300 % page zoom.
+* **Data**: cookies in `$KDEHOME/share/apps/kwpepart/cookies.sqlite`,
+  local storage, IndexedDB etc. next to them (`KWPE_EPHEMERAL=1`: in
+  memory only); WebKit's cookie policy (no third-party cookies), not
+  kcookiejar's.
+* **HTTP authentication**: KIO's password dialog, kept for the session.
+  `submit-form` is connected as the hook for a password manager (stub).
+* **Security**: WebKit's bubblewrap sandbox for the web processes
+  (always on), TLS errors fail the load, file: pages get no access to
+  other files, permission requests (location, camera, ...) are denied,
+  mixed content shows Konqueror's "partially encrypted" padlock.
+* **Web process crash**: the page is reloaded once; a second crash
+  within 30 s or an out-of-memory kill leaves the last frame and a
+  status bar message.
 
 ### Which part Konqueror uses
 
@@ -230,6 +271,21 @@ at 55–60 fps.
   X server's vblank: frames are occasionally one vblank late.
 * POST data handed over by Konqueror (`URLArgs::postData`, e.g. a form
   submitted in KHTML and reloaded here) is not passed to WebKit.
+* Printing: WPE WebKit has no print API (`WebKitPrintOperation` is
+  GTK-only); Konqueror's Print stays disabled.
+* `WebKitEditorState` never changes with the WPE platform API, so
+  Konqueror's Copy is always enabled.
+* Unsupported GET responses are fetched again by KIO for Konqueror
+  (without WebKit's cookies): downloads behind a login may get the login
+  page; "Save Link As" uses WebKit and works.
+* `history.back()` steps are counted in WebKit's back/forward list, which
+  also has items of subframe navigations Konqueror never saw.
+* No `get_keymap` in the platform (WPE assumes a US keymap for its own
+  keymap queries); autorepeat is not filtered; Escape never reaches the
+  page.
+* Script dialogs (`alert`, `confirm`, `beforeunload`) and the file
+  chooser have no UI yet; `window.open()` returns null (popups using
+  `opener` break).
 * The DMA-BUF path was tested on Xwayland (AMD), not yet on a real Xorg
   (Fedora 44 does not package WPE WebKit; the Arch build needs glibc
   2.44).
@@ -238,13 +294,16 @@ at 55–60 fps.
 
 1. **Konqueror integration**: a Konqueror setting for the web engine
    (per protocol, skipping the KIO mime type probe for http/https);
-   context menus (`popupMenu` with KHTML's actions), find, zoom,
-   print, view source, favicons, `enableAction` for copy/paste and the
-   X clipboard and primary selection (`WPEClipboard`).
-2. **Downloads via KIO** with WebKit's cookies and authentication,
-   POST downloads; `URLArgs::postData`.
-3. **Cookies and passwords**: KDE's cookie policy (kcookiejar) and a
-   persistent cookie store, KWallet for HTTP authentication and forms.
+   view source, favicons, script dialogs, file chooser, the X clipboard
+   and primary selection (`WPEClipboard`: paste into pages), printing
+   (no WPE API: maybe a snapshot or a PDF via a headless GTK WebKit).
+   Done: context menus, find, zoom, copy.
+2. **Downloads**: `URLArgs::postData`; unsupported GET content
+   downloaded by WebKit when no part embeds it.  Done: downloads via
+   KDE's dialog and KIO's progress window, POST downloads.
+3. **Cookies and passwords**: KDE's cookie policy (kcookiejar), KWallet
+   for HTTP authentication and forms (hook: `submit-form`).  Done:
+   persistent cookies, HTTP authentication dialog.
 4. **Input**: XIM preedit through a `WPEInputMethodContext`; smooth
    XI2.1 scrolling as precise deltas with phases (with the Qt 3 XI2
    work); touchpad gestures.
