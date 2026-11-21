@@ -13,10 +13,15 @@
 // and "emit" as macros.
 #include <wpe/webkit.h>
 
+#include <qcheckbox.h>
 #include <qfile.h>
+#include <qlabel.h>
+#include <qlayout.h>
+#include <qlineedit.h>
 #include <qfileinfo.h>
 #include <qstringlist.h>
 
+#include <kiconloader.h>
 #include <klocale.h>
 #include <kmessagebox.h>
 #include <kmimetype.h>
@@ -130,6 +135,99 @@ QString KWPEFileChooser::filterFor( const char* const* mimeTypes )
     if ( !unique.isEmpty() )
         filter = unique.join( " " ) + "|" + names.join( ", " ).replace( '|', ' ' ) + "\n";
     return filter + "*|" + i18n( "All Files" );
+}
+
+// ---------------------------------------------------------------------
+// KWPEScriptDialog
+
+KWPEScriptDialog::KWPEScriptDialog( WebKitScriptDialog* dialog, const QString& origin, QWidget* page )
+    : KDialogBase( page, "kwpescriptdialog", false, QString::null,
+                   webkit_script_dialog_get_dialog_type( dialog ) == WEBKIT_SCRIPT_DIALOG_ALERT ? Ok : Ok | Cancel, Ok, true ),
+      m_dialog( webkit_script_dialog_ref( dialog ) ), m_edit( 0 )
+{
+    WebKitScriptDialogType type = webkit_script_dialog_get_dialog_type( dialog );
+    bool leave = type == WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM;
+    // The origin, never the page's words: which site asks.
+    setPlainCaption( ( leave ? i18n( "Leave Page? - %1" ) : i18n( "JavaScript - %1" ) ).arg( origin ) );
+
+    QWidget* main = makeMainWidget();
+    QGridLayout* grid = new QGridLayout( main, 3, 2, 0, KDialog::spacingHint() );
+    QLabel* icon = new QLabel( main );
+    icon->setPixmap( DesktopIcon( type == WEBKIT_SCRIPT_DIALOG_ALERT ? "messagebox_info" : "messagebox_warning", 32 ) );
+    grid->addWidget( icon, 0, 0, AlignTop );
+
+    QString message;
+    if ( leave ) {
+        // WebKit's text; pages cannot choose it any more.
+        message = i18n( "This page asks you to confirm that you want to leave it: "
+                        "what you entered may not be saved." );
+        setButtonOK( KGuiItem( i18n( "&Leave Page" ) ) );
+        setButtonCancel( KGuiItem( i18n( "&Stay on Page" ) ) );
+    } else {
+        message = QString::fromUtf8( webkit_script_dialog_get_message( dialog ) );
+        if ( message.length() > 4000 )
+            message = message.left( 4000 ) + QString::fromUtf8( "\xe2\x80\xa6" );
+    }
+    QLabel* text = new QLabel( main );
+    text->setTextFormat( PlainText );
+    text->setAlignment( AlignLeft | AlignTop | WordBreak );
+    text->setText( message );
+    text->setMinimumWidth( 300 );
+    grid->addWidget( text, 0, 1 );
+
+    if ( type == WEBKIT_SCRIPT_DIALOG_PROMPT ) {
+        m_edit = new QLineEdit( main );
+        m_edit->setText( QString::fromUtf8( webkit_script_dialog_prompt_get_default_text( dialog ) ) );
+        m_edit->selectAll();
+        grid->addWidget( m_edit, 1, 1 );
+        m_edit->setFocus();
+    }
+    m_suppress = new QCheckBox( i18n( "Do not show more dialogs from this page" ), main );
+    grid->addWidget( m_suppress, 2, 1 );
+    grid->setColStretch( 1, 1 );
+}
+
+KWPEScriptDialog::~KWPEScriptDialog()
+{
+    // Unanswered (closed with the view): the defaults.
+    if ( m_dialog ) {
+        webkit_script_dialog_close( m_dialog );
+        webkit_script_dialog_unref( m_dialog );
+    }
+}
+
+void KWPEScriptDialog::answerQuietly( WebKitScriptDialog* dialog )
+{
+    if ( webkit_script_dialog_get_dialog_type( dialog ) == WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM )
+        webkit_script_dialog_confirm_set_confirmed( dialog, TRUE );
+    webkit_script_dialog_close( dialog );
+}
+
+void KWPEScriptDialog::done( int result )
+{
+    KDialogBase::done( result );
+    if ( !m_dialog )
+        return;
+    WebKitScriptDialog* dialog = m_dialog;
+    m_dialog = 0;
+    switch ( webkit_script_dialog_get_dialog_type( dialog ) ) {
+    case WEBKIT_SCRIPT_DIALOG_CONFIRM:
+    case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM:
+        webkit_script_dialog_confirm_set_confirmed( dialog, result == Accepted );
+        break;
+    case WEBKIT_SCRIPT_DIALOG_PROMPT:
+        // Cancel: null for the page.
+        if ( result == Accepted && m_edit )
+            webkit_script_dialog_prompt_set_text( dialog, m_edit->text().utf8().data() );
+        break;
+    default:
+        break;
+    }
+    webkit_script_dialog_close( dialog );
+    webkit_script_dialog_unref( dialog );
+    if ( m_suppress->isChecked() )
+        emit suppressRequested();
+    deleteLater();
 }
 
 #include "kwpedialogs.moc"

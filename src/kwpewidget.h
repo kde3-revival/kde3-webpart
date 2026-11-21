@@ -166,6 +166,8 @@ private slots:
     void showContextMenu();
     void emitUnsupportedContent();
     void emitExternalURL();
+    void suppressDialogs();
+    void answerQuietDialogs();
     void reloadAfterCrash();
     void askAuthentication();
     void adBlockChanged();

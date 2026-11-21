@@ -24,6 +24,7 @@
 #include <qguardedptr.h>
 #include <qfile.h>
 #include <qmap.h>
+#include <qvaluelist.h>
 #include <qtimer.h>
 #include <qevent.h>
 
@@ -147,7 +148,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), overEditable( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -177,6 +178,7 @@ public:
     static void onAuthenticationCancelled( WebKitAuthenticationRequest*, gpointer data );
     static void onSubmitForm( WebKitWebView*, WebKitFormSubmissionRequest* request, gpointer data );
     void dropAuthentication();
+    static gboolean onScriptDialog( WebKitWebView*, WebKitScriptDialog* dialog, gpointer data );
     static gboolean onRunFileChooser( WebKitWebView*, WebKitFileChooserRequest* request, gpointer data );
     void showPageDialog( QWidget* dialog );
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
@@ -217,6 +219,9 @@ public:
     bool overEditable;           // the pointer is over a text field (middle click pastes)
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
+    bool suppressDialogs;        // "no more dialogs from this page" (until the next page)
+    QValueList<WebKitScriptDialog*> quietDialogs;   // answered without asking, after WebKit's signal (ref)
+    void answerQuietDialogs();
     QGuardedPtr<QWidget> pageDialog;   // file chooser or script dialog (KWPEFileChooser): the page takes no input
     bool insecureContent;        // the page loaded http content (https page)
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
@@ -304,6 +309,7 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "authenticate", G_CALLBACK( onAuthenticate ), this );
     g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
     g_signal_connect( view, "run-file-chooser", G_CALLBACK( onRunFileChooser ), this );
+    g_signal_connect( view, "script-dialog", G_CALLBACK( onScriptDialog ), this );
 
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
@@ -327,6 +333,7 @@ void KWPEWidgetPrivate::destroy()
         return;
     // A dialog of the page answers WebKit (cancelled) while the view lives.
     delete static_cast<QWidget*>( pageDialog );
+    answerQuietDialogs();
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
@@ -432,6 +439,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         }
         d->ownBackForward = false;
         d->insecureContent = false;
+        d->suppressDialogs = false;
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
         d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
@@ -790,6 +798,41 @@ void KWPEWidgetPrivate::onSubmitForm( WebKitWebView*, WebKitFormSubmissionReques
     webkit_form_submission_request_submit( request );
 }
 
+// alert(), confirm(), prompt(), onbeforeunload: modal to the page only
+// (KWPEScriptDialog), with the page's origin as the caption.
+gboolean KWPEWidgetPrivate::onScriptDialog( WebKitWebView* view, WebKitScriptDialog* dialog, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // The user said no more; or a file chooser is open (one dialog at a
+    // time): answered without asking.
+    if ( d->suppressDialogs || d->pageDialog ) {
+        d->quietDialogs.append( webkit_script_dialog_ref( dialog ) );
+        QTimer::singleShot( 0, d->q, SLOT( answerQuietDialogs() ) );
+        return TRUE;
+    }
+    KURL url( QString::fromUtf8( webkit_web_view_get_uri( view ) ) );
+    QString origin = url.protocol();
+    if ( !url.host().isEmpty() ) {
+        origin += "://" + url.host();
+        if ( url.port() )
+            origin += ":" + QString::number( url.port() );
+    }
+    KWPEScriptDialog* box = new KWPEScriptDialog( dialog, origin, d->q );
+    QObject::connect( box, SIGNAL( suppressRequested() ), d->q, SLOT( suppressDialogs() ) );
+    d->showPageDialog( box );
+    return TRUE;
+}
+
+void KWPEWidgetPrivate::answerQuietDialogs()
+{
+    QValueList<WebKitScriptDialog*> dialogs = quietDialogs;
+    quietDialogs.clear();
+    for ( QValueList<WebKitScriptDialog*>::Iterator it = dialogs.begin(); it != dialogs.end(); ++it ) {
+        KWPEScriptDialog::answerQuietly( *it );
+        webkit_script_dialog_unref( *it );
+    }
+}
+
 // <input type=file>: KDE's file dialog, modal to the page only.
 gboolean KWPEWidgetPrivate::onRunFileChooser( WebKitWebView*, WebKitFileChooserRequest* request, gpointer data )
 {
@@ -1060,6 +1103,16 @@ void KWPEWidget::emitUnsupportedContent()
     d->unsupportedUrl = d->unsupportedMimeType = QString::null;
     if ( !url.isEmpty() )
         emit unsupportedContent( url, mimeType );
+}
+
+void KWPEWidget::suppressDialogs()
+{
+    d->suppressDialogs = true;
+}
+
+void KWPEWidget::answerQuietDialogs()
+{
+    d->answerQuietDialogs();
 }
 
 void KWPEWidget::emitExternalURL()
