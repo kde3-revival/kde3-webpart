@@ -14,6 +14,7 @@
 
 #include <kparts/browserextension.h>
 #include <kparts/part.h>
+#include <kxmlguiclient.h>
 
 class KAboutData;
 class KWPEWidget;
@@ -65,9 +66,12 @@ private slots:
     void slotNewWindowRequested( const QString& url );
     void slotUnsupportedContent( const QString& url, const QString& mimeType );
     void slotHistoryNavigationRequested( int steps );
+    void slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
+    void slotCopyAvailable( bool available );
 
 private:
     friend class KWPEBrowserExtension;
+    friend class KWPEPopupGUIClient;
     void restore( const KURL& url, int token );
 
     KWPEWidget* m_view;
@@ -88,8 +92,36 @@ public:
     virtual void saveState( QDataStream& stream );
     virtual void restoreState( QDataStream& stream );
 
+public slots:
+    /** Konqueror's Edit/Copy (enabled while text is selected). */
+    void copy();
+
 private:
     KWPEPart* m_part;
+};
+
+/**
+ * The part's actions in Konqueror's popup menu (KonqPopupMenu adds the
+ * navigation, "Open in New Window/Tab", bookmarks and "Open With").
+ */
+class KWPEPopupGUIClient : public QObject, public KXMLGUIClient
+{
+    Q_OBJECT
+
+public:
+    KWPEPopupGUIClient( KWPEPart* part, const KURL& linkURL, const KURL& imageURL, bool onSelection );
+
+private slots:
+    void slotSaveLinkAs();
+    void slotCopyLinkLocation();
+    void slotSaveImageAs();
+    void slotCopyImageLocation();
+    void slotViewImage();
+
+private:
+    KWPEPart* m_part;
+    KURL m_linkURL;
+    KURL m_imageURL;
 };
 
 #endif

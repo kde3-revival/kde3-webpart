@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include <qapplication.h>
+#include <qclipboard.h>
 #include <qcursor.h>
 #include <qfile.h>
 #include <qmap.h>
@@ -120,7 +121,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          nextToken( 1 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          nextToken( 1 ), menuSelection( false ), canCopy( false ), cancellable( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -144,6 +145,9 @@ public:
     static gboolean onDecidePolicy( WebKitWebView*, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data );
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
+    static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
+    static void onEditorStateChanged( WebKitEditorState* state, gpointer data );
+    static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
 
     KWPEWidget* q;
     WebKitWebView* view;
@@ -160,6 +164,13 @@ public:
     QMap<int, WebKitBackForwardListItem*> itemOfToken;
     QMap<WebKitBackForwardListItem*, int> tokenOfItem;
     int nextToken;
+
+    // the context menu WebKit asked for (shown outside its signal)
+    QString menuLink;
+    QString menuImage;
+    bool menuSelection;
+    bool canCopy;
+    GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
     QTimer* statsTimer;
     gint64 loadStart;
@@ -229,6 +240,9 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "decide-policy", G_CALLBACK( onDecidePolicy ), this );
     g_signal_connect( webkit_web_view_get_back_forward_list( view ), "changed",
                       G_CALLBACK( onBackForwardChanged ), this );
+    g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
+    g_signal_connect( webkit_web_view_get_editor_state( view ), "changed", G_CALLBACK( onEditorStateChanged ), this );
+    cancellable = g_cancellable_new();
 
     statsEnabled = envFlag( "KWPE_STATS" );
     if ( statsEnabled ) {
@@ -246,6 +260,10 @@ void KWPEWidgetPrivate::destroy()
     if ( !view )
         return;
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
+    g_signal_handlers_disconnect_by_data( webkit_web_view_get_editor_state( view ), this );
+    g_cancellable_cancel( cancellable );
+    g_object_unref( cancellable );
+    cancellable = 0;
     g_signal_handlers_disconnect_by_data( view, this );
     g_object_set_data( G_OBJECT( view ), widgetKey, 0 );
     KWPE::attachView( wpeView, 0, 0 );
@@ -500,6 +518,48 @@ void KWPEWidgetPrivate::onBackForwardChanged( WebKitBackForwardList*, WebKitBack
         static_cast<KWPEWidgetPrivate*>( data )->forgetItems( removed );
 }
 
+gboolean KWPEWidgetPrivate::onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    d->menuLink = webkit_hit_test_result_context_is_link( hit )
+        ? QString::fromUtf8( webkit_hit_test_result_get_link_uri( hit ) ) : QString::null;
+    d->menuImage = webkit_hit_test_result_context_is_image( hit )
+        ? QString::fromUtf8( webkit_hit_test_result_get_image_uri( hit ) ) : QString::null;
+    d->menuSelection = webkit_hit_test_result_context_is_selection( hit );
+    // Konqueror's popup menu runs an event loop: not inside WebKit's signal.
+    QTimer::singleShot( 0, d->q, SLOT( showContextMenu() ) );
+    return TRUE;   // WPE has no menu of its own
+}
+
+void KWPEWidgetPrivate::onEditorStateChanged( WebKitEditorState* state, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    bool canCopy = webkit_editor_state_is_copy_available( state );
+    if ( canCopy != d->canCopy ) {
+        d->canCopy = canCopy;
+        emit d->q->copyAvailable( canCopy );
+    }
+}
+
+void KWPEWidgetPrivate::onSelectionText( GObject* view, GAsyncResult* result, gpointer )
+{
+    GError* error = 0;
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish( WEBKIT_WEB_VIEW( view ), result, &error );
+    if ( !value ) {
+        // Cancelled: the widget is gone.
+        g_error_free( error );
+        return;
+    }
+    if ( jsc_value_is_string( value ) ) {
+        char* text = jsc_value_to_string( value );
+        QString selection = QString::fromUtf8( text );
+        g_free( text );
+        if ( !selection.isEmpty() )
+            QApplication::clipboard()->setText( selection, QClipboard::Clipboard );
+    }
+    g_object_unref( value );
+}
+
 void KWPEWidgetPrivate::onFrameDisplayed( WebKitWebView*, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
@@ -547,6 +607,25 @@ void KWPEWidget::downloadURL( const QString& url )
     // WebKit's "download-started" takes it from here (onDownloadStarted).
     if ( d->view )
         g_object_unref( webkit_web_view_download_uri( d->view, url.utf8().data() ) );
+}
+
+void KWPEWidget::copySelection()
+{
+    // The selected text into the X clipboard.  (WebKit's own copy goes
+    // to WPE's clipboard, which is not the X one yet.)
+    if ( d->view )
+        webkit_web_view_evaluate_javascript( d->view, "window.getSelection().toString()", -1, 0, 0, d->cancellable,
+                                             KWPEWidgetPrivate::onSelectionText, 0 );
+}
+
+bool KWPEWidget::hasSelection() const
+{
+    return d->canCopy;
+}
+
+void KWPEWidget::showContextMenu()
+{
+    emit contextMenuRequested( d->menuLink, d->menuImage, d->menuSelection, QCursor::pos() );
 }
 
 void KWPEWidget::reload( bool bypassCache )

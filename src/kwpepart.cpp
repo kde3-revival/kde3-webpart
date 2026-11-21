@@ -9,13 +9,22 @@
     (at your option) any later version.
 */
 
+#include <qapplication.h>
+#include <qclipboard.h>
 #include <qdatastream.h>
+#include <qguardedptr.h>
 #include <qvariant.h>
 
+#include <sys/stat.h>
+
 #include <kaboutdata.h>
+#include <kaction.h>
 #include <kdebug.h>
 #include <kdemacros.h>
 #include <klocale.h>
+#include <kmimetype.h>
+#include <kstdaction.h>
+#include <kstringhandler.h>
 #include <kparts/browserinterface.h>
 #include <kparts/event.h>
 #include <kparts/genericfactory.h>
@@ -61,6 +70,10 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( unsupportedContent( const QString&, const QString& ) ),
              SLOT( slotUnsupportedContent( const QString&, const QString& ) ) );
     connect( m_view, SIGNAL( historyNavigationRequested( int ) ), SLOT( slotHistoryNavigationRequested( int ) ) );
+    connect( m_view, SIGNAL( contextMenuRequested( const QString&, const QString&, bool, const QPoint& ) ),
+             SLOT( slotContextMenu( const QString&, const QString&, bool, const QPoint& ) ) );
+    connect( m_view, SIGNAL( copyAvailable( bool ) ), SLOT( slotCopyAvailable( bool ) ) );
+    m_ext->enableAction( "copy", false );
 }
 
 KWPEPart::~KWPEPart()
@@ -216,6 +229,124 @@ void KWPEPart::slotHistoryNavigationRequested( int steps )
         iface->callMethod( "goHistory(int)", QVariant( steps ) );
 }
 
+void KWPEPart::slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos )
+{
+    KURL link( linkUrl );
+    KURL popupURL = link.isEmpty() ? m_url : link;
+    KParts::URLArgs args;
+    QString mimeType = QString::fromLatin1( "text/html" );
+    KParts::BrowserExtension::PopupFlags flags = KParts::BrowserExtension::ShowBookmark | KParts::BrowserExtension::ShowReload;
+    if ( link.isEmpty() ) {
+        if ( onSelection )
+            flags = KParts::BrowserExtension::ShowTextSelectionItems;
+        else
+            flags |= KParts::BrowserExtension::ShowNavigationItems;
+    } else if ( !link.hasRef() && link.query().isEmpty() && !link.fileName().isEmpty() ) {
+        // Like KHTML: the type from the extension, unless it is a script
+        // that probably makes HTML.
+        KMimeType::Ptr type = KMimeType::findByPath( link.fileName(), 0, true );
+        if ( type->name() != KMimeType::defaultMimeType() && !type->is( "application/x-php" )
+             && !type->is( "application/x-perl" ) && !type->is( "application/x-python" )
+             && !type->is( "application/x-shellscript" ) )
+            mimeType = type->name();
+    }
+    args.serviceType = mimeType;
+    args.metaData()["referrer"] = m_url.url();
+
+    // Konqueror may destroy this part while the menu is open.
+    KWPEPopupGUIClient* client = new KWPEPopupGUIClient( this, link, KURL( imageUrl ), onSelection );
+    QGuardedPtr<QObject> guard( client );
+    emit m_ext->popupMenu( client, globalPos, popupURL, args, flags, S_IFREG );
+    if ( guard )
+        delete client;
+}
+
+void KWPEPart::slotCopyAvailable( bool available )
+{
+    m_ext->enableAction( "copy", available );
+}
+
+// ---------------------------------------------------------------------
+
+static const char popupXML[] =
+    "<!DOCTYPE kpartgui SYSTEM \"kpartgui.dtd\">"
+    "<kpartgui name=\"kwpepart_popupmenu\" version=\"1\"><Menu name=\"popupmenu\">"
+    "<Action name=\"copy\" group=\"editactions\"/>"
+    "<Separator weakSeparator=\"1\" group=\"editactions\"/>"
+    "<Action name=\"savelinkas\" group=\"linkactions\"/>"
+    "<Action name=\"copylinklocation\" group=\"linkactions\"/>"
+    "<Separator weakSeparator=\"1\"/>"
+    "<Action name=\"saveimageas\"/>"
+    "<Action name=\"copyimagelocation\"/>"
+    "<Action name=\"viewimage\"/>"
+    "</Menu></kpartgui>";
+
+KWPEPopupGUIClient::KWPEPopupGUIClient( KWPEPart* part, const KURL& linkURL, const KURL& imageURL, bool onSelection )
+    : QObject( part ), m_part( part ), m_linkURL( linkURL ), m_imageURL( imageURL )
+{
+    setInstance( part->instance() );
+
+    if ( onSelection ) {
+        KAction* copy = KStdAction::copy( part->m_ext, SLOT( copy() ), actionCollection(), "copy" );
+        copy->setText( i18n( "&Copy Text" ) );
+    }
+    if ( !linkURL.isEmpty() ) {
+        if ( linkURL.protocol() == "mailto" ) {
+            new KAction( i18n( "Copy Email Address" ), 0, this, SLOT( slotCopyLinkLocation() ),
+                         actionCollection(), "copylinklocation" );
+        } else {
+            new KAction( i18n( "&Save Link As..." ), 0, this, SLOT( slotSaveLinkAs() ),
+                         actionCollection(), "savelinkas" );
+            new KAction( i18n( "Copy &Link Address" ), 0, this, SLOT( slotCopyLinkLocation() ),
+                         actionCollection(), "copylinklocation" );
+        }
+    }
+    if ( !imageURL.isEmpty() ) {
+        new KAction( i18n( "Save Image As..." ), 0, this, SLOT( slotSaveImageAs() ),
+                     actionCollection(), "saveimageas" );
+        new KAction( i18n( "Copy Image Location" ), 0, this, SLOT( slotCopyImageLocation() ),
+                     actionCollection(), "copyimagelocation" );
+        QString name = KStringHandler::csqueeze( imageURL.fileName() + imageURL.query(), 25 );
+        new KAction( i18n( "View Image (%1)" ).arg( name.replace( "&", "&&" ) ), 0, this, SLOT( slotViewImage() ),
+                     actionCollection(), "viewimage" );
+    }
+
+    setXML( QString::fromLatin1( popupXML ) );
+}
+
+void KWPEPopupGUIClient::slotSaveLinkAs()
+{
+    m_part->m_view->downloadURL( m_linkURL.url() );
+}
+
+static void copyURL( const KURL& url )
+{
+    // Both selections, like KHTML.  mailto: as the bare address.
+    QString text = url.protocol() == "mailto" ? url.path() : url.url();
+    QApplication::clipboard()->setText( text, QClipboard::Clipboard );
+    QApplication::clipboard()->setText( text, QClipboard::Selection );
+}
+
+void KWPEPopupGUIClient::slotCopyLinkLocation()
+{
+    copyURL( m_linkURL );
+}
+
+void KWPEPopupGUIClient::slotSaveImageAs()
+{
+    m_part->m_view->downloadURL( m_imageURL.url() );
+}
+
+void KWPEPopupGUIClient::slotCopyImageLocation()
+{
+    copyURL( m_imageURL );
+}
+
+void KWPEPopupGUIClient::slotViewImage()
+{
+    emit m_part->m_ext->openURLRequest( m_imageURL );
+}
+
 // ---------------------------------------------------------------------
 
 KWPEBrowserExtension::KWPEBrowserExtension( KWPEPart* part )
@@ -226,6 +357,11 @@ KWPEBrowserExtension::KWPEBrowserExtension( KWPEPart* part )
 void KWPEBrowserExtension::saveState( QDataStream& stream )
 {
     stream << QString::fromLatin1( stateMagic ) << m_part->m_url << Q_INT32( m_part->m_historyToken );
+}
+
+void KWPEBrowserExtension::copy()
+{
+    m_part->m_view->copySelection();
 }
 
 void KWPEBrowserExtension::restoreState( QDataStream& stream )

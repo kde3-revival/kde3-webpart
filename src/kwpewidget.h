@@ -45,6 +45,11 @@ public:
      */
     void downloadURL( const QString& url );
 
+    /** Text is selected (in the page or in a field). */
+    bool hasSelection() const;
+    /** The selected text into the clipboard. */
+    void copySelection();
+
     QString url() const;
     QString title() const;
     bool isLoading() const;
@@ -83,6 +88,13 @@ signals:
     void unsupportedContent( const QString& url, const QString& mimeType );
     /** A script went back/forward (history.back()), @p steps from here. */
     void historyNavigationRequested( int steps );
+    /**
+     * A context menu (right click) at @p globalPos, on a link and/or an
+     * image (empty: not on one), on selected text.
+     */
+    void contextMenuRequested( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
+    /** hasSelection() changed. */
+    void copyAvailable( bool available );
 
 protected:
     virtual bool event( QEvent* e );
@@ -106,6 +118,7 @@ protected:
 
 private slots:
     void printFrameStats();
+    void showContextMenu();
 
 private:
     friend class KWPEWidgetPrivate;
