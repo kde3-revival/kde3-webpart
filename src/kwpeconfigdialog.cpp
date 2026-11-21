@@ -74,7 +74,7 @@ KWPEConfigDialog::KWPEConfigDialog( QWidget* parent )
 
     // General
     QFrame* general = addPage( i18n( "&General" ) );
-    QGridLayout* grid = new QGridLayout( general, 2, 2, 0, KDialog::spacingHint() );
+    QGridLayout* grid = new QGridLayout( general, 3, 2, 0, KDialog::spacingHint() );
     m_smooth = new QComboBox( false, general );
     m_smooth->insertItem( i18n( "Never" ) );
     m_smooth->insertItem( i18n( "When Efficient" ) );
@@ -82,8 +82,13 @@ KWPEConfigDialog::KWPEConfigDialog( QWidget* parent )
     QLabel* label = new QLabel( m_smooth, i18n( "S&mooth scrolling:" ), general );
     grid->addWidget( label, 0, 0 );
     grid->addWidget( m_smooth, 0, 1 );
+    m_pdfInPage = new QCheckBox( i18n( "Show &PDF files in the page (PDF.js)" ), general );
+    grid->addMultiCellWidget( m_pdfInPage, 1, 1, 0, 1 );
+    QWhatsThis::add( m_pdfInPage, i18n( "PDF files are shown by WebKit's own viewer. Otherwise they go to "
+                                        "Konqueror, which embeds KDE's PDF viewer, starts an application "
+                                        "or offers to save them." ) );
     grid->setColStretch( 1, 1 );
-    grid->setRowStretch( 1, 1 );
+    grid->setRowStretch( 2, 1 );
     QString smoothHelp = i18n( "Whether the mouse wheel and the keyboard scroll with an animation. "
                                "\"When Efficient\": only when pages are drawn on the GPU and handed "
                                "to the X server without a copy." );
@@ -144,6 +149,7 @@ void KWPEConfigDialog::load()
 {
     KWPESettings::SmoothScrolling smooth = KWPESettings::smoothScrolling();
     m_smooth->setCurrentItem( smooth == KWPESettings::SmoothAlways ? 2 : smooth == KWPESettings::SmoothWhenEfficient ? 1 : 0 );
+    m_pdfInPage->setChecked( KWPESettings::pdfInPage() );
 
     KWPEAdBlock* adblock = KWPEAdBlock::self();
     m_enabled->setChecked( adblock->isEnabled() );
@@ -167,6 +173,7 @@ void KWPEConfigDialog::save()
     int smooth = m_smooth->currentItem();
     KWPESettings::setSmoothScrolling( smooth == 2 ? KWPESettings::SmoothAlways
                                       : smooth == 1 ? KWPESettings::SmoothWhenEfficient : KWPESettings::SmoothNever );
+    KWPESettings::setPDFInPage( m_pdfInPage->isChecked() );
 
     KWPEAdBlock* adblock = KWPEAdBlock::self();
     QValueList<KWPEAdBlock::List> before = adblock->lists();

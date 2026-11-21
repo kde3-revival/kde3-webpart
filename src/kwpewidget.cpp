@@ -195,6 +195,8 @@ public:
     QMap<int, WebKitBackForwardListItem*> itemOfToken;
     QMap<WebKitBackForwardListItem*, int> tokenOfItem;
 
+    // a URL of a scheme for Konqueror (reported outside WebKit's signal)
+    QString externalUrl;
     // the response WebKit cannot show (reported outside its signal)
     QString unsupportedUrl;
     QString unsupportedMimeType;
@@ -456,7 +458,10 @@ gboolean KWPEWidgetPrivate::onLoadFailed( WebKitWebView* view, WebKitLoadEvent, 
     // only for successful loads.
     d->loading = false;
     d->failed = true;
-    emit d->q->loadFailed( quiet ? QString::null : QString::fromUtf8( error->message ) );
+    if ( g_error_matches( error, WEBKIT_POLICY_ERROR, WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE ) )
+        emit d->q->loadHandedOff();
+    else
+        emit d->q->loadFailed( quiet ? QString::null : QString::fromUtf8( error->message ) );
     return quiet;   // otherwise WebKit shows its error page
 }
 
@@ -535,6 +540,16 @@ static int historyStepsTo( WebKitBackForwardList* list, WebKitBackForwardListIte
     return back ? back : forward;
 }
 
+// The schemes WebKit loads itself; others go to Konqueror.
+static bool isWebKitScheme( const char* uri )
+{
+    static const char* const schemes[] = { "http:", "https:", "file:", "data:", "about:", "blob:", "javascript:" };
+    for ( unsigned i = 0; i < sizeof( schemes ) / sizeof( schemes[0] ); ++i )
+        if ( g_ascii_strncasecmp( uri, schemes[i], strlen( schemes[i] ) ) == 0 )
+            return true;
+    return false;
+}
+
 gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDecision* decision,
                                             WebKitPolicyDecisionType type, gpointer data )
 {
@@ -559,6 +574,18 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
         if ( navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED && webkit_navigation_action_get_mouse_button( action ) == 2 ) {
             webkit_policy_decision_ignore( decision );
             emit d->q->newWindowRequested( QString::fromUtf8( uri ) );
+            return TRUE;
+        }
+
+        // mailto:, ftp:, smb:, ...: WebKit would show an error page.  For
+        // Konqueror (a mail program, KIO), on a click or another user
+        // gesture only: a page must not start programs by itself.
+        if ( !isWebKitScheme( uri ) ) {
+            webkit_policy_decision_ignore( decision );
+            if ( webkit_navigation_action_is_user_gesture( action ) || navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED ) {
+                d->externalUrl = QString::fromUtf8( uri );
+                QTimer::singleShot( 0, d->q, SLOT( emitExternalURL() ) );
+            }
             return TRUE;
         }
 
@@ -597,8 +624,11 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
             if ( switched && ( !method || g_ascii_strcasecmp( method, "GET" ) == 0 ) && !d->redirected )
                 d->reloadForFilters = true;
         }
+        // PDF: WebKit has a viewer (PDF.js), Konqueror's choice unless asked.
+        bool pdfToKonqueror = g_strcmp0( webkit_uri_response_get_mime_type( webkit_response_policy_decision_get_response( response ) ),
+                                         "application/pdf" ) == 0 && !KWPESettings::pdfInPage();
         if ( webkit_response_policy_decision_is_main_frame_main_resource( response )
-             && !webkit_response_policy_decision_is_mime_type_supported( response ) ) {
+             && ( pdfToKonqueror || !webkit_response_policy_decision_is_mime_type_supported( response ) ) ) {
             // The answer to a POST cannot be fetched again by Konqueror:
             // WebKit downloads it.
             const char* method = webkit_uri_request_get_http_method( webkit_response_policy_decision_get_request( response ) );
@@ -991,6 +1021,14 @@ void KWPEWidget::emitUnsupportedContent()
     d->unsupportedUrl = d->unsupportedMimeType = QString::null;
     if ( !url.isEmpty() )
         emit unsupportedContent( url, mimeType );
+}
+
+void KWPEWidget::emitExternalURL()
+{
+    QString url = d->externalUrl;
+    d->externalUrl = QString::null;
+    if ( !url.isEmpty() )
+        emit externalURLRequested( url );
 }
 
 void KWPEWidget::showContextMenu()

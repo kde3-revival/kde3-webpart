@@ -10,3 +10,6 @@ X-KDE-Library=libkwpepart
 # orders the parts otherwise (Control Center, File Associations,
 # Embedding) or picks "View Mode" in Konqueror.
 InitialPreference=12
+# Konqueror (kde3-kdebase konq-wpe) does not ask KIO for the mime type of
+# these URLs first: the part loads them and gives back what it cannot show.
+X-KDE-BrowserView-FetchesProtocols=http,https

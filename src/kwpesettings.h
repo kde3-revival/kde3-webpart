@@ -40,6 +40,14 @@ SmoothScrolling smoothScrolling();
 void setSmoothScrolling( SmoothScrolling mode );
 
 /**
+ * [Settings] PDFInPage in kwpepartrc: PDF files shown by WebKit's PDF.js
+ * in the page; false (default): they go to Konqueror like other content
+ * WebKit cannot show (KDE's PDF part or application, or saving).
+ */
+bool pdfInPage();
+void setPDFInPage( bool inPage );
+
+/**
  * The settings were changed and written: apply them here and in every
  * other process with the part (a DCOP signal).
  */

@@ -67,12 +67,14 @@ private slots:
     void slotUrlChanged( const QString& url, bool newItem );
     void slotLoadFinished();
     void slotLoadFailed( const QString& message );
+    void slotLoadHandedOff();
     void slotLoadProgress( int percent );
     void slotTitleChanged( const QString& title );
     void slotLinkHovered( const QString& url );
     void slotNewWindowRequested( const QString& url );
     void slotUnsupportedContent( const QString& url, const QString& mimeType );
     void slotHistoryNavigationRequested( int steps );
+    void slotExternalURL( const QString& url );
     void slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
     void slotFind();
     void slotFindDialogOk();

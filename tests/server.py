@@ -13,6 +13,8 @@
 #                        ad-like resources for pages/adblock.html (an image,
 #                        a script or a frame, by extension)
 #   /frames/*            a small third-party frame
+#   /typed?type=T&name=N a small body of content type T (application/pdf: a
+#                        real one-page PDF), Content-Disposition inline; N
 #   /report?host=&name=&expected=&result=
 #                        pages/adblock.html reports a result: printed on stdout
 
@@ -26,7 +28,22 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 PAGES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pages')
 
 
+# A minimal one-page PDF.
+PDF = (b'%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
+       b'2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n'
+       b'3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R'
+       b'/Resources<</Font<</F1 5 0 R>>>>>>endobj\n'
+       b'4 0 obj<</Length 44>>stream\nBT /F1 24 Tf 40 100 Td (kwpepart PDF) Tj ET\nendstream endobj\n'
+       b'5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n'
+       b'trailer<</Root 1 0 R>>\n%%EOF\n')
+
+
 class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Who asked: KIO (Konqueror's mime type probe) or WebKit.
+        agent = self.headers.get('User-Agent', '') if hasattr(self, 'headers') and self.headers else ''
+        sys.stderr.write('%s [%s]\n' % (fmt % args, 'KIO' if 'Konqueror' in agent else 'WebKit' if 'WebKit' in agent else agent))
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=PAGES, **kwargs)
 
@@ -73,6 +90,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_body(body, 'text/html; charset=utf-8',
                                   [('Set-Cookie', 'persistent=yes; Max-Age=86400; Path=/'),
                                    ('Set-Cookie', 'session=yes; Path=/')])
+        if url.path == '/typed':
+            ctype = query.get('type', ['text/plain'])[0]
+            name = query.get('name', [''])[0]
+            body = PDF if ctype == 'application/pdf' else ('typed %s\n' % ctype).encode() * 20
+            extra = [('Content-Disposition', 'inline; filename="%s"' % name)] if name else []
+            return self.send_body(body, ctype, extra)
         if url.path == '/report':
             print('REPORT %s: %s | expected %s | got %s' % (query.get('host', [''])[0], query.get('name', [''])[0],
                                                            query.get('expected', [''])[0], query.get('result', [''])[0]),

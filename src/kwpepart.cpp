@@ -90,6 +90,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( urlChanged( const QString&, bool ) ), SLOT( slotUrlChanged( const QString&, bool ) ) );
     connect( m_view, SIGNAL( loadFinished() ), SLOT( slotLoadFinished() ) );
     connect( m_view, SIGNAL( loadFailed( const QString& ) ), SLOT( slotLoadFailed( const QString& ) ) );
+    connect( m_view, SIGNAL( loadHandedOff() ), SLOT( slotLoadHandedOff() ) );
     connect( m_view, SIGNAL( loadProgress( int ) ), SLOT( slotLoadProgress( int ) ) );
     connect( m_view, SIGNAL( titleChanged( const QString& ) ), SLOT( slotTitleChanged( const QString& ) ) );
     connect( m_view, SIGNAL( linkHovered( const QString& ) ), SLOT( slotLinkHovered( const QString& ) ) );
@@ -97,6 +98,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( unsupportedContent( const QString&, const QString& ) ),
              SLOT( slotUnsupportedContent( const QString&, const QString& ) ) );
     connect( m_view, SIGNAL( historyNavigationRequested( int ) ), SLOT( slotHistoryNavigationRequested( int ) ) );
+    connect( m_view, SIGNAL( externalURLRequested( const QString& ) ), SLOT( slotExternalURL( const QString& ) ) );
     connect( m_view, SIGNAL( contextMenuRequested( const QString&, const QString&, bool, const QPoint& ) ),
              SLOT( slotContextMenu( const QString&, const QString&, bool, const QPoint& ) ) );
     // Always: WPE does not report selection changes (WebKitEditorState
@@ -325,6 +327,18 @@ void KWPEPart::slotLoadFailed( const QString& message )
     emit canceled( message );
 }
 
+void KWPEPart::slotLoadHandedOff()
+{
+    // A download, or content for Konqueror: the page shown before stays,
+    // and so does its URL (Konqueror opened a URL here without asking KIO
+    // for its type first, see kwpepart.desktop).
+    m_ownNavigation = false;
+    m_url = KURL( m_view->url() );
+    m_historyToken = m_view->currentHistoryToken();
+    emit m_ext->setLocationBarURL( m_url.prettyURL() );
+    emit canceled( QString::null );
+}
+
 void KWPEPart::slotLoadProgress( int percent )
 {
     emit m_ext->loadingProgress( percent );
@@ -356,8 +370,30 @@ void KWPEPart::slotUnsupportedContent( const QString& url, const QString& mimeTy
         return;
     }
     m_lastUnsupported = url;
+    // The view still shows the page before (or nothing): that is our URL
+    // again.  Otherwise Konqueror takes the request for a link to the page
+    // itself (a URL Konqueror had us open without asking KIO for its mime
+    // type) and only tries to embed it, never offering to save it.
+    m_url = KURL( m_view->url() );
+    m_historyToken = m_view->currentHistoryToken();
     KParts::URLArgs args;
     args.serviceType = mimeType;
+    // Konqueror may replace this part (another part embeds it): deleted.
+    QGuardedPtr<KWPEPart> self( this );
+    KURL shown = m_url;
+    emit m_ext->openURLRequest( KURL( url ), args );
+    // Saved, given to an application or cancelled: the location bar shows
+    // the page on screen again.
+    if ( self && m_url == shown )
+        emit m_ext->setLocationBarURL( m_url.prettyURL() );
+}
+
+void KWPEPart::slotExternalURL( const QString& url )
+{
+    // Konqueror runs the mail program for mailto:, embeds KIO's view of
+    // ftp:, smb:, ... (as for links in KHTML).
+    KParts::URLArgs args;
+    args.metaData()["referrer"] = m_url.url();
     emit m_ext->openURLRequest( KURL( url ), args );
 }
 

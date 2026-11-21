@@ -105,6 +105,11 @@ signals:
     void urlChanged( const QString& url, bool newItem );
     void loadFinished();
     void loadFailed( const QString& message );
+    /**
+     * The main frame load became a download or went to Konqueror
+     * (unsupportedContent()): the page before stays.
+     */
+    void loadHandedOff();
     void loadProgress( int percent );
     void titleChanged( const QString& title );
     void linkHovered( const QString& url );
@@ -112,6 +117,11 @@ signals:
     void newWindowRequested( const QString& url );
     /** A main frame response WebKit cannot show (PDF, archive, ...). */
     void unsupportedContent( const QString& url, const QString& mimeType );
+    /**
+     * A link (a click, a user gesture) to a URL WebKit does not load
+     * (mailto:, ftp:, smb:, ...): for Konqueror (KIO, an application).
+     */
+    void externalURLRequested( const QString& url );
     /** A script went back/forward (history.back()), @p steps from here. */
     void historyNavigationRequested( int steps );
     /**
@@ -155,6 +165,7 @@ private slots:
     void printFrameStats();
     void showContextMenu();
     void emitUnsupportedContent();
+    void emitExternalURL();
     void reloadAfterCrash();
     void askAuthentication();
     void adBlockChanged();

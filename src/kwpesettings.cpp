@@ -97,6 +97,20 @@ void KWPESettings::setSmoothScrolling( SmoothScrolling mode )
     c->writeEntry( "SmoothScrolling", mode == SmoothAlways ? "Always" : mode == SmoothWhenEfficient ? "WhenEfficient" : "Never" );
 }
 
+bool KWPESettings::pdfInPage()
+{
+    KConfig* c = config();
+    c->setGroup( "Settings" );
+    return c->readBoolEntry( "PDFInPage", false );
+}
+
+void KWPESettings::setPDFInPage( bool inPage )
+{
+    KConfig* c = config();
+    c->setGroup( "Settings" );
+    c->writeEntry( "PDFInPage", inPage );
+}
+
 void KWPESettings::changed()
 {
     config()->sync();

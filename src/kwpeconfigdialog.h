@@ -52,6 +52,7 @@ private:
     void save();
 
     QComboBox* m_smooth;
+    QCheckBox* m_pdfInPage;
     QCheckBox* m_enabled;
     QListView* m_lists;
     KLineEdit* m_url;
