@@ -151,6 +151,7 @@ protected:
 private slots:
     void printFrameStats();
     void showContextMenu();
+    void emitUnsupportedContent();
     void reloadAfterCrash();
     void askAuthentication();
 

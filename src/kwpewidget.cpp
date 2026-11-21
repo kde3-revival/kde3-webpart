@@ -189,6 +189,10 @@ public:
     QMap<int, WebKitBackForwardListItem*> itemOfToken;
     QMap<WebKitBackForwardListItem*, int> tokenOfItem;
 
+    // the response WebKit cannot show (reported outside its signal)
+    QString unsupportedUrl;
+    QString unsupportedMimeType;
+
     // the context menu WebKit asked for (shown outside its signal)
     QString menuLink;
     QString menuImage;
@@ -560,10 +564,12 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
                 return TRUE;
             }
             WebKitURIResponse* r = webkit_response_policy_decision_get_response( response );
-            QString uri = QString::fromUtf8( webkit_uri_response_get_uri( r ) );
-            QString mimeType = QString::fromLatin1( webkit_uri_response_get_mime_type( r ) );
+            d->unsupportedUrl = QString::fromUtf8( webkit_uri_response_get_uri( r ) );
+            d->unsupportedMimeType = QString::fromLatin1( webkit_uri_response_get_mime_type( r ) );
             webkit_policy_decision_ignore( decision );
-            emit d->q->unsupportedContent( uri, mimeType );
+            // Not inside WebKit's signal: Konqueror may ask the user
+            // (an event loop) and replace this part (delete the view).
+            QTimer::singleShot( 0, d->q, SLOT( emitUnsupportedContent() ) );
             return TRUE;
         }
     }
@@ -742,6 +748,8 @@ bool KWPEWidget::isValid() const
 
 void KWPEWidget::load( const QString& url )
 {
+    // A response of the previous page not reported yet: superseded.
+    d->unsupportedUrl = QString::null;
     if ( d->view )
         webkit_web_view_load_uri( d->view, url.utf8().data() );
 }
@@ -894,6 +902,15 @@ void KWPEWidget::reloadAfterCrash()
 {
     if ( d->view )
         webkit_web_view_reload( d->view );
+}
+
+void KWPEWidget::emitUnsupportedContent()
+{
+    QString url = d->unsupportedUrl;
+    QString mimeType = d->unsupportedMimeType;
+    d->unsupportedUrl = d->unsupportedMimeType = QString::null;
+    if ( !url.isEmpty() )
+        emit unsupportedContent( url, mimeType );
 }
 
 void KWPEWidget::showContextMenu()
