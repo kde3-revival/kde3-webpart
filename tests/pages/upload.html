@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><title>upload</title>
+<style> input { display: block; margin: 12px 0; font-size: 16px; } #log { font: 13px monospace; white-space: pre; } </style>
+</head><body>
+<h3>File chooser</h3>
+<input type="file" id="one">
+<input type="file" id="many" multiple accept="image/*,application/pdf">
+<div id="log"></div>
+<script>
+function log(s) {
+  document.getElementById('log').textContent += s + '\n';
+  new Image().src = '/report?host=' + location.host + '&name=upload&expected=&result=' + encodeURIComponent(s);
+}
+['one', 'many'].forEach(function (id) {
+  document.getElementById(id).addEventListener('change', function () {
+    var f = this.files, names = [];
+    for (var i = 0; i < f.length; i++) names.push(f[i].name + ' (' + f[i].size + ' bytes)');
+    log(id + ': ' + names.join(', '));
+  });
+});
+</script>
+</body></html>

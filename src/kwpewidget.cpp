@@ -35,6 +35,7 @@
 
 #include "kwpeadblock.h"
 #include "kwpeclipboard.h"
+#include "kwpedialogs.h"
 #include "kwpedownload.h"
 #include "kwpesettings.h"
 #include "kwpewidget.h"
@@ -176,6 +177,8 @@ public:
     static void onAuthenticationCancelled( WebKitAuthenticationRequest*, gpointer data );
     static void onSubmitForm( WebKitWebView*, WebKitFormSubmissionRequest* request, gpointer data );
     void dropAuthentication();
+    static gboolean onRunFileChooser( WebKitWebView*, WebKitFileChooserRequest* request, gpointer data );
+    void showPageDialog( QWidget* dialog );
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
@@ -214,6 +217,7 @@ public:
     bool overEditable;           // the pointer is over a text field (middle click pastes)
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
+    QGuardedPtr<QWidget> pageDialog;   // file chooser or script dialog (KWPEFileChooser): the page takes no input
     bool insecureContent;        // the page loaded http content (https page)
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
     unsigned authSerial;         // counts the requests (a new one may reuse the address of an old one)
@@ -299,6 +303,7 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "insecure-content-detected", G_CALLBACK( onInsecureContent ), this );
     g_signal_connect( view, "authenticate", G_CALLBACK( onAuthenticate ), this );
     g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
+    g_signal_connect( view, "run-file-chooser", G_CALLBACK( onRunFileChooser ), this );
 
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
@@ -320,6 +325,8 @@ void KWPEWidgetPrivate::destroy()
 {
     if ( !view )
         return;
+    // A dialog of the page answers WebKit (cancelled) while the view lives.
+    delete static_cast<QWidget*>( pageDialog );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
@@ -783,6 +790,29 @@ void KWPEWidgetPrivate::onSubmitForm( WebKitWebView*, WebKitFormSubmissionReques
     webkit_form_submission_request_submit( request );
 }
 
+// <input type=file>: KDE's file dialog, modal to the page only.
+gboolean KWPEWidgetPrivate::onRunFileChooser( WebKitWebView*, WebKitFileChooserRequest* request, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( d->pageDialog )
+        webkit_file_chooser_request_cancel( request );   // one at a time
+    else
+        d->showPageDialog( new KWPEFileChooser( request, d->q ) );
+    return TRUE;
+}
+
+// A dialog of the page: shown while the page is (a background tab shows
+// it when it comes to the front), no input to the page meanwhile.
+void KWPEWidgetPrivate::showPageDialog( QWidget* dialog )
+{
+    pageDialog = dialog;
+    if ( q->isVisible() ) {
+        dialog->show();
+        dialog->raise();
+        dialog->setActiveWindow();
+    }
+}
+
 gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer )
 {
     // Geolocation, camera, microphone, notifications, ...: no UI to ask
@@ -1134,6 +1164,20 @@ QString KWPEWidget::bufferPathName()
 
 bool KWPEWidget::event( QEvent* e )
 {
+    // A dialog of the page is open: the page takes no input.
+    if ( d->pageDialog ) {
+        switch ( e->type() ) {
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::Wheel:
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease:
+            return true;
+        default:
+            break;
+        }
+    }
     switch ( e->type() ) {
     case QEvent::Reparent:
         // Qt 3 made a new X window.
@@ -1181,6 +1225,8 @@ void KWPEWidget::showEvent( QShowEvent* )
         return;
     d->attach();
     wpe_view_map( d->wpeView );
+    if ( d->pageDialog && !d->pageDialog->isVisible() )
+        d->showPageDialog( d->pageDialog );
     wpe_toplevel_state_changed( d->toplevel, isActiveWindow() ? WPE_TOPLEVEL_STATE_ACTIVE : WPE_TOPLEVEL_STATE_NONE );
     // WebKit takes the pointer as inside until it is told otherwise (the
     // overlay scrollbars stay shown and keep repainting).
@@ -1190,6 +1236,9 @@ void KWPEWidget::showEvent( QShowEvent* )
 
 void KWPEWidget::hideEvent( QHideEvent* )
 {
+    // Another tab: the page's dialog waits for this one to come back.
+    if ( d->pageDialog )
+        d->pageDialog->hide();
     if ( d->wpeView )
         wpe_view_unmap( d->wpeView );
 }
