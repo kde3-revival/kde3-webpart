@@ -23,6 +23,7 @@
 #include <kfiledialog.h>
 #include <kio/global.h>
 #include <kio/job.h>
+#include <kio/netaccess.h>
 #include <kio/observer.h>
 #include <klocale.h>
 #include <kmessagebox.h>
@@ -131,7 +132,14 @@ void KWPEDownload::askDestination()
                                                i18n( "Save As - %1" ).arg( m_source.prettyURL() ) );
         if ( !self )
             return;
-        if ( !destination.isValid() || !destination.isLocalFile() || !QFile::exists( destination.path() ) )
+        if ( !destination.isValid() )
+            break;
+        // A remote destination is overwritten by KIO at the end: ask too.
+        bool exists = destination.isLocalFile() ? QFile::exists( destination.path() )
+                                                : KIO::NetAccess::exists( destination, false, parent );
+        if ( !self )
+            return;
+        if ( !exists )
             break;
         int answer = KMessageBox::warningContinueCancel( parent,
                  i18n( "A file named \"%1\" already exists. Are you sure you want to overwrite it?" )
