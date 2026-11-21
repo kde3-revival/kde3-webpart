@@ -447,6 +447,27 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 
 ## Known problems
 
+* **Images scaled down by a page look jagged** (screenshots lose their
+  text, photos alias; e.g. the screenshot on icesoft.ro).  This is WebKit
+  itself, not the part: the Skia port draws `InterpolationQuality::Default`
+  with bilinear filtering and no mipmaps, which point samples anything
+  shown at less than half its size (the Cairo port box-filtered).  The
+  part's output is bit-identical to Skia's `drawImageRect` with
+  `SkSamplingOptions(kLinear, kNone)`; buffers are presented 1:1.  No
+  setting, CSS (`image-rendering`) or environment variable changes it, and
+  Skia is linked into libWPEWebKit with hidden symbols.  The fix is
+  `webkit/0001-Skia-Sample-scaled-down-images-from-mipmaps.patch` (applies
+  to wpewebkit 2.54.3; trilinear filtering when a decoded image or
+  background is scaled down, unchanged at 1:1, scaled up, while resizing,
+  for `image-rendering: pixelated`, for texture-backed images (canvas,
+  video) and sprite (strict source rect) draws), which needs a patched WPE
+  WebKit build.
+  Measured with the Skia of 2.54.3 (`tests/imagescale`), PSNR / SSIM against
+  Lanczos-3: zone plate 2048 -> 280: 12.7 dB / 0.05 -> 30.7 dB / 0.77;
+  1920x1152 screenshot -> 400x240: 22.4 dB / 0.83 -> 34.4 dB / 0.98,
+  -> 640x384: 20.5 dB / 0.80 -> 32.6 dB / 0.97 (Firefox: Lanczos-3 itself).
+  Images in composited layers (`will-change`, 3D transforms) are drawn by
+  the compositor, still without mipmaps.
 * WebKit 2.54 drops the contents of GPU-accelerated 2D canvases of pages
   in the back/forward cache (going back shows them empty), so 2D canvas
   acceleration is off by default.

@@ -1,0 +1,159 @@
+From 0301021056a0dcacdb6c1cfaef79b36b3efb891c Mon Sep 17 00:00:00 2001
+From: Serghei Amelian <serghei.amelian@gmail.com>
+Date: Sat, 21 Nov 2026 18:52:52 +0200
+Subject: [PATCH] [Skia] Sample scaled-down images from mipmaps
+
+InterpolationQuality::Default (and Medium, High) map to bilinear (bicubic
+for High) filtering without mipmaps.  Those filters read only the 2x2 (4x4)
+source pixels nearest to each destination pixel, so an image drawn at less
+than about half its size is point sampled: photos alias, screenshots shown
+as thumbnails lose their text, a zone plate turns into moire.  The Cairo
+port used CAIRO_FILTER_GOOD, which box-filters when scaling down.
+
+Use trilinear filtering (SkMipmapMode::kLinear) when the image-to-device
+matrix scales a raster image down in drawNativeImage() and drawPattern().
+Low (live and animated resizes) and DoNotInterpolate are unchanged, as are
+draws at 1:1 or scaled up, texture-backed images (Ganesh would copy them
+into a new mipmapped texture, for every promise image again) and strict
+source rect draws (SkCanvas drops mipmaps for those).  Raster images sampled with mipmaps are not packed into
+the GPU image atlas (its texture has no mipmaps, and mipmaps of an atlas
+would mix neighbouring images), and the replay canvas does not substitute
+the atlas for such draws.
+
+Measured with the Skia bundled in 2.54.3 (CPU raster and Ganesh GL),
+downscaled against a Lanczos-3 reference (PSNR / SSIM):
+  2048x2048 zone plate -> 280x280:   12.7 dB / 0.046  ->  30.7 dB / 0.769
+  1920x1152 screenshot -> 400x240:   22.4 dB / 0.826  ->  34.4 dB / 0.975
+  1920x1152 screenshot -> 640x384:   20.5 dB / 0.805  ->  32.6 dB / 0.973
+---
+ .../graphics/skia/GraphicsContextSkia.cpp     | 50 +++++++++++++++----
+ .../graphics/skia/SkiaReplayCanvas.cpp        | 10 ++--
+ 2 files changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+index e4ba236..f916d2d 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+@@ -201,6 +201,31 @@ static SkSamplingOptions toSkSamplingOptions(InterpolationQuality quality)
+     return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone);
+ }
+ 
++// Bilinear (and bicubic) filtering reads only the 2x2 (4x4) source pixels nearest to each
++// destination pixel, so an image drawn at less than about half its size is point sampled:
++// photos and screenshots shown smaller than their size alias badly (moire, broken text).
++// When the image is scaled down, sample from its mipmaps instead (trilinear filtering),
++// as the Cairo port did with CAIRO_FILTER_GOOD. InterpolationQuality::Low (used while an
++// image is being resized) and DoNotInterpolate keep their meaning. Not for texture-backed
++// images (Ganesh would copy them into a new mipmapped texture, again for every promise
++// image) nor for strict source rect draws (SkCanvas drops mipmaps for those).
++static SkSamplingOptions toSkSamplingOptions(InterpolationQuality quality, const SkMatrix& imageToDevice, bool canUseMipmaps)
++{
++    if (!canUseMipmaps || quality == InterpolationQuality::DoNotInterpolate || quality == InterpolationQuality::Low)
++        return toSkSamplingOptions(quality);
++
++    bool scaledDown = true;
++    if (!imageToDevice.hasPerspective()) {
++        SkScalar scales[2];
++        if (imageToDevice.getMinMaxScales(scales))
++            scaledDown = scales[0] < 1 - 1e-4f;
++    }
++    if (!scaledDown)
++        return toSkSamplingOptions(quality);
++
++    return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear);
++}
++
+ sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>& image) const
+ {
+     if (!image->isTextureBacked())
+@@ -232,12 +257,6 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+     if (!image)
+         return;
+ 
+-    // Collect raster images for atlas batching during recording.
+-    if (m_contextMode == ContextMode::TileRecordingMode && m_renderingMode == RenderingMode::Accelerated && !image->isTextureBacked()) {
+-        ASSERT(m_atlasLayoutBuilder);
+-        m_atlasLayoutBuilder->collectRasterImage(image);
+-    }
+-
+     auto imageSize = nativeImage.size();
+     if (options.orientation().usesWidthAsHeight())
+         imageSize = imageSize.transposedSize();
+@@ -268,11 +287,22 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+         }
+     }
+ 
++    auto clampingConstraint = options.strictImageClamping() == StrictImageClamping::Yes ? SkCanvas::kStrict_SrcRectConstraint : SkCanvas::kFast_SrcRectConstraint;
++    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality(),
++        SkMatrix::Concat(m_canvas.getTotalMatrix(), SkMatrix::RectToRect(normalizedSrcRect, normalizedDestRect)),
++        !image->isTextureBacked() && clampingConstraint == SkCanvas::kFast_SrcRectConstraint);
++
++    // Collect raster images for atlas batching during recording. The atlas texture has no
++    // mipmaps (they would mix neighbouring images), so images sampled with mipmaps stay out.
++    if (m_contextMode == ContextMode::TileRecordingMode && m_renderingMode == RenderingMode::Accelerated && !image->isTextureBacked() && samplingOptions.mipmap == SkMipmapMode::kNone) {
++        ASSERT(m_atlasLayoutBuilder);
++        m_atlasLayoutBuilder->collectRasterImage(image);
++    }
++
+     SkPaint paint = createFillPaint();
+     paint.setAlphaf(alpha());
+     paint.setBlendMode(SkiaUtilities::toSkiaBlendMode(options.blendMode(), options.compositeOperator()));
+     bool inExtraTransparencyLayer = false;
+-    auto clampingConstraint = options.strictImageClamping() == StrictImageClamping::Yes ? SkCanvas::kStrict_SrcRectConstraint : SkCanvas::kFast_SrcRectConstraint;
+ 
+     // 'imageInThisThread' is either the incoming 'image', or a wrapper around the 'image' accessible in the current thread.
+     auto imageInThisThread = imageForCurrentThread(image);
+@@ -288,11 +318,11 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+ 
+     if (hasDropShadow()) {
+         inExtraTransparencyLayer = drawOutsetShadow(paint, [&](const SkPaint& paint) {
+-            m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, toSkSamplingOptions(m_state.imageInterpolationQuality()), &paint, clampingConstraint);
++            m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
+         });
+     }
+ 
+-    m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, toSkSamplingOptions(m_state.imageInterpolationQuality()), &paint, clampingConstraint);
++    m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
+     if (inExtraTransparencyLayer)
+         restoreLayer();
+ 
+@@ -1106,7 +1136,7 @@ void GraphicsContextSkia::drawPattern(const NativeImage& nativeImage, const Floa
+     SkMatrix phaseMatrix;
+     phaseMatrix.setTranslate(phaseOffset.x(), phaseOffset.y());
+     SkMatrix shaderMatrix = SkMatrix::Concat(phaseMatrix, patternTransform);
+-    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality());
++    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality(), SkMatrix::Concat(m_canvas.getTotalMatrix(), shaderMatrix), !image->isTextureBacked());
+ 
+     SkPaint paint = createFillPaint();
+     paint.setBlendMode(SkiaUtilities::toSkiaBlendMode(options.blendMode(), options.compositeOperator()));
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp b/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
+index 6fe7285..0956c3e 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
+@@ -176,8 +176,9 @@ void SkiaReplayCanvas::onDrawGlyphRunList(const sktext::GlyphRunList& glyphRunLi
+ 
+ void SkiaReplayCanvas::onDrawImage2(const SkImage* image, SkScalar x, SkScalar y, const SkSamplingOptions& sampling, const SkPaint* paint)
+ {
+-    // Check for atlas substitution for raster images.
+-    if (!m_atlases.isEmpty() && image && !image->isTextureBacked()) {
++    // Check for atlas substitution for raster images. The atlas has no mipmaps, so a
++    // draw that samples from mipmaps (an image scaled down) uses the image itself.
++    if (!m_atlases.isEmpty() && image && !image->isTextureBacked() && sampling.mipmap == SkMipmapMode::kNone) {
+         for (auto& atlas : m_atlases) {
+             if (auto atlasRect = atlas->rectForImage(*image)) {
+                 // Draw from atlas instead of original image.
+@@ -204,8 +205,9 @@ void SkiaReplayCanvas::onDrawImageLattice2(const SkImage* image, const Lattice&
+ 
+ void SkiaReplayCanvas::onDrawImageRect2(const SkImage* image, const SkRect& src, const SkRect& dst, const SkSamplingOptions& sampling, const SkPaint* paint, SrcRectConstraint constraint)
+ {
+-    // Check for atlas substitution for raster images.
+-    if (!m_atlases.isEmpty() && image && !image->isTextureBacked()) {
++    // Check for atlas substitution for raster images. The atlas has no mipmaps, so a
++    // draw that samples from mipmaps (an image scaled down) uses the image itself.
++    if (!m_atlases.isEmpty() && image && !image->isTextureBacked() && sampling.mipmap == SkMipmapMode::kNone) {
+         for (auto& atlas : m_atlases) {
+             if (auto atlasRect = atlas->rectForImage(*image)) {
+                 // Draw from atlas instead of original image.
+-- 
+2.56.1
+
