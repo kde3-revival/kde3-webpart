@@ -1,0 +1,110 @@
+/*
+    This file is part of kde3-wpepart, a WPE WebKit browser part for KDE 3.
+
+    Copyright (C) 2026 Serghei Amelian
+
+    This library is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published
+    by the Free Software Foundation; either version 2.1 of the License, or
+    (at your option) any later version.
+*/
+
+#ifndef KWPEWIDGET_H
+#define KWPEWIDGET_H
+
+#include <qwidget.h>
+
+class QTimer;
+class KWPEWidgetPrivate;
+
+/**
+ * A widget showing a WebKitWebView (WPE WebKit) through the X11 WPE
+ * platform of wpex11platform.h.  Qt only in this header: WebKit and
+ * GLib stay in kwpewidget.cpp (Qt 3's "signals"/"slots" macros).
+ *
+ * WebKit navigates by itself (links, forms, scripts, redirects); the
+ * widget reports what happened, the part maps that onto Konqueror.
+ */
+class KWPEWidget : public QWidget
+{
+    Q_OBJECT
+
+public:
+    KWPEWidget( QWidget* parent = 0, const char* name = 0 );
+    virtual ~KWPEWidget();
+
+    /** False if WebKit could not be set up (no X11, no WPE platform). */
+    bool isValid() const;
+
+    void load( const QString& url );
+    void reload( bool bypassCache = false );
+    void stop();
+
+    QString url() const;
+    QString title() const;
+    bool isLoading() const;
+    /** https with a certificate WebKit accepted. */
+    bool isSecure() const;
+
+    /**
+     * A token for WebKit's current back/forward item (0 if none), valid
+     * as long as WebKit keeps the item; goToHistoryToken() navigates to
+     * it (false if it is gone).  The part stores tokens in Konqueror's
+     * history entries.
+     */
+    int currentHistoryToken();
+    bool goToHistoryToken( int token );
+
+    /** "DMA-BUF" or "SHM": how frames reach the X server. */
+    static QString bufferPathName();
+
+signals:
+    void loadStarted();
+    /**
+     * The main frame shows @p url now: a load committed, or a navigation
+     * inside the document (anchor, history.pushState).  @p newItem: WebKit
+     * made a new back/forward item for it (not for back/forward, reload,
+     * location.replace()).
+     */
+    void urlChanged( const QString& url, bool newItem );
+    void loadFinished();
+    void loadFailed( const QString& message );
+    void loadProgress( int percent );
+    void titleChanged( const QString& title );
+    void linkHovered( const QString& url );
+    /** target=_blank, window.open(), a middle click on a link. */
+    void newWindowRequested( const QString& url );
+    /** A main frame response WebKit cannot show (PDF, archive, ...). */
+    void unsupportedContent( const QString& url, const QString& mimeType );
+    /** A script went back/forward (history.back()), @p steps from here. */
+    void historyNavigationRequested( int steps );
+
+protected:
+    virtual bool event( QEvent* e );
+    virtual void paintEvent( QPaintEvent* e );
+    virtual void resizeEvent( QResizeEvent* e );
+    virtual void showEvent( QShowEvent* e );
+    virtual void hideEvent( QHideEvent* e );
+    virtual void focusInEvent( QFocusEvent* e );
+    virtual void focusOutEvent( QFocusEvent* e );
+    virtual bool focusNextPrevChild( bool next );
+    virtual void keyPressEvent( QKeyEvent* e );
+    virtual void keyReleaseEvent( QKeyEvent* e );
+    virtual void mousePressEvent( QMouseEvent* e );
+    virtual void mouseDoubleClickEvent( QMouseEvent* e );
+    virtual void mouseReleaseEvent( QMouseEvent* e );
+    virtual void mouseMoveEvent( QMouseEvent* e );
+    virtual void wheelEvent( QWheelEvent* e );
+    virtual void enterEvent( QEvent* e );
+    virtual void leaveEvent( QEvent* e );
+    virtual void windowActivationChange( bool oldActive );
+
+private slots:
+    void printFrameStats();
+
+private:
+    friend class KWPEWidgetPrivate;
+    KWPEWidgetPrivate* d;
+};
+
+#endif
