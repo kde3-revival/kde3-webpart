@@ -11,11 +11,13 @@ kde3_add_module(libkwpepart
     kwpepart.h
   LINK
     KDE3::kparts
+    KDE3::kutils
     PkgConfig::WPEWEBKIT
     PkgConfig::KWPEX11
 )
 
 install(FILES kwpepart.desktop DESTINATION ${KDE3_SERVICES_INSTALL_DIR})
+install(FILES kwpepart.rc DESTINATION ${KDE3_DATA_INSTALL_DIR}/kwpepart)
 
 # kwpeview URL: the part in a window of its own, for debugging
 kde3_add_executable(kwpeview

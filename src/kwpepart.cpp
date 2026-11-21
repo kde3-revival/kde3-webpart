@@ -21,6 +21,8 @@
 #include <kaction.h>
 #include <kdebug.h>
 #include <kdemacros.h>
+#include <kfinddialog.h>
+#include <knotifyclient.h>
 #include <klocale.h>
 #include <kmimetype.h>
 #include <kstdaction.h>
@@ -48,7 +50,7 @@ static const char stateMagic[] = "kwpepart-1";
 
 KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
                     QObject* parent, const char* name, const QStringList& )
-    : KParts::ReadOnlyPart( parent, name ), m_ownNavigation( false ), m_historyToken( 0 )
+    : KParts::ReadOnlyPart( parent, name ), m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 )
 {
     setInstance( KWPEPartFactory::instance() );
 
@@ -74,10 +76,20 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
              SLOT( slotContextMenu( const QString&, const QString&, bool, const QPoint& ) ) );
     connect( m_view, SIGNAL( copyAvailable( bool ) ), SLOT( slotCopyAvailable( bool ) ) );
     m_ext->enableAction( "copy", false );
+    connect( m_view, SIGNAL( findResult( bool, unsigned ) ), SLOT( slotFindResult( bool, unsigned ) ) );
+
+    KStdAction::find( this, SLOT( slotFind() ), actionCollection(), "find" );
+    m_findNext = KStdAction::findNext( this, SLOT( slotFindNext() ), actionCollection(), "findNext" );
+    m_findPrevious = KStdAction::findPrev( this, SLOT( slotFindPrevious() ), actionCollection(), "findPrevious" );
+    m_findNext->setEnabled( false );
+    m_findPrevious->setEnabled( false );
+
+    setXMLFile( "kwpepart.rc" );
 }
 
 KWPEPart::~KWPEPart()
 {
+    delete m_findDialog;
 }
 
 KAboutData* KWPEPart::createAboutData()
@@ -259,6 +271,68 @@ void KWPEPart::slotContextMenu( const QString& linkUrl, const QString& imageUrl,
     emit m_ext->popupMenu( client, globalPos, popupURL, args, flags, S_IFREG );
     if ( guard )
         delete client;
+}
+
+void KWPEPart::slotFind()
+{
+    if ( m_findDialog ) {
+        m_findDialog->show();
+        m_findDialog->raise();
+        m_findDialog->setActiveWindow();
+        return;
+    }
+    // Non-modal, like KHTML's.
+    m_findDialog = new KFindDialog( false, widget(), "kwpefind", m_findOptions, m_findHistory );
+    m_findDialog->setHasSelection( false );
+    m_findDialog->setHasCursor( false );
+    m_findDialog->setSupportsRegularExpressionFind( false );
+    if ( !m_findText.isEmpty() )
+        m_findDialog->setPattern( m_findText );
+    connect( m_findDialog, SIGNAL( okClicked() ), SLOT( slotFindDialogOk() ) );
+    connect( m_findDialog, SIGNAL( finished() ), m_findDialog, SLOT( delayedDestruct() ) );
+    m_findDialog->show();
+}
+
+void KWPEPart::slotFindDialogOk()
+{
+    if ( !m_findDialog )
+        return;
+    m_findText = m_findDialog->pattern();
+    m_findOptions = m_findDialog->options() & ~KFindDialog::RegularExpression;
+    m_findHistory = m_findDialog->findHistory();
+    m_findDialog->hide();
+    m_findNext->setEnabled( !m_findText.isEmpty() );
+    m_findPrevious->setEnabled( !m_findText.isEmpty() );
+    if ( !m_findText.isEmpty() )
+        m_view->find( m_findText, m_findOptions & KFindDialog::CaseSensitive, m_findOptions & KFindDialog::WholeWordsOnly,
+                      m_findOptions & KFindDialog::FindBackwards );
+}
+
+void KWPEPart::slotFindNext()
+{
+    if ( m_findText.isEmpty() )
+        slotFind();
+    else
+        m_view->findNext( !( m_findOptions & KFindDialog::FindBackwards ) );
+}
+
+void KWPEPart::slotFindPrevious()
+{
+    if ( m_findText.isEmpty() )
+        slotFind();
+    else
+        m_view->findNext( m_findOptions & KFindDialog::FindBackwards );
+}
+
+void KWPEPart::slotFindResult( bool found, unsigned matches )
+{
+    if ( found ) {
+        emit setStatusBarText( matches >= 1000 ? i18n( "More than 1000 matches" )
+                                               : i18n( "1 match", "%n matches", matches ) );
+    } else {
+        KNotifyClient::beep();
+        emit setStatusBarText( i18n( "No matches found for '%1'." ).arg( m_findText ) );
+    }
 }
 
 void KWPEPart::slotCopyAvailable( bool available )

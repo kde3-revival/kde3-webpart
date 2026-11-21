@@ -148,6 +148,8 @@ public:
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onEditorStateChanged( WebKitEditorState* state, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
+    static void onFoundText( WebKitFindController*, guint matchCount, gpointer data );
+    static void onFailedToFindText( WebKitFindController*, gpointer data );
 
     KWPEWidget* q;
     WebKitWebView* view;
@@ -243,6 +245,9 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
     g_signal_connect( webkit_web_view_get_editor_state( view ), "changed", G_CALLBACK( onEditorStateChanged ), this );
     cancellable = g_cancellable_new();
+    WebKitFindController* finder = webkit_web_view_get_find_controller( view );
+    g_signal_connect( finder, "found-text", G_CALLBACK( onFoundText ), this );
+    g_signal_connect( finder, "failed-to-find-text", G_CALLBACK( onFailedToFindText ), this );
 
     statsEnabled = envFlag( "KWPE_STATS" );
     if ( statsEnabled ) {
@@ -261,6 +266,7 @@ void KWPEWidgetPrivate::destroy()
         return;
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_editor_state( view ), this );
+    g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
     g_object_unref( cancellable );
     cancellable = 0;
@@ -560,6 +566,16 @@ void KWPEWidgetPrivate::onSelectionText( GObject* view, GAsyncResult* result, gp
     g_object_unref( value );
 }
 
+void KWPEWidgetPrivate::onFoundText( WebKitFindController*, guint matchCount, gpointer data )
+{
+    emit static_cast<KWPEWidgetPrivate*>( data )->q->findResult( true, matchCount );
+}
+
+void KWPEWidgetPrivate::onFailedToFindText( WebKitFindController*, gpointer data )
+{
+    emit static_cast<KWPEWidgetPrivate*>( data )->q->findResult( false, 0 );
+}
+
 void KWPEWidgetPrivate::onFrameDisplayed( WebKitWebView*, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
@@ -607,6 +623,32 @@ void KWPEWidget::downloadURL( const QString& url )
     // WebKit's "download-started" takes it from here (onDownloadStarted).
     if ( d->view )
         g_object_unref( webkit_web_view_download_uri( d->view, url.utf8().data() ) );
+}
+
+void KWPEWidget::find( const QString& text, bool caseSensitive, bool wholeWords, bool backwards )
+{
+    if ( !d->view )
+        return;
+    guint32 options = WEBKIT_FIND_OPTIONS_WRAP_AROUND;
+    if ( !caseSensitive )
+        options |= WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE;
+    if ( wholeWords )
+        options |= WEBKIT_FIND_OPTIONS_AT_WORD_STARTS;
+    if ( backwards )
+        options |= WEBKIT_FIND_OPTIONS_BACKWARDS;
+    // All matches highlighted, up to 1000 counted.
+    webkit_find_controller_search( webkit_web_view_get_find_controller( d->view ), text.utf8().data(), options, 1000 );
+}
+
+void KWPEWidget::findNext( bool forward )
+{
+    if ( !d->view )
+        return;
+    WebKitFindController* finder = webkit_web_view_get_find_controller( d->view );
+    if ( forward )
+        webkit_find_controller_search_next( finder );
+    else
+        webkit_find_controller_search_previous( finder );
 }
 
 void KWPEWidget::copySelection()

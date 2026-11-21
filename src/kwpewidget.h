@@ -45,6 +45,14 @@ public:
      */
     void downloadURL( const QString& url );
 
+    /**
+     * Find @p text in the page (wrapping around), select the match and
+     * highlight all of them; findResult() tells how it went.
+     */
+    void find( const QString& text, bool caseSensitive, bool wholeWords, bool backwards );
+    /** The next (or previous) match of the last find(). */
+    void findNext( bool forward );
+
     /** Text is selected (in the page or in a field). */
     bool hasSelection() const;
     /** The selected text into the clipboard. */
@@ -93,6 +101,8 @@ signals:
      * image (empty: not on one), on selected text.
      */
     void contextMenuRequested( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
+    /** The result of find(), findNext(): @p matches (up to 1000). */
+    void findResult( bool found, unsigned matches );
     /** hasSelection() changed. */
     void copyAvailable( bool available );
 

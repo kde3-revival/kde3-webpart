@@ -1,0 +1,14 @@
+<!DOCTYPE kpartgui SYSTEM "kpartgui.dtd">
+<kpartgui name="kwpepart" version="1">
+<MenuBar>
+ <Menu name="edit"><text>&amp;Edit</text>
+  <Separator />
+  <Action name="find" />
+  <Action name="findNext" />
+  <Action name="findPrevious" />
+ </Menu>
+</MenuBar>
+<ToolBar name="mainToolBar"><text>Main Toolbar</text>
+ <Action name="find" />
+</ToolBar>
+</kpartgui>

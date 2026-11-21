@@ -15,8 +15,12 @@
 #include <kparts/browserextension.h>
 #include <kparts/part.h>
 #include <kxmlguiclient.h>
+#include <qguardedptr.h>
+#include <qstringlist.h>
 
 class KAboutData;
+class KAction;
+class KFindDialog;
 class KWPEWidget;
 class KWPEBrowserExtension;
 
@@ -68,6 +72,11 @@ private slots:
     void slotHistoryNavigationRequested( int steps );
     void slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
     void slotCopyAvailable( bool available );
+    void slotFind();
+    void slotFindDialogOk();
+    void slotFindNext();
+    void slotFindPrevious();
+    void slotFindResult( bool found, unsigned matches );
 
 private:
     friend class KWPEBrowserExtension;
@@ -79,6 +88,13 @@ private:
     bool m_ownNavigation;   // openURL()/restore() started what commits next
     int m_historyToken;     // WebKit's back/forward item of m_url
     QString m_lastUnsupported;
+
+    QGuardedPtr<KFindDialog> m_findDialog;
+    QString m_findText;
+    long m_findOptions;
+    QStringList m_findHistory;
+    KAction* m_findNext;
+    KAction* m_findPrevious;
 };
 
 class KWPEBrowserExtension : public KParts::BrowserExtension
