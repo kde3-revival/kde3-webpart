@@ -138,7 +138,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -197,6 +197,7 @@ public:
 
     bool insecureContent;        // the page loaded http content (https page)
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
+    unsigned authSerial;         // counts the requests (a new one may reuse the address of an old one)
     gint64 lastCrashReload;      // when the page was reloaded after a crash
     unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
@@ -666,6 +667,7 @@ gboolean KWPEWidgetPrivate::onAuthenticate( WebKitWebView*, WebKitAuthentication
     if ( d->authRequest )
         return FALSE;   // one dialog at a time
     d->authRequest = WEBKIT_AUTHENTICATION_REQUEST( g_object_ref( request ) );
+    d->authSerial++;
     g_signal_connect( request, "cancelled", G_CALLBACK( onAuthenticationCancelled ), d );
     // The dialog runs an event loop: not inside WebKit's signal.
     QTimer::singleShot( 0, d->q, SLOT( askAuthentication() ) );
@@ -868,11 +870,14 @@ void KWPEWidget::askAuthentication()
         prompt = i18n( "Authentication failed." ) + " " + prompt;
 
     QGuardedPtr<KWPEWidget> self( this );
+    unsigned serial = d->authSerial;
     int result = KIO::PasswordDialog::getNameAndPassword( user, password, 0, prompt, false,
                                                          i18n( "Authorization Dialog" ),
                                                          realm, i18n( "Site:" ) );
-    // Gone meanwhile: destroy() cancelled the request; or WebKit did.
-    if ( !self || d->authRequest != request )
+    // Gone meanwhile: destroy() cancelled the request; or WebKit did
+    // (and another request, maybe of another site, may have come since:
+    // these credentials are not for it).
+    if ( !self || d->authRequest != request || d->authSerial != serial )
         return;
     if ( result == QDialog::Accepted ) {
         WebKitCredential* credential = webkit_credential_new( user.utf8().data(), password.utf8().data(),
