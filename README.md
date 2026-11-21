@@ -185,6 +185,40 @@ same-document navigation and double every request, so:
   within 30 s or an out-of-memory kill leaves the last frame and a
   status bar message.
 
+### Clipboard, page dialogs, favicons, source (`kwpeclipboard.cpp`, `kwpedialogs.cpp`)
+
+* **Paste** (`KWPEClipboard`, the X11 platform's `WPEClipboard`): Ctrl+V,
+  Ctrl+Shift+V and Shift+Insert paste the X CLIPBOARD, a middle click
+  into a text field pastes PRIMARY (WebKit does that for GTK only):
+  text, HTML (sanitized by WebKit), URI lists, images.  What WebKit
+  copies itself (a page's `execCommand("copy")` on a click) becomes the
+  X CLIPBOARD.  WPE has a single clipboard that WebKit reads whenever
+  the web process asks, so other programs' data is served only during a
+  paste the user started (the key or the click opens a one second
+  window); scripts cannot paste (`javascript-can-access-clipboard` off,
+  DOM paste access denied by WPE).
+* **Page dialogs** are modal to the page only: non-modal windows, the
+  page takes no input while one is open, they hide with their tab and
+  come back with it, closing the tab answers them (cancel) before the
+  view goes; no nested event loop runs.  `<input type=file>`: KDE's
+  file dialog (multiple files, accept='s mime types as a filter, local
+  regular readable files only).  `alert`, `confirm`, `prompt`,
+  `onbeforeunload`: the page's origin as the caption, the message as
+  plain text, "Do not show more dialogs from this page" until the next
+  page.
+* **Favicons**: after a load the best `<link rel=icon>` for 16–32
+  pixels (http/https) goes to Konqueror (`setIconURL()`), which has
+  kded's favicons module download it into KDE's favicon cache (location
+  bar, tabs, bookmarks); without one Konqueror asks for `/favicon.ico`.
+* **View Document Source** (View menu, Ctrl+U): the main resource as
+  WebKit loaded it (no new request) in the text editor, from a temporary
+  file.
+* **Other schemes**: links to `mailto:`, `ftp:`, `smb:`, ... (a click or
+  another user gesture) go to Konqueror (the mail program, KIO).
+* **PDF** goes to Konqueror (KDE's viewer, an application or saving)
+  unless `[Settings] PDFInPage=true` (WebKit's PDF.js, a check box in
+  the settings dialog).
+
 ### Ad blocking (`kwpeadblock.cpp`, `abpconverter.cpp`, `kwpe-filterconv`)
 
 Adblock Plus filter lists become WebKit **content filters**
@@ -282,8 +316,19 @@ KDE 3 chooses parts by mime type: `kwpepart.desktop` registers for
 above KHTML's 10, so Konqueror uses this part for web pages once it is
 installed (also for local HTML files).  Users can reorder the parts in
 Control Center → File Associations → text/html → Embedding, or switch a
-view with View → View Mode.  A per-protocol choice (only http/https)
-would need a Konqueror setting; see "Next stages".
+view with View → View Mode.
+
+Konqueror normally asks KIO for the mime type of a typed (or otherwise
+opened) http URL first (KonqRun): a request of its own, and KDE's cookie
+or certificate dialogs, before the part loads the page again.
+`kwpepart.desktop` says `X-KDE-BrowserView-FetchesProtocols=http,https`:
+the Konqueror of kde3-kdebase's `konq-wpe` branch then opens such URLs as
+`text/html` directly when this part would show them (the view's part,
+or the preferred text/html part), except POST requests; KHTML views
+keep the probe.  Whatever WebKit cannot show still reaches Konqueror
+(`openURLRequest()` with the mime type: other parts, applications, the
+save dialog; KIO fetches it once more), attachments are downloaded by
+WebKit, and the location bar returns to the page on screen.
 
 ## Building
 
@@ -314,7 +359,7 @@ Environment variables:
 
 | variable | effect |
 | --- | --- |
-| `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports |
+| `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports; every paste and clipboard read |
 | `KWPE_DEBUG=2` / `3` | also every Present completion / every damage rectangle |
 | `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel event → first frame on screen, last wheel event of a burst → page at rest; time to commit, first paint and load end |
 | `KWPE_FORCE_SHM=1` | shared memory even when DRI3 is there (to compare) |
@@ -325,9 +370,15 @@ Environment variables:
 `tests/` has test pages (`pages/`, serve them with
 `python3 -m http.server`), `xinject.py` (XTest input for a nested X
 server: clicks, wheel, keys, UTF-8 text through the server's keymap; it
-refuses `:0`/`:1`), `wpemem.sh` (RSS/PSS and CPU of a UI process and its
-WebKit processes) and `bench.sh` (kwpeview idle and wheel scrolling with
-frame statistics).
+refuses `:0`/`:1`), `xselection.py` (owns an X selection with text,
+HTML or a PNG like another program, for paste tests), `wpemem.sh`
+(RSS/PSS and CPU of a UI process and its WebKit processes) and
+`bench.sh` (kwpeview idle and wheel scrolling with frame statistics).
+`server.py` serves the pages plus downloads, POST, cookies, Basic
+authentication and `/typed?type=T&name=N` answers of any type (a real
+PDF for `application/pdf`); its log says whether KIO or WebKit asked.
+Pages for stage 3: `probe.html` (PDF, archive, attachment, mailto:),
+`paste.html`, `upload.html`, `dialogs.html`.
 
 Xephyr has no DRI3, so it exercises the SHM path.  A rootful Xwayland
 in a headless compositor has DRI3 and Present (glamor) and exercises the
@@ -399,10 +450,11 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 * WebKit 2.54 drops the contents of GPU-accelerated 2D canvases of pages
   in the back/forward cache (going back shows them empty), so 2D canvas
   acceleration is off by default.
-* For http/https URLs typed or opened from outside, Konqueror first asks
-  KIO for the mime type (KonqRun), so the first request of a page goes
-  through kio_http too (KDE's cookie dialog may appear) before WebKit
-  loads it itself.
+* Without the `konq-wpe` Konqueror, typed http/https URLs are still
+  fetched by kio_http first (the mime type probe, KDE's cookie dialog).
+  With it, a file WebKit cannot show is fetched twice (WebKit, then
+  KIO) and KDE's save dialog does not know the server's file name
+  (`Content-Disposition` on a non-attachment).
 * WebKit's frames are paced by its own refresh-rate timer, not by the
   X server's vblank: frames are occasionally one vblank late.
 * POST data handed over by Konqueror (`URLArgs::postData`, e.g. a form
@@ -419,9 +471,35 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 * No `get_keymap` in the platform (WPE assumes a US keymap for its own
   keymap queries); autorepeat is not filtered; Escape never reaches the
   page.
-* Script dialogs (`alert`, `confirm`, `beforeunload`) and the file
-  chooser have no UI yet; `window.open()` returns null (popups using
-  `opener` break).
+* `window.open()` returns null (popups using `opener` break).
+* Page dialogs: the caption shows the top page's origin, also for a
+  dialog of a frame from another site (WPE does not tell the frame).
+  While an `alert()` is open the page's web process waits, and so does
+  a URL Konqueror opens in that view until the dialog is answered;
+  `onbeforeunload` is asked for links and scripts, not for URLs
+  Konqueror opens.  "No more dialogs" lasts until the next page (a
+  page can reload itself).
+  The file chooser's filter knows accept='s mime types only (WPE does
+  not expose its file extensions); remote files are refused, not
+  downloaded.
+* Clipboard: selecting text in a page does not set PRIMARY; a middle
+  click outside text fields does not open the selection as a URL (as
+  KHTML does).  Konqueror's Edit/Copy and Ctrl+C copy plain text only.
+  The one second paste window is for the whole process (a compromised
+  web process of another tab could read during it); a page can lay a
+  text field over a link so that a middle click also pastes PRIMARY
+  (as in GTK browsers and Firefox).
+* Links to other schemes cannot be told apart from those of frames of
+  other sites (WPE's navigation action does not say); they need a user
+  gesture and KDE's URL policy.
+* Favicons go through KDE's cache at 16 pixels (kded's favicons module
+  downloads them once more); SVG icons need kdelibs' SVG kimgio plugin;
+  the module and the ICO reader needed fixes (kde3-kdebase and
+  kde3-kdelibs, branches `favicons`: a kded crash with icons over 64 KiB,
+  PNG entries in ICO files, error pages taken for icons).  The icon
+  arrives after the page and is taken for the page shown then.
+* No password manager yet (KWallet for forms; the `submit-form` hook is
+  a stub).
 * Ad blocking: no count of blocked requests (WebKit does not report
   them); uBlock's scriptlets, procedural cosmetics, `$redirect` and
   `$removeparam` are not supported; a link between a site where ad
@@ -436,16 +514,19 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 ## Next stages
 
 1. **Konqueror integration**: a Konqueror setting for the web engine
-   (per protocol, skipping the KIO mime type probe for http/https);
-   view source, favicons, script dialogs, file chooser, the X clipboard
-   and primary selection (`WPEClipboard`: paste into pages), printing
-   (no WPE API: maybe a snapshot or a PDF via a headless GTK WebKit).
-   Done: context menus, find, zoom, copy.
+   (per protocol); PRIMARY from page selections, middle click to open a
+   URL; printing (no WPE API: maybe a snapshot or a PDF via a headless
+   GTK WebKit).  Done: context menus, find, zoom, copy, paste (X
+   CLIPBOARD and PRIMARY), no KIO probe (Konqueror `konq-wpe`), file
+   chooser, script dialogs, favicons, view source, other schemes.
 2. **Downloads**: `URLArgs::postData`; unsupported GET content
    downloaded by WebKit when no part embeds it.  Done: downloads via
    KDE's dialog and KIO's progress window, POST downloads.
 3. **Cookies and passwords**: KDE's cookie policy (kcookiejar), KWallet
-   for HTTP authentication and forms (hook: `submit-form`).  Done:
+   for HTTP authentication and forms (hook: `submit-form`; https top
+   frames only, never into cross-origin frames, filled on a user
+   gesture; WPE's form submission request does not tell the frame, so
+   the origin check needs a script world of our own).  Done:
    persistent cookies, HTTP authentication dialog.
 4. **Input**: XIM preedit through a `WPEInputMethodContext`; smooth
    XI2.1 scrolling as precise deltas with phases (with the Qt 3 XI2
