@@ -105,6 +105,9 @@ static bool ensureWebKit()
     }
 
     g_signal_connect( s_session, "download-started", G_CALLBACK( onDownloadStarted ), 0 );
+    // Explicit, whatever WebKit's default: a certificate error fails the
+    // load (WebKit's error page), it is never accepted silently.
+    webkit_network_session_set_tls_errors_policy( s_session, WEBKIT_TLS_ERRORS_POLICY_FAIL );
 
     s_context = webkit_web_context_new();
     webkit_web_context_set_cache_model( s_context, WEBKIT_CACHE_MODEL_WEB_BROWSER );
@@ -112,6 +115,11 @@ static bool ensureWebKit()
     s_settings = webkit_settings_new();
     webkit_settings_set_enable_smooth_scrolling( s_settings, TRUE );
     webkit_settings_set_enable_developer_extras( s_settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
+    // Explicit, whatever WebKit's defaults: file: pages read no other
+    // files, scripts open no windows by themselves.
+    webkit_settings_set_allow_file_access_from_file_urls( s_settings, FALSE );
+    webkit_settings_set_allow_universal_access_from_file_urls( s_settings, FALSE );
+    webkit_settings_set_javascript_can_open_windows_automatically( s_settings, FALSE );
     // WebKit 2.54 drops the contents of GPU canvases of pages kept in the
     // back/forward cache: going back shows them empty.  Skia's CPU canvas
     // keeps them (KWPE_CANVAS_ACCELERATION=1 to compare).
@@ -127,7 +135,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), canCopy( false ), cancellable( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), canCopy( false ), cancellable( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -151,6 +159,8 @@ public:
     static gboolean onDecidePolicy( WebKitWebView*, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data );
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
+    static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
+    static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onEditorStateChanged( WebKitEditorState* state, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
@@ -178,6 +188,9 @@ public:
     bool menuSelection;
     bool canCopy;
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
+
+    gint64 lastCrashReload;      // when the page was reloaded after a crash
+    unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
     QTimer* statsTimer;
     gint64 loadStart;
@@ -248,6 +261,8 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( webkit_web_view_get_back_forward_list( view ), "changed",
                       G_CALLBACK( onBackForwardChanged ), this );
     g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
+    g_signal_connect( view, "web-process-terminated", G_CALLBACK( onWebProcessTerminated ), this );
+    g_signal_connect( view, "permission-request", G_CALLBACK( onPermissionRequest ), this );
     g_signal_connect( webkit_web_view_get_editor_state( view ), "changed", G_CALLBACK( onEditorStateChanged ), this );
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
@@ -256,7 +271,7 @@ void KWPEWidgetPrivate::create()
 
     statsEnabled = envFlag( "KWPE_STATS" );
     if ( statsEnabled ) {
-        webkit_web_view_add_frame_displayed_callback( view, onFrameDisplayed, this, 0 );
+        frameCallback = webkit_web_view_add_frame_displayed_callback( view, onFrameDisplayed, this, 0 );
         statsTimer = new QTimer( q );
         QObject::connect( statsTimer, SIGNAL( timeout() ), q, SLOT( printFrameStats() ) );
         statsTimer->start( 1000 );
@@ -279,7 +294,9 @@ void KWPEWidgetPrivate::destroy()
     g_object_set_data( G_OBJECT( view ), widgetKey, 0 );
     KWPE::attachView( wpeView, 0, 0 );
     forgetItems( 0 );
-    webkit_web_view_try_close( view );
+    if ( frameCallback )
+        webkit_web_view_remove_frame_displayed_callback( view, frameCallback );
+    frameCallback = 0;
     g_object_unref( view );
     g_object_unref( toplevel );
     view = 0;
@@ -596,6 +613,38 @@ void KWPEWidgetPrivate::onFailedToFindText( WebKitFindController*, gpointer data
     emit static_cast<KWPEWidgetPrivate*>( data )->q->findResult( false, 0 );
 }
 
+void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    bool wasLoading = d->loading;
+    d->loading = false;
+    d->failed = true;
+    if ( reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API )
+        return;
+    fprintf( stderr, "kwpe: the web process of %s %s\n", d->url.utf8().data(),
+             reason == WEBKIT_WEB_PROCESS_CRASHED ? "crashed" : "exceeded its memory limit" );
+    // Konqueror must not keep spinning.
+    if ( wasLoading )
+        emit d->q->loadFailed( QString::null );
+    // A crash: reload once (a new web process), not in a loop.  Out of
+    // memory: the same page would do it again; reload by hand.
+    gint64 now = g_get_monotonic_time();
+    if ( reason == WEBKIT_WEB_PROCESS_CRASHED && now - d->lastCrashReload > 30 * G_USEC_PER_SEC ) {
+        d->lastCrashReload = now;
+        QTimer::singleShot( 0, d->q, SLOT( reloadAfterCrash() ) );
+    } else {
+        emit d->q->webProcessFailed( reason == WEBKIT_WEB_PROCESS_CRASHED );
+    }
+}
+
+gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer )
+{
+    // Geolocation, camera, microphone, notifications, ...: no UI to ask
+    // the user yet, so no.
+    webkit_permission_request_deny( request );
+    return TRUE;
+}
+
 void KWPEWidgetPrivate::onFrameDisplayed( WebKitWebView*, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
@@ -733,6 +782,12 @@ void KWPEWidget::copySelection()
 bool KWPEWidget::hasSelection() const
 {
     return d->canCopy;
+}
+
+void KWPEWidget::reloadAfterCrash()
+{
+    if ( d->view )
+        webkit_web_view_reload( d->view );
 }
 
 void KWPEWidget::showContextMenu()

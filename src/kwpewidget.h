@@ -118,6 +118,11 @@ signals:
     void contextMenuRequested( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
     /** The result of find(), findNext(): @p matches (up to 1000). */
     void findResult( bool found, unsigned matches );
+    /**
+     * The web process died and the page was not reloaded (@p crashed:
+     * again within 30 s; otherwise: out of memory).  The last frame stays.
+     */
+    void webProcessFailed( bool crashed );
     /** zoom() changed (setZoom(), Ctrl+wheel). */
     void zoomChanged( int percent );
     /** hasSelection() changed. */
@@ -146,6 +151,7 @@ protected:
 private slots:
     void printFrameStats();
     void showContextMenu();
+    void reloadAfterCrash();
 
 private:
     friend class KWPEWidgetPrivate;

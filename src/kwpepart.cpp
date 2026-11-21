@@ -94,6 +94,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_zoomNormal->setShortcut( KShortcut( "CTRL+0" ) );
     m_zoomNormal->setEnabled( false );
     connect( m_view, SIGNAL( zoomChanged( int ) ), SLOT( slotZoomChanged( int ) ) );
+    connect( m_view, SIGNAL( webProcessFailed( bool ) ), SLOT( slotWebProcessFailed( bool ) ) );
 
     setXMLFile( "kwpepart.rc" );
 }
@@ -354,6 +355,12 @@ void KWPEPart::slotFindResult( bool found, unsigned matches )
         KNotifyClient::beep();
         emit setStatusBarText( i18n( "No matches found for '%1'." ).arg( m_findText ) );
     }
+}
+
+void KWPEPart::slotWebProcessFailed( bool crashed )
+{
+    emit setStatusBarText( crashed ? i18n( "The page crashed again. Reload to try once more." )
+                                   : i18n( "The page used too much memory and was stopped. Reload to show it again." ) );
 }
 
 void KWPEPart::slotZoomIn()
