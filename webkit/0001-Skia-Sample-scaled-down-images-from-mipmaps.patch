@@ -1,6 +1,6 @@
-From 0301021056a0dcacdb6c1cfaef79b36b3efb891c Mon Sep 17 00:00:00 2001
+From 962068a4080f9958d9dc4ea46f86fafadc830c9f Mon Sep 17 00:00:00 2001
 From: Serghei Amelian <serghei.amelian@gmail.com>
-Date: Sat, 21 Nov 2026 18:52:52 +0200
+Date: Sat, 21 Nov 2026 22:17:19 +0200
 Subject: [PATCH] [Skia] Sample scaled-down images from mipmaps
 
 InterpolationQuality::Default (and Medium, High) map to bilinear (bicubic
@@ -13,28 +13,71 @@ port used CAIRO_FILTER_GOOD, which box-filters when scaling down.
 Use trilinear filtering (SkMipmapMode::kLinear) when the image-to-device
 matrix scales a raster image down in drawNativeImage() and drawPattern().
 Low (live and animated resizes) and DoNotInterpolate are unchanged, as are
-draws at 1:1 or scaled up, texture-backed images (Ganesh would copy them
-into a new mipmapped texture, for every promise image again) and strict
-source rect draws (SkCanvas drops mipmaps for those).  Raster images sampled with mipmaps are not packed into
-the GPU image atlas (its texture has no mipmaps, and mipmaps of an atlas
-would mix neighbouring images), and the replay canvas does not substitute
-the atlas for such draws.
+draws at 1:1 or scaled up and texture-backed images (Ganesh would copy them
+into a new mipmapped texture, for every promise image again).  When painting
+on the CPU, images whose mipmaps would not fit in half of Skia's resource
+cache (32 MB) go without, so that they are not rebuilt for every tile.
+
+Most draws are strict source rect draws (CSS backgrounds, border-image,
+list markers; only RenderImage draws are not), and SkCanvas drops mipmaps
+for those: the mipmaps of the whole image would mix in the pixels around
+the source rect (the neighbouring sprites of a CSS sprite sheet).  So a
+scaled-down strict draw whose source rect covers the whole image is drawn
+as a fast one (there is nothing around it), and one of a part of the image
+draws from a copy of that part with its own mipmaps.  The copies (at most
+16 MB each) are kept in a small LRU cache (48 MB, 256 entries) keyed by the
+source's unique ID, without keeping the source alive; a source drawn with
+ever-changing, mostly overlapping parts (a fixed background while
+scrolling) falls back to the strict draw without mipmaps after a few
+changes instead of copying on every frame.  drawPattern() records its tile
+(border-image slices, background-repeat: space/round) the same way.
+
+Raster images sampled with mipmaps are not packed into the GPU image atlas
+(its texture has no mipmaps, and mipmaps of an atlas would mix neighbouring
+images), and the replay canvas does not substitute the atlas for such draws.
 
 Measured with the Skia bundled in 2.54.3 (CPU raster and Ganesh GL),
 downscaled against a Lanczos-3 reference (PSNR / SSIM):
   2048x2048 zone plate -> 280x280:   12.7 dB / 0.046  ->  30.7 dB / 0.769
   1920x1152 screenshot -> 400x240:   22.4 dB / 0.826  ->  34.4 dB / 0.975
   1920x1152 screenshot -> 640x384:   20.5 dB / 0.805  ->  32.6 dB / 0.973
+and in WPE (GPU tiles, Mesa):
+  <img> 1920x1152 -> 400x240:                22.4 dB  ->  32.8 dB
+  background-size 400x240 / cover / contain: 22.4 dB  ->  32.8 dB
+  background-repeat, 2048 -> 200 tiles:      12.8 dB  ->  35.7 dB
+  background-repeat: space, same tiles:      13.0 dB  ->  34.9 dB
+  border-image, 512px slices at 80px:        13.1 dB  ->  29.7 dB
+  sprite (sheet 512 -> 128) 256 -> 64:       35.7 dB  ->  50.5 dB, no bleeding
 ---
- .../graphics/skia/GraphicsContextSkia.cpp     | 50 +++++++++++++++----
- .../graphics/skia/SkiaReplayCanvas.cpp        | 10 ++--
- 2 files changed, 46 insertions(+), 14 deletions(-)
+ .../graphics/skia/GraphicsContextSkia.cpp     | 229 +++++++++++++++++-
+ .../graphics/skia/SkiaReplayCanvas.cpp        |  10 +-
+ 2 files changed, 224 insertions(+), 15 deletions(-)
 
 diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
-index e4ba236..f916d2d 100644
+index e4ba236..2fe0f40 100644
 --- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
 +++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
-@@ -201,6 +201,31 @@ static SkSamplingOptions toSkSamplingOptions(InterpolationQuality quality)
+@@ -48,6 +48,7 @@
+ #include <ranges>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorFilter.h>
++#include <skia/core/SkGraphics.h>
+ #include <skia/core/SkImage.h>
+ #include <skia/core/SkPathBuilder.h>
+ #include <skia/core/SkPathEffect.h>
+@@ -61,7 +62,11 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/effects/SkImageFilters.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#include <optional>
++#include <wtf/Lock.h>
+ #include <wtf/MathExtras.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/Vector.h>
+ 
+ #if USE(THEME_ADWAITA)
+ #include "Adwaita.h"
+@@ -201,6 +206,196 @@ static SkSamplingOptions toSkSamplingOptions(InterpolationQuality quality)
      return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone);
  }
  
@@ -45,12 +88,26 @@ index e4ba236..f916d2d 100644
 +// as the Cairo port did with CAIRO_FILTER_GOOD. InterpolationQuality::Low (used while an
 +// image is being resized) and DoNotInterpolate keep their meaning. Not for texture-backed
 +// images (Ganesh would copy them into a new mipmapped texture, again for every promise
-+// image) nor for strict source rect draws (SkCanvas drops mipmaps for those).
++// image). Strict source rect draws need prepareStrictDraw() (SkCanvas drops mipmaps for those).
++// Whether 'image' may be sampled from mipmaps. On the CPU, mipmaps that the image does not
++// hold itself live in Skia's resource cache (32 MB): mipmaps too big for it would be built
++// again for every draw (every tile), so those images go without.
++static bool canUseMipmaps(const SkImage& image, RenderingMode renderingMode)
++{
++    if (image.isTextureBacked())
++        return false;
++    if (renderingMode == RenderingMode::Accelerated || image.hasMipmaps())
++        return true;
++    size_t mipmapBytes = image.imageInfo().computeMinByteSize() / 3;
++    return mipmapBytes <= SkGraphics::GetResourceCacheTotalByteLimit() / 2;
++}
++
 +static SkSamplingOptions toSkSamplingOptions(InterpolationQuality quality, const SkMatrix& imageToDevice, bool canUseMipmaps)
 +{
 +    if (!canUseMipmaps || quality == InterpolationQuality::DoNotInterpolate || quality == InterpolationQuality::Low)
 +        return toSkSamplingOptions(quality);
 +
++    // Scaled down in either direction (the mipmap level follows the larger scale-down).
 +    bool scaledDown = true;
 +    if (!imageToDevice.hasPerspective()) {
 +        SkScalar scales[2];
@@ -63,10 +120,161 @@ index e4ba236..f916d2d 100644
 +    return SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear);
 +}
 +
++// Copies of parts of raster images, with mipmaps, for scaled-down strict source rect draws
++// (see prepareStrictDraw()), keyed by the source image's unique ID (never reused), least
++// recently used first out, within a budget. They do not keep their source alive. A source
++// drawn with ever-changing, mostly overlapping parts (a fixed background while scrolling, an
++// animated background-position) would make a new copy on every frame, so after a few such
++// changes its draws go without mipmaps, as before, until the entry is evicted.
++class MipmappedSubsetCache {
++    WTF_MAKE_NONCOPYABLE(MipmappedSubsetCache);
++public:
++    MipmappedSubsetCache() = default;
++
++    static MipmappedSubsetCache& singleton()
++    {
++        static NeverDestroyed<MipmappedSubsetCache> cache;
++        return cache;
++    }
++
++    sk_sp<SkImage> get(const SkImage& source, const SkIRect& rect)
++    {
++        // Copies are made synchronously while painting: keep each one small enough.
++        size_t bytes = static_cast<size_t>(rect.width()) * rect.height() * source.imageInfo().bytesPerPixel() / 3 * 4;
++        if (bytes > maxEntryBytes)
++            return nullptr;
++
++        uint32_t id = source.uniqueID();
++        unsigned changes = 0;
++        {
++            Locker locker { m_lock };
++            if (auto image = find(id, rect))
++                return *image;
++            for (size_t i = m_entries.size(); i--;) {
++                auto& entry = m_entries[i];
++                if (entry.sourceID != id || !mostlyOverlap(entry.rect, rect))
++                    continue;
++                changes = std::max(changes, entry.changes + 1);
++                m_bytes -= entry.bytes;
++                m_entries.removeAt(i);
++            }
++            if (changes >= maxChanges) {
++                m_entries.append({ id, rect, nullptr, changes, 0 });
++                evict();
++                return nullptr;
++            }
++        }
++
++        auto image = source.makeSubset(nullptr, rect, { .fMipmapped = true });
++        if (!image)
++            return nullptr;
++
++        Locker locker { m_lock };
++        // Another thread may have made the same copy meanwhile.
++        if (auto existing = find(id, rect))
++            return *existing;
++        m_entries.append({ id, rect, image, changes, bytes });
++        m_bytes += bytes;
++        evict();
++        return image;
++    }
++
++private:
++    struct Entry {
++        uint32_t sourceID;
++        SkIRect rect;
++        sk_sp<SkImage> image;
++        unsigned changes;
++        size_t bytes;
++    };
++
++    static constexpr size_t maxBytes = 48 * 1024 * 1024;
++    static constexpr size_t maxEntryBytes = 16 * 1024 * 1024;
++    static constexpr size_t maxEntries = 256;
++    static constexpr unsigned maxChanges = 3;
++
++    // Neighbouring sprites with fractional edges share a texel row or column; that is
++    // not a moving part.
++    static bool mostlyOverlap(const SkIRect& a, const SkIRect& b)
++    {
++        SkIRect intersection;
++        if (!intersection.intersect(a, b))
++            return false;
++        int64_t smaller = std::min(static_cast<int64_t>(a.width()) * a.height(), static_cast<int64_t>(b.width()) * b.height());
++        return 2 * static_cast<int64_t>(intersection.width()) * intersection.height() > smaller;
++    }
++
++    // Moves a matching entry to the most recently used end.
++    std::optional<sk_sp<SkImage>> find(uint32_t id, const SkIRect& rect) WTF_REQUIRES_LOCK(m_lock)
++    {
++        for (size_t i = 0; i < m_entries.size(); ++i) {
++            if (m_entries[i].sourceID == id && m_entries[i].rect == rect) {
++                auto entry = WTF::move(m_entries[i]);
++                m_entries.removeAt(i);
++                auto image = entry.image;
++                m_entries.append(WTF::move(entry));
++                return image;
++            }
++        }
++        return std::nullopt;
++    }
++
++    void evict() WTF_REQUIRES_LOCK(m_lock)
++    {
++        // Least recently used first.
++        size_t count = 0;
++        size_t bytes = m_bytes;
++        while (count < m_entries.size() && (bytes > maxBytes || m_entries.size() - count > maxEntries))
++            bytes -= m_entries[count++].bytes;
++        // Vector::removeAt(0, 0) would move the entries onto themselves and destroy them.
++        if (count)
++            m_entries.removeAt(0, count);
++        m_bytes = bytes;
++    }
++
++    Lock m_lock;
++    Vector<Entry> m_entries WTF_GUARDED_BY_LOCK(m_lock);
++    size_t m_bytes WTF_GUARDED_BY_LOCK(m_lock) { 0 };
++};
++
++// A strict source rect draw must not sample outside the source rect: CSS sprites, border-image
++// slices. SkCanvas drops mipmaps for strict draws (the mipmaps of the whole image mix in the
++// pixels around the rect). When 'sampling' uses mipmaps, return the constraint to draw with:
++// if the source rect covers the whole image, there is nothing to keep out and the draw can
++// be a fast one; otherwise draw from a copy of the part of the image within the source rect,
++// with its own mipmaps ('image' and 'srcRect' are replaced). If no copy can be made, drop
++// the mipmaps from 'sampling' and draw strict as before.
++static SkCanvas::SrcRectConstraint prepareStrictDraw(sk_sp<SkImage>& image, SkRect& srcRect, SkSamplingOptions& sampling, InterpolationQuality quality)
++{
++    if (sampling.mipmap == SkMipmapMode::kNone)
++        return SkCanvas::kStrict_SrcRectConstraint;
++
++    if (srcRect.contains(SkRect::Make(image->bounds())))
++        return SkCanvas::kFast_SrcRectConstraint;
++
++    // The texels a strict bilinear draw reads, except those it weighs less than 1/16
++    // (a source rect edge a rounding error away from a texel edge).
++    constexpr float tolerance = 1.f / 16;
++    auto rect = SkIRect::MakeLTRB(std::floor(srcRect.left() + tolerance), std::floor(srcRect.top() + tolerance),
++        std::ceil(srcRect.right() - tolerance), std::ceil(srcRect.bottom() - tolerance));
++    if (rect == image->bounds())
++        return SkCanvas::kFast_SrcRectConstraint;
++    if (!image->isLazyGenerated() && rect.intersect(image->bounds())) {
++        if (auto subset = MipmappedSubsetCache::singleton().get(*image, rect)) {
++            image = WTF::move(subset);
++            srcRect.offset(-rect.x(), -rect.y());
++            return SkCanvas::kFast_SrcRectConstraint;
++        }
++    }
++
++    sampling = toSkSamplingOptions(quality);
++    return SkCanvas::kStrict_SrcRectConstraint;
++}
++
  sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>& image) const
  {
      if (!image->isTextureBacked())
-@@ -232,12 +257,6 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+@@ -232,12 +427,6 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
      if (!image)
          return;
  
@@ -79,14 +287,17 @@ index e4ba236..f916d2d 100644
      auto imageSize = nativeImage.size();
      if (options.orientation().usesWidthAsHeight())
          imageSize = imageSize.transposedSize();
-@@ -268,11 +287,22 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+@@ -268,11 +457,25 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
          }
      }
  
-+    auto clampingConstraint = options.strictImageClamping() == StrictImageClamping::Yes ? SkCanvas::kStrict_SrcRectConstraint : SkCanvas::kFast_SrcRectConstraint;
 +    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality(),
 +        SkMatrix::Concat(m_canvas.getTotalMatrix(), SkMatrix::RectToRect(normalizedSrcRect, normalizedDestRect)),
-+        !image->isTextureBacked() && clampingConstraint == SkCanvas::kFast_SrcRectConstraint);
++        canUseMipmaps(*image, m_renderingMode));
++    SkRect skSrcRect = normalizedSrcRect;
++    auto clampingConstraint = SkCanvas::kFast_SrcRectConstraint;
++    if (options.strictImageClamping() == StrictImageClamping::Yes)
++        clampingConstraint = prepareStrictDraw(image, skSrcRect, samplingOptions, m_state.imageInterpolationQuality());
 +
 +    // Collect raster images for atlas batching during recording. The atlas texture has no
 +    // mipmaps (they would mix neighbouring images), so images sampled with mipmaps stay out.
@@ -103,29 +314,42 @@ index e4ba236..f916d2d 100644
  
      // 'imageInThisThread' is either the incoming 'image', or a wrapper around the 'image' accessible in the current thread.
      auto imageInThisThread = imageForCurrentThread(image);
-@@ -288,11 +318,11 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+@@ -288,11 +491,11 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
  
      if (hasDropShadow()) {
          inExtraTransparencyLayer = drawOutsetShadow(paint, [&](const SkPaint& paint) {
 -            m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, toSkSamplingOptions(m_state.imageInterpolationQuality()), &paint, clampingConstraint);
-+            m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
++            m_canvas.drawImageRect(imageForDrawing, skSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
          });
      }
  
 -    m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, toSkSamplingOptions(m_state.imageInterpolationQuality()), &paint, clampingConstraint);
-+    m_canvas.drawImageRect(imageForDrawing, normalizedSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
++    m_canvas.drawImageRect(imageForDrawing, skSrcRect, normalizedDestRect, samplingOptions, &paint, clampingConstraint);
      if (inExtraTransparencyLayer)
          restoreLayer();
  
-@@ -1106,7 +1136,7 @@ void GraphicsContextSkia::drawPattern(const NativeImage& nativeImage, const Floa
+@@ -1106,7 +1309,7 @@ void GraphicsContextSkia::drawPattern(const NativeImage& nativeImage, const Floa
      SkMatrix phaseMatrix;
      phaseMatrix.setTranslate(phaseOffset.x(), phaseOffset.y());
      SkMatrix shaderMatrix = SkMatrix::Concat(phaseMatrix, patternTransform);
 -    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality());
-+    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality(), SkMatrix::Concat(m_canvas.getTotalMatrix(), shaderMatrix), !image->isTextureBacked());
++    auto samplingOptions = toSkSamplingOptions(m_state.imageInterpolationQuality(), SkMatrix::Concat(m_canvas.getTotalMatrix(), shaderMatrix), canUseMipmaps(*image, m_renderingMode));
  
      SkPaint paint = createFillPaint();
      paint.setBlendMode(SkiaUtilities::toSkiaBlendMode(options.blendMode(), options.compositeOperator()));
+@@ -1155,7 +1358,11 @@ void GraphicsContextSkia::drawPattern(const NativeImage& nativeImage, const Floa
+             SkPictureRecorder recorder;
+             auto* recordCanvas = recorder.beginRecording(clipRect);
+             // The below call effectively extracts a tile from the image thus performing a clipping.
+-            recordCanvas->drawImageRect(image, tileRect, dstRect, samplingOptions, nullptr, SkCanvas::kStrict_SrcRectConstraint);
++            // The picture is played back at the scale of the pattern, so 'samplingOptions' applies.
++            auto tileImage = image;
++            SkRect tileSrcRect = tileRect;
++            auto constraint = prepareStrictDraw(tileImage, tileSrcRect, samplingOptions, m_state.imageInterpolationQuality());
++            recordCanvas->drawImageRect(tileImage, tileSrcRect, dstRect, samplingOptions, nullptr, constraint);
+             auto picture = recorder.finishRecordingAsPicture();
+             paint.setShader(picture->makeShader(SkTileMode::kRepeat, SkTileMode::kRepeat, samplingOptions.filter, &shaderMatrix, nullptr));
+         }
 diff --git a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp b/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp
 index 6fe7285..0956c3e 100644
 --- a/Source/WebCore/platform/graphics/skia/SkiaReplayCanvas.cpp

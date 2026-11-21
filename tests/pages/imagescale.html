@@ -1,17 +1,76 @@
 <!doctype html>
 <!-- Images scaled down by the page: tests/imagescale/run.sh crops them out of
-     a screenshot (content origin at the top left) and compares them with a
-     Lanczos-3 reference.  zone.png comes from tests/imagescale/zoneplate.py,
-     hero.png is any 1920x1152 screenshot. -->
+     a screenshot (it finds the content origin by the magenta marker) and
+     compares them with Lanczos-3 references.  zone.png comes from
+     tests/imagescale/zoneplate.py, hero.png is any 1920x1152 screenshot,
+     sprites.png, strip.png and border.png come from tests/imagescale/sprites.py.
+     Two screenshots (the viewport needs 1580x880): imagescale.html and
+     imagescale.html#b (scrolled to the cyan marker at y=700). -->
 <html><head><meta charset="utf-8"><style>
 html, body { margin: 0; background: #fff; }
-img { position: absolute; display: block; }
-.bg { position: absolute; left: 720px; top: 300px; width: 400px; height: 240px;
+img, div { position: absolute; display: block; }
+#marker { left: 286px; top: 0; width: 8px; height: 8px; background: #f0f; }
+#b { left: 410px; top: 700px; width: 8px; height: 8px; background: #0ff; }
+#spacer { left: 0; top: 2400px; width: 1px; height: 1px; }
+.bg { left: 720px; top: 300px; width: 400px; height: 240px;
       background: url(hero.png) 0 0 / 400px 240px no-repeat; }
+/* background-size */
+.cover { left: 0; top: 700px; width: 400px; height: 200px;
+         background: url(hero.png) center / cover no-repeat; }
+.contain { left: 420px; top: 700px; width: 400px; height: 300px;
+           background: #fff url(hero.png) center / contain no-repeat; }
+.content { left: 840px; top: 700px; width: 400px; height: 240px; content: url(hero.png); }
+.trbox { left: 0; top: 1020px; width: 400px; height: 240px; overflow: hidden; }
+.trbg { left: 0; top: 0; width: 1920px; height: 1152px; background: url(hero.png) no-repeat;
+        transform: scale(0.20833333); transform-origin: 0 0; }
+/* repeated tiles */
+.repeat { left: 0; top: 1280px; width: 600px; height: 280px;
+          background: url(zone.png) 0 0 / 200px 200px repeat; }
+.space { left: 620px; top: 1280px; width: 640px; height: 200px;
+         background: url(zone.png) 0 0 / 200px 200px; background-repeat: space no-repeat; }
+/* border-image: nine pieces of 512px slices drawn at 80px.  A URL of its own: with
+   hero.png (also used by the <img>s) stock WebKit drew these wrongly, not investigated */
+.bstretch, .bround { width: 400px; height: 240px; box-sizing: border-box;
+                     border: 80px solid transparent; border-image: url(border.png) 512 fill stretch; }
+.bstretch { left: 420px; top: 1020px; }
+.bround { left: 840px; top: 1020px; border-image-repeat: round; }
+/* sprites: must not take colour from their neighbours */
+.sgreen { left: 1260px; top: 700px; width: 64px; height: 64px;
+          background: url(strip.png) -64px 0 / 256px 64px no-repeat; }
+.szone { left: 1340px; top: 700px; width: 64px; height: 64px;
+         background: url(sprites.png) 0 0 / 128px 128px no-repeat; }
+.sgreen2d { left: 1420px; top: 700px; width: 48px; height: 48px;
+            background: url(sprites.png) -48px -48px / 96px 96px no-repeat; }
+.sblue { left: 1480px; top: 700px; width: 50px; height: 50px;
+         background: url(strip.png) -100px 0 / 200px 50px no-repeat; }
+/* must stay as they were: 1:1, scaled up, image-rendering: pixelated */
+.u1 { left: 1140px; top: 0; width: 300px; height: 200px; background: url(hero.png) -100px -100px no-repeat; }
+.uup { left: 1140px; top: 480px; width: 300px; height: 200px;
+       background: url(sprites.png) -100px -100px / 1024px 1024px no-repeat; }
+.upix { left: 1140px; top: 220px; width: 400px; height: 240px; image-rendering: pixelated;
+        background: url(hero.png) 0 0 / 400px 240px no-repeat; }
 </style></head><body>
+<div id="marker"></div>
+<div id="b"></div>
+<div id="spacer"></div>
 <img src="zone.png" style="left:0;top:0;width:280px;height:280px">
 <img src="hero.png" style="left:300px;top:0;width:400px;height:240px">
 <img src="hero.png" style="left:0;top:300px;width:640px;height:384px">
 <div class="bg"></div>
 <img src="hero.png" style="left:720px;top:0;width:1280px;height:768px;transform:scale(0.3125);transform-origin:0 0">
+<div class="cover"></div>
+<div class="contain"></div>
+<div class="content"></div>
+<div class="trbox"><div class="trbg"></div></div>
+<div class="repeat"></div>
+<div class="space"></div>
+<div class="bstretch"></div>
+<div class="bround"></div>
+<div class="sgreen"></div>
+<div class="szone"></div>
+<div class="sgreen2d"></div>
+<div class="sblue"></div>
+<div class="u1"></div>
+<div class="uup"></div>
+<div class="upix"></div>
 </body></html>

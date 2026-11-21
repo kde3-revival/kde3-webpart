@@ -29,9 +29,10 @@ def psnr(a, b):
     m = ((a - b) ** 2).mean()
     return float('inf') if m == 0 else 10 * np.log10(255 ** 2 / m)
 
-ref = load(sys.argv[1])
-for p in sys.argv[2:]:
-    im = load(p)
-    if im.shape != ref.shape:
-        print(f"{p}: size {im.shape} != {ref.shape}"); continue
-    print(f"{psnr(ref, im):7.2f} dB  SSIM {ssim(ref, im):.4f}  {p}")
+if __name__ == "__main__":
+    ref = load(sys.argv[1])
+    for p in sys.argv[2:]:
+        im = load(p)
+        if im.shape != ref.shape:
+            print(f"{p}: size {im.shape} != {ref.shape}"); continue
+        print(f"{psnr(ref, im):7.2f} dB  SSIM {ssim(ref, im):.4f}  {p}")
