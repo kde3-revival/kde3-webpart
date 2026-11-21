@@ -16,6 +16,7 @@
 #include <kapplication.h>
 #include <kconfig.h>
 
+#include "kwpeadblock.h"
 #include "kwpesettings.h"
 #include "kwpewidget.h"
 
@@ -108,4 +109,5 @@ void KWPESettings::changed()
 void KWPESettings::apply()
 {
     KWPEWidget::applySettings();
+    KWPEAdBlock::self()->reloadConfig();
 }

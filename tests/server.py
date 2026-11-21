@@ -9,6 +9,12 @@
 #   /postraw             POST: the form data back, application/octet-stream
 #   /cookie              sets a persistent and a session cookie, shows the cookies sent
 #   /auth                HTTP Basic authentication (user / secret)
+#   /ads/*, /track/*, /res/*, /regex-ad*, /sep-ad*, /ads-redirected.js
+#                        ad-like resources for pages/adblock.html (an image,
+#                        a script or a frame, by extension)
+#   /frames/*            a small third-party frame
+#   /report?host=&name=&expected=&result=
+#                        pages/adblock.html reports a result: printed on stdout
 
 import base64
 import os
@@ -67,6 +73,21 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_body(body, 'text/html; charset=utf-8',
                                   [('Set-Cookie', 'persistent=yes; Max-Age=86400; Path=/'),
                                    ('Set-Cookie', 'session=yes; Path=/')])
+        if url.path == '/report':
+            print('REPORT %s: %s | expected %s | got %s' % (query.get('host', [''])[0], query.get('name', [''])[0],
+                                                           query.get('expected', [''])[0], query.get('result', [''])[0]),
+                  flush=True)
+            return self.send_body(b'', 'text/plain')
+        if url.path.startswith(('/ads/', '/track/', '/res/', '/regex-ad', '/sep-ad', '/ads-redirected')):
+            print('SERVED %s' % url.path, flush=True)
+            if url.path.endswith('.js'):
+                return self.send_body(b'window.adLoaded = true;\n', 'application/javascript')
+            with open(os.path.join(PAGES, 'img.png'), 'rb') as f:
+                return self.send_body(f.read(), 'image/png')
+        if url.path.startswith('/frames/'):
+            print('SERVED %s' % url.path, flush=True)
+            return self.send_body(b'<html><body style="background:#fdd">third-party frame (blocked: empty)</body></html>',
+                                  'text/html')
         if url.path == '/auth':
             expected = 'Basic ' + base64.b64encode(b'user:secret').decode()
             if self.headers.get('Authorization') != expected:

@@ -21,6 +21,9 @@
 class KAboutData;
 class KAction;
 class KFindDialog;
+class KToggleAction;
+class QLabel;
+namespace KParts { class StatusBarExtension; }
 class KWPEWidget;
 class KWPEBrowserExtension;
 
@@ -82,11 +85,16 @@ private slots:
     void slotZoomOut();
     void slotZoomNormal();
     void slotZoomChanged( int percent );
+    void slotAdBlockSite();
+    void slotConfigure();
+    void updateAdBlockState();
 
 private:
     friend class KWPEBrowserExtension;
     friend class KWPEPopupGUIClient;
+    friend class KWPEAdBlockLabel;
     void restore( const KURL& url, int token );
+    void showAdBlockMenu( const QPoint& globalPos );
 
     KWPEWidget* m_view;
     KWPEBrowserExtension* m_ext;
@@ -103,6 +111,10 @@ private:
     KAction* m_zoomIn;
     KAction* m_zoomOut;
     KAction* m_zoomNormal;
+    KToggleAction* m_adblockSite;
+    KAction* m_configure;
+    KParts::StatusBarExtension* m_statusBar;
+    QLabel* m_adblockLabel;   // in Konqueror's status bar (made when first shown)
 };
 
 class KWPEBrowserExtension : public KParts::BrowserExtension

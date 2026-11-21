@@ -31,7 +31,14 @@
 #include <kparts/event.h>
 #include <kparts/genericfactory.h>
 #include <kparts/partmanager.h>
+#include <kparts/statusbarextension.h>
+#include <kpopupmenu.h>
+#include <kstatusbar.h>
+#include <qlabel.h>
+#include <qtooltip.h>
 
+#include "kwpeadblock.h"
+#include "kwpeconfigdialog.h"
 #include "kwpepart.h"
 #include "kwpewidget.h"
 
@@ -49,9 +56,26 @@ enum { NotCrypted = 0, Encrypted = 1, Mixed = 2 };
 
 static const char stateMagic[] = "kwpepart-1";
 
+// The ad blocker's state in Konqueror's status bar; a click shows its menu.
+class KWPEAdBlockLabel : public QLabel
+{
+public:
+    KWPEAdBlockLabel( KWPEPart* part, QWidget* parent ) : QLabel( parent ), m_part( part ) {}
+
+protected:
+    virtual void mousePressEvent( QMouseEvent* e )
+    {
+        m_part->showAdBlockMenu( e->globalPos() );
+    }
+
+private:
+    KWPEPart* m_part;
+};
+
 KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
                     QObject* parent, const char* name, const QStringList& )
-    : KParts::ReadOnlyPart( parent, name ), m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 )
+    : KParts::ReadOnlyPart( parent, name ), m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 ),
+      m_adblockLabel( 0 )
 {
     setInstance( KWPEPartFactory::instance() );
 
@@ -97,6 +121,17 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( zoomChanged( int ) ), SLOT( slotZoomChanged( int ) ) );
     connect( m_view, SIGNAL( webProcessFailed( bool ) ), SLOT( slotWebProcessFailed( bool ) ) );
     connect( m_view, SIGNAL( insecureContentDetected() ), SLOT( updatePageSecurity() ) );
+
+    // Ad blocking: off for the site shown (a list in kwpepartrc), the
+    // settings dialog.  WebKit does not tell what its content filters
+    // blocked, so the status bar shows only whether they apply here.
+    m_adblockSite = new KToggleAction( i18n( "Disable Ad &Blocking on This Site" ), 0, this, SLOT( slotAdBlockSite() ),
+                                       actionCollection(), "adblockSite" );
+    m_configure = new KAction( i18n( "&Configure WPE WebKit..." ), "configure", 0, this, SLOT( slotConfigure() ),
+                               actionCollection(), "configureWPE" );
+    m_statusBar = new KParts::StatusBarExtension( this );
+    connect( KWPEAdBlock::self(), SIGNAL( changed() ), SLOT( updateAdBlockState() ) );
+    updateAdBlockState();
 
     setXMLFile( "kwpepart.rc" );
 }
@@ -151,8 +186,74 @@ bool KWPEPart::openFile()
 void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 {
     // ReadOnlyPart's shows the URL.
-    if ( event->activated() )
-        emit setWindowCaption( m_view->title().isEmpty() ? m_url.prettyURL() : m_view->title() );
+    if ( !event->activated() )
+        return;
+    emit setWindowCaption( m_view->title().isEmpty() ? m_url.prettyURL() : m_view->title() );
+    // The status bar exists now (Konqueror sets it late); the extension
+    // shows the label while this part is active.
+    if ( !m_adblockLabel && m_statusBar->statusBar() ) {
+        m_adblockLabel = new KWPEAdBlockLabel( this, m_statusBar->statusBar() );
+        m_adblockLabel->setMargin( 2 );
+        // permanent: a status bar message must not hide it
+        m_statusBar->addStatusBarItem( m_adblockLabel, 0, true );
+        updateAdBlockState();
+    }
+}
+
+void KWPEPart::updateAdBlockState()
+{
+    KWPEAdBlock* adblock = KWPEAdBlock::self();
+    QString host = m_url.host();
+    bool web = m_url.protocol() == "http" || m_url.protocol() == "https";
+    m_adblockSite->setEnabled( adblock->isEnabled() && web && !host.isEmpty() );
+    m_adblockSite->setChecked( web && adblock->isSiteDisabled( host ) );
+    if ( !m_adblockLabel )
+        return;
+    QString text, tip;
+    if ( !adblock->isEnabled() ) {
+        text = i18n( "short for: ad blocking is off", "Ads: off" );
+        tip = i18n( "Ad blocking is off." );
+    } else if ( web && adblock->isSiteDisabled( host ) ) {
+        text = i18n( "short for: ads are allowed on this site", "Ads: allowed" );
+        tip = i18n( "Ad blocking is off for %1." ).arg( host );
+    } else if ( adblock->isBlocking( host ) ) {
+        text = i18n( "short for: ads are blocked", "Ads: blocked" );
+        tip = i18n( "Advertisements and trackers are blocked." );
+    } else {
+        text = i18n( "short for: no ad filters yet", "Ads: none yet" );
+    }
+    if ( adblock->isUpdating() )
+        text += i18n( " (updating)" );
+    m_adblockLabel->setText( text );
+    QToolTip::remove( m_adblockLabel );
+    QString status = adblock->status();
+    QToolTip::add( m_adblockLabel, tip.isEmpty() ? status : tip + "\n" + status );
+}
+
+void KWPEPart::showAdBlockMenu( const QPoint& globalPos )
+{
+    KPopupMenu menu( widget() );
+    m_adblockSite->plug( &menu );
+    m_configure->plug( &menu );
+    menu.exec( globalPos );
+    m_adblockSite->unplug( &menu );
+    m_configure->unplug( &menu );
+}
+
+void KWPEPart::slotAdBlockSite()
+{
+    QString host = m_url.host();
+    if ( host.isEmpty() )
+        return;
+    KWPEAdBlock::self()->setSiteDisabled( host, m_adblockSite->isChecked() );
+    // The filters of the view follow the list at once; the page is loaded
+    // again with them (or without).
+    m_view->reload();
+}
+
+void KWPEPart::slotConfigure()
+{
+    KWPEConfigDialog::showDialog( widget() );
 }
 
 void KWPEPart::restore( const KURL& url, int token )
@@ -198,6 +299,7 @@ void KWPEPart::slotUrlChanged( const QString& url, bool newItem )
     m_historyToken = m_view->currentHistoryToken();
     emit m_ext->setLocationBarURL( u.prettyURL() );
     updatePageSecurity();
+    updateAdBlockState();
 
     // A navigation inside the document has no load: Konqueror fills its
     // history entry on completed().

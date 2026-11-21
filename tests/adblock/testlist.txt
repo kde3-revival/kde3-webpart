@@ -1,0 +1,21 @@
+[Adblock Plus 2.0]
+! Title: kwpepart test list (tests/adblock/run.sh)
+! network: path, separator, third-party, types, regex, exception
+/ads/*
+@@/ads/allowed-ad.png
+/track/pixel.png$third-party
+||localhost^*/frames/$subdocument
+/res/ad.js$script
+/res/ad-img.png$script
+/regex-ad[0-9]+\.png/
+||127.0.0.1^*/sep-ad^
+! cosmetic: generic, site specific, exception
+##.ad-box
+127.0.0.1##.site-ad
+##.kept-ad
+127.0.0.1#@#.kept-ad
+otherhost.example##.other-site-ad
+! not expressible: dropped, must not break anything
+example.com##.x:has-text(Ad)
+##+js(set-constant, foo, true)
+/ads-redirected.js$script,redirect=noopjs

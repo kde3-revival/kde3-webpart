@@ -10,8 +10,8 @@ padlock, status bar text and wheel scrolling work, on
 the GPU (DMA-BUF) or through shared memory.  Stage 2 so far: downloads
 through KDE's save dialog and KIO's progress window, Konqueror's context
 menus, find in page, zoom, persistent cookies, HTTP authentication,
-recovery from web process crashes.  See "Next stages" for what is
-missing.
+recovery from web process crashes, an ad blocker (EasyList and friends
+as WebKit content filters).  See "Next stages" for what is missing.
 
 Why WPE WebKit: it is GLib based and embeddable without a toolkit (the
 embedder implements a small "platform": display, view, buffers,
@@ -185,6 +185,78 @@ same-document navigation and double every request, so:
   within 30 s or an out-of-memory kill leaves the last frame and a
   status bar message.
 
+### Ad blocking (`kwpeadblock.cpp`, `abpconverter.cpp`, `kwpe-filterconv`)
+
+Adblock Plus filter lists become WebKit **content filters**
+(`WebKitUserContentFilterStore`, Safari's content blocker format): WebKit
+compiles them once into byte code (a DFA) and matches every load itself,
+in the web process; the part is not called per request.
+
+* **Lists**: EasyList and EasyPrivacy by default; uBlock filters,
+  uBlock filters – Annoyances and ROList (Romanian) can be switched on;
+  more by URL.  Downloaded with KIO over **HTTPS only** (or read from a
+  local file): no cookies, no language header, no authentication, a
+  certificate that does not validate fails the download (no dialog), a
+  redirect must stay on HTTPS, at most 16 MiB, HTML (a captive portal)
+  is refused.  uBlock's `!#include file` is fetched from the directory of
+  its list on the same host.  Nothing else is contacted: no telemetry.
+  A list that cannot be fetched keeps its last copy.
+* **Converting and compiling** happen in `kwpe-filterconv`, started in
+  the background (KProcess, nice 10): ABP syntax → WebKit JSON
+  (`abpconverter.cpp`, plain C++) → `webkit_user_content_filter_store_save()`.
+  What WebKit cannot express is **dropped and counted, never widened**
+  (a rule that blocks more than its list says breaks sites):
+  `$redirect`, `$csp`, `$removeparam`, `$denyallow`, `$to`, scriptlets
+  (`##+js`), procedural cosmetics (`:has-text`, `:upward`, `:style`, ...),
+  HTML filters, regular expressions with `\b`, look-around or long
+  `{n,m}`, uBlock's `example.*` entities, unknown options.  Exceptions
+  that cannot be read completely apply more widely (blocking less).
+  Network patterns become WebKit's regex subset (`||` host anchor, `^`
+  separator also at the end of the address, `|` anchors, escaping);
+  `/regex/` filters are rewritten (`\d`, `\w`, small `{n,m}`, alternatives
+  expanded into several rules) or dropped.  Sites become anchored
+  `if-top-url`/`unless-top-url` patterns, not `if-domain`: WebKit finds an
+  `if-domain` site anywhere in the page's URL (a `?next=http://site/`
+  parameter counts).
+* **Rule lists**: WebKit applies `ignore-previous-rules` only inside one
+  rule list, and a list holds at most 150 000 rules, so the converter
+  writes several lists of at most 50 000 rules, **each with every
+  exception** that may cancel its rules: network blocks (slices) +
+  exceptions + `$important` blocks + `$document` exceptions; generic
+  element hiding (WebKit makes one style sheet of it) + `$document`,
+  `$elemhide`, `$generichide` exceptions; site-specific element hiding +
+  `$document`, `$elemhide`, `$specifichide` exceptions.  `#@#`
+  exceptions are folded into the hiding rules (`unless-top-url`).
+* **Updates**: weekly (checked hourly), on "Update Now", when the choice
+  of lists changes; at most once an hour after a failure.  One process
+  at a time (`KLockFile`, a dead holder's lock is taken over).  A new
+  set gets new identifiers; kwpepartrc names the set in use only after
+  all of it compiled and loaded, then the old set leaves the store: a
+  crash or a failed download, conversion or compilation leaves the old
+  set in use and nothing half-written that is used.  Unchanged lists
+  (MD5 of the files) are not compiled again.  Other Konqueror processes
+  load the new set when told (DCOP `KWPEPartSettings changed()`).
+* **First run**: nothing to block with until the lists are compiled
+  (about 6 s); then every view gets the filters.  At the start of a
+  process the compiled set is read from the store (20 ms); the first
+  page waits for it (at most a second).
+* **Off for a site**: Settings → "Disable Ad Blocking on This Site"
+  (also from the status bar label), a list of sites in kwpepartrc
+  (`[AdBlock] DisabledSites`, a site covers its subdomains).  Every view
+  has a content manager of its own; the filters are taken off it while
+  it shows such a site.  WebKit decides which elements to hide when it
+  *requests* a page, so the part sets the filters before the loads it
+  starts (typed URLs, history); a link or redirect that crosses between
+  a site with and one without blocking switches them when the response
+  arrives (before the page commits) and loads the page once more.
+* **UI**: Settings → "Configure WPE WebKit..." (smooth scrolling; ad
+  blocking on/off, lists with checkboxes, another list by URL, Update
+  Now, last update and rule count, the sites where it is off) and a
+  status bar label ("Ads: blocked / allowed / off"; a click shows the
+  menu).  WebKit does not report what its content filters blocked (no
+  signal, no failed resource), so there is no count.  No Konqueror
+  control center page yet.
+
 ### Which part Konqueror uses
 
 KDE 3 chooses parts by mime type: `kwpepart.desktop` registers for
@@ -209,8 +281,11 @@ ninja -C build && ninja -C build install
 kbuildsycoca
 ```
 
-It installs `lib/kde3/libkwpepart.so`, `share/services/kwpepart.desktop`
-and `bin/kwpeview`.
+It installs `lib/kde3/libkwpepart.so`, `share/services/kwpepart.desktop`,
+`bin/kwpeview` and `bin/kwpe-filterconv` (the ad blocker's converter;
+`kwpe-filterconv --store DIR --id NAME [--json DIR] [--verbose] LIST...`
+converts and compiles lists by hand, `--verbose` names every dropped
+filter).
 
 ## Debugging and testing
 
@@ -284,6 +359,23 @@ last wheel event of a burst to the last such frame (the page at rest).
 | single notch: page at rest | 141 ms | 40 ms |
 | 25 notches 12 ms apart: page at rest after the last one | 261 ms | 56 ms |
 
+### Ad blocking (2026-11-21)
+
+`kwpe-filterconv`, EasyList + EasyPrivacy (135 486 filters): 108 995
+network blocks, 1 606 exceptions, 13 638 generic and 10 268 site
+element hiding rules, 685 dropped (0.5 %: extended CSS 289, unsupported
+sites 244, redirect 30, ...); 5 rule lists, 137 401 rules with the
+repeated exceptions.  Converting 0.18 s, compiling 4.4–5.2 s, peak RSS
+of the converter 510 MiB (it exits), store 74 MB on disk (WebKit keeps
+the source too).  All five lists (163 002 filters): 16 883 dropped
+(11 593 of them uBlock scriptlets), compiling 5.9 s, 535 MiB.  The
+first update (downloads included) takes about 6 s.
+
+In use: the set is read from the store in 20 ms; kwpeview with a still
+page, filters off/on: RSS 347 / 352 MiB, PSS 183 / 188 MiB (+5 MiB, in
+the web process).  dailymail.co.uk: 1586 → 1060 MiB RSS, no ad slots
+and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
+
 ## Known problems
 
 * WebKit 2.54 drops the contents of GPU-accelerated 2D canvases of pages
@@ -312,6 +404,10 @@ last wheel event of a burst to the last such frame (the page at rest).
 * Script dialogs (`alert`, `confirm`, `beforeunload`) and the file
   chooser have no UI yet; `window.open()` returns null (popups using
   `opener` break).
+* Ad blocking: no count of blocked requests (WebKit does not report
+  them); uBlock's scriptlets, procedural cosmetics, `$redirect` and
+  `$removeparam` are not supported; a link between a site where ad
+  blocking is off and one where it is on loads the page twice.
 * The DMA-BUF path was tested on Xwayland (AMD), not yet on a real Xorg
   (Fedora 44 does not package WPE WebKit; the Arch build needs glibc
   2.44).
@@ -338,4 +434,5 @@ last wheel event of a burst to the last such frame (the page at rest).
    thread), explicit sync (syncobj) where the X server has it, KDE's
    font, colour and double-click settings into `WPESettings`.
 6. **Settings module** (kcm): engine choice, JavaScript, plugins, user
-   agent, fonts, cache.
+   agent, fonts, cache; the ad blocker's page (now a dialog of the
+   part).

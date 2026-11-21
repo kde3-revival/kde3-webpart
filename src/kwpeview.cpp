@@ -18,12 +18,20 @@
 #include <kcmdlineargs.h>
 #include <klibloader.h>
 #include <klocale.h>
-#include <kmainwindow.h>
 #include <kparts/factory.h>
+#include <kparts/mainwindow.h>
 #include <kparts/part.h>
 #include <kstatusbar.h>
 
 #include <stdio.h>
+
+// A KParts main window: the part's menus and status bar items, as in
+// Konqueror.
+class ViewWindow : public KParts::MainWindow
+{
+public:
+    void showPart( KParts::Part* part ) { createGUI( part ); }
+};
 
 static KCmdLineOptions options[] =
 {
@@ -48,7 +56,7 @@ int main( int argc, char** argv )
         return 1;
     }
 
-    KMainWindow* window = new KMainWindow();
+    ViewWindow* window = new ViewWindow();
     KParts::ReadOnlyPart* part = static_cast<KParts::ReadOnlyPart*>(
         static_cast<KParts::Factory*>( factory )->createPart( window, "webview", window, "kwpepart",
                                                                "KParts::ReadOnlyPart" ) );
@@ -57,6 +65,7 @@ int main( int argc, char** argv )
         return 1;
     }
     window->setCentralWidget( part->widget() );
+    window->showPart( part );
     QObject::connect( part, SIGNAL( setWindowCaption( const QString& ) ), window, SLOT( setCaption( const QString& ) ) );
     QObject::connect( part, SIGNAL( setStatusBarText( const QString& ) ), window->statusBar(), SLOT( message( const QString& ) ) );
     window->statusBar()->message( " " );

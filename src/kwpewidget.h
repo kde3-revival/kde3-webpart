@@ -157,6 +157,9 @@ private slots:
     void emitUnsupportedContent();
     void reloadAfterCrash();
     void askAuthentication();
+    void adBlockChanged();
+    void reloadForFilters();
+    void loadDeferred();
 
 private:
     friend class KWPEWidgetPrivate;

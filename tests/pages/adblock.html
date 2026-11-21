@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Ad block test</title>
+<style>
+ body { font-family: sans-serif; margin: 16px }
+ .box { padding: 6px; margin: 4px 0; background: #fdd; border: 1px solid #c88 }
+ table { border-collapse: collapse } td { border: 1px solid #aaa; padding: 3px 8px }
+ .ok { background: #cfc } .bad { background: #f99 }
+</style></head>
+<body>
+<h1>Ad block test</h1>
+<p><a id="other" href="#">This page on the other host</a> (tests/adblock/run.sh drives this page; parameters: off=1, next=URL)</p>
+<p>Filters: tests/adblock/testlist.txt. Hidden boxes do not show; the table compares each request with what the list says.</p>
+<div class="ad-box box">generic cosmetic ##.ad-box: hidden</div>
+<div class="site-ad box">site cosmetic 127.0.0.1##.site-ad: hidden</div>
+<div class="kept-ad box">##.kept-ad with 127.0.0.1#@#.kept-ad: visible</div>
+<div class="other-site-ad box">otherhost.example##.other-site-ad: visible</div>
+<iframe id="frame" src="about:blank" style="width:300px;height:40px"></iframe>
+<table id="results"><tr><th>test</th><th>expected</th><th>result</th></tr></table>
+<script>
+const port = location.port;
+document.getElementById('other').href = 'http://' + (location.hostname === '127.0.0.1' ? 'localhost' : '127.0.0.1') + ':' + port + '/adblock.html';
+document.getElementById('frame').src = 'http://localhost:' + port + '/frames/third.html';
+// Parameters: off=1: ad blocking is off for this site (everything
+// loads); next=URL: go there when done (the per-site switch on a link).
+const params = new URLSearchParams(location.search);
+const off = params.get('off') === '1';
+const main = location.hostname === '127.0.0.1';   // the list's site
+const other = 'http://' + (main ? 'localhost' : '127.0.0.1') + ':' + port;
+const B = off ? 'loaded' : 'blocked', L = 'loaded';
+const tests = [
+  ['path /ads/*', '/ads/banner.png', 'img', B],
+  ['exception @@/ads/allowed-ad.png', '/ads/allowed-ad.png', 'img', L],
+  ['third-party /track/pixel.png', other + '/track/pixel.png', 'img', B],
+  ['first-party /track/pixel.png', '/track/pixel.png', 'img', L],
+  ['$script: /res/ad.js as script', '/res/ad.js', 'script', B],
+  ['$script: /res/ad-img.png as image', '/res/ad-img.png', 'img', L],
+  ['regex /regex-ad[0-9]+.png/', '/regex-ad42.png', 'img', B],
+  ['regex: /regex-adX.png', '/regex-adX.png', 'img', L],
+  ['separator ^ at the end: /sep-ad', '/sep-ad', 'img', main ? B : L],
+  ['separator ^: /sep-ad?x', '/sep-ad?x=1', 'img', main ? B : L],
+  ['separator ^: /sep-adx (no separator)', '/sep-adx', 'img', L],
+  ['redirect= rule dropped: /ads-redirected.js', '/ads-redirected.js', 'script', L],
+  ['plain image', '/img.png', 'img', L],
+];
+const table = document.getElementById('results');
+let pending = tests.length + 1;
+function report(name, expected, result) {
+  const tr = table.insertRow();
+  tr.insertCell().textContent = name;
+  tr.insertCell().textContent = expected;
+  const td = tr.insertCell();
+  td.textContent = result;
+  td.className = result === expected ? 'ok' : 'bad';
+  fetch('/report?' + new URLSearchParams({ host: location.hostname, name, expected, result }));
+  if (--pending === 0) {
+    const bad = document.querySelectorAll('td.bad').length;
+    document.title = bad ? 'Ad block test: ' + bad + ' FAILED' : 'Ad block test: all passed';
+    fetch('/report?' + new URLSearchParams({ host: location.hostname, name: 'DONE', expected: '0', result: String(bad) }))
+      .then(() => { if (params.get('next')) setTimeout(() => location.href = params.get('next'), 300); });
+  }
+}
+for (const [name, url, kind, expected] of tests) {
+  const el = document.createElement(kind);
+  el.onload = () => report(name, expected, 'loaded');
+  el.onerror = () => report(name, expected, 'blocked');
+  el.src = url + (url.includes('?') ? '&' : '?') + 'n=' + Math.random();
+  (kind === 'img' ? document.body : document.head).appendChild(el);
+}
+setTimeout(() => {
+  const vis = c => getComputedStyle(document.querySelector('.' + c)).display !== 'none' ? 'visible' : 'hidden';
+  const H = off ? 'visible' : 'hidden', V = 'visible';
+  const res = [['ad-box', H], ['site-ad', main ? H : V], ['kept-ad', main ? V : H], ['other-site-ad', V]];
+  pending += res.length;
+  for (const [c, e] of res) report('cosmetic .' + c, e, vis(c));
+  report('cosmetic checks', 'done', 'done');
+}, 1500);
+</script>
+</body></html>

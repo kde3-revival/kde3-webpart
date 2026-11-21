@@ -1,5 +1,5 @@
 <!DOCTYPE kpartgui SYSTEM "kpartgui.dtd">
-<kpartgui name="kwpepart" version="2">
+<kpartgui name="kwpepart" version="3">
 <MenuBar>
  <Menu name="edit"><text>&amp;Edit</text>
   <Separator />
@@ -11,6 +11,11 @@
   <Action name="zoomIn" />
   <Action name="zoomOut" />
   <Action name="zoomNormal" />
+ </Menu>
+ <Menu name="settings"><text>&amp;Settings</text>
+  <Separator />
+  <Action name="adblockSite" />
+  <Action name="configureWPE" />
  </Menu>
 </MenuBar>
 <ToolBar name="mainToolBar"><text>Main Toolbar</text>

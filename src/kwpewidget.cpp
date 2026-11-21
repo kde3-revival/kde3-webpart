@@ -33,6 +33,7 @@
 #include <kurl.h>
 #include <kstandarddirs.h>
 
+#include "kwpeadblock.h"
 #include "kwpedownload.h"
 #include "kwpesettings.h"
 #include "kwpewidget.h"
@@ -138,7 +139,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 {
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
-        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -179,8 +180,11 @@ public:
     WebKitWebView* view;
     WPEView* wpeView;
     WPEToplevel* toplevel;
+    WebKitUserContentManager* contentManager;   // ours: the ad blocker's filters
     QString url;
     QString title;
+    QString deferredURL;   // load() waits for the ad blocker's filters
+    bool reloadForFilters; // the ad blocker switched for this page after it was requested
     bool loading;
     bool failed;           // the current load failed (WebKit still sends LOAD_FINISHED)
     bool ownBackForward;   // goToHistoryToken() asked for this back/forward navigation
@@ -247,12 +251,17 @@ void KWPEWidgetPrivate::create()
     if ( !ensureWebKit() )
         return;
 
+    // A content manager per view: the ad blocker's filters are attached
+    // to it or not, depending on the site the view shows.
+    contentManager = webkit_user_content_manager_new();
     view = WEBKIT_WEB_VIEW( g_object_new( WEBKIT_TYPE_WEB_VIEW,
                                           "display", s_display,
                                           "web-context", s_context,
                                           "network-session", s_session,
                                           "settings", s_settings,
+                                          "user-content-manager", contentManager,
                                           NULL ) );
+    KWPEAdBlock::self()->addView( contentManager );
     wpeView = webkit_web_view_get_wpe_view( view );
     g_object_set_data( G_OBJECT( view ), widgetKey, q );
 
@@ -280,6 +289,7 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "insecure-content-detected", G_CALLBACK( onInsecureContent ), this );
     g_signal_connect( view, "authenticate", G_CALLBACK( onAuthenticate ), this );
     g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
+
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
     g_signal_connect( finder, "found-text", G_CALLBACK( onFoundText ), this );
@@ -318,6 +328,9 @@ void KWPEWidgetPrivate::destroy()
     frameCallback = 0;
     g_object_unref( view );
     g_object_unref( toplevel );
+    KWPEAdBlock::self()->removeView( contentManager );
+    g_object_unref( contentManager );
+    contentManager = 0;
     view = 0;
     wpeView = 0;
     toplevel = 0;
@@ -379,6 +392,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     switch ( event ) {
     case WEBKIT_LOAD_STARTED:
+        d->reloadForFilters = false;
         d->loading = true;
         d->failed = false;
         d->loadStart = g_get_monotonic_time();
@@ -388,6 +402,15 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         break;
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
+        // Usually set already (a page from the back/forward cache has no
+        // response).  WebKit decides which elements to hide when it
+        // requests the page: if the filters were switched later, the
+        // page is loaded once more, with the right ones.
+        KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() );
+        if ( d->reloadForFilters ) {
+            d->reloadForFilters = false;
+            QTimer::singleShot( 0, d->q, SLOT( reloadForFilters() ) );
+        }
         d->ownBackForward = false;
         d->insecureContent = false;
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
@@ -555,6 +578,18 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
 
     if ( type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE ) {
         WebKitResponsePolicyDecision* response = WEBKIT_RESPONSE_POLICY_DECISION( decision );
+        // A link (or a redirect) from a site where ad blocking is off to
+        // one where it is on, or the other way round: the filters switch
+        // before WebKit commits the page and loads what it needs.  Its
+        // element hiding was decided with the previous ones: reloaded
+        // after the commit (not an answer to POST).
+        if ( webkit_response_policy_decision_is_main_frame_main_resource( response ) ) {
+            bool switched = KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8(
+                webkit_uri_response_get_uri( webkit_response_policy_decision_get_response( response ) ) ) ).host() );
+            const char* method = webkit_uri_request_get_http_method( webkit_response_policy_decision_get_request( response ) );
+            if ( switched && ( !method || g_ascii_strcasecmp( method, "GET" ) == 0 ) )
+                d->reloadForFilters = true;
+        }
         if ( webkit_response_policy_decision_is_main_frame_main_resource( response )
              && !webkit_response_policy_decision_is_mime_type_supported( response ) ) {
             // The answer to a POST cannot be fetched again by Konqueror:
@@ -751,8 +786,39 @@ void KWPEWidget::load( const QString& url )
 {
     // A response of the previous page not reported yet: superseded.
     d->unsupportedUrl = QString::null;
-    if ( d->view )
-        webkit_web_view_load_uri( d->view, url.utf8().data() );
+    if ( !d->view )
+        return;
+    // The filters for the site, before WebKit requests the page.
+    KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
+    // A process just started: the filters are read from their store in
+    // the background (milliseconds).  The first page waits for them, at
+    // most a second, or its ads would come through.
+    if ( !KWPEAdBlock::self()->isReady() ) {
+        if ( d->deferredURL.isNull() ) {
+            connect( KWPEAdBlock::self(), SIGNAL( changed() ), SLOT( adBlockChanged() ) );
+            QTimer::singleShot( 1000, this, SLOT( loadDeferred() ) );
+        }
+        d->deferredURL = url;
+        return;
+    }
+    d->deferredURL = QString::null;
+    webkit_web_view_load_uri( d->view, url.utf8().data() );
+}
+
+void KWPEWidget::adBlockChanged()
+{
+    if ( KWPEAdBlock::self()->isReady() )
+        loadDeferred();
+}
+
+void KWPEWidget::loadDeferred()
+{
+    disconnect( KWPEAdBlock::self(), SIGNAL( changed() ), this, SLOT( adBlockChanged() ) );
+    if ( d->deferredURL.isNull() || !d->view )
+        return;
+    QString url = d->deferredURL;
+    d->deferredURL = QString::null;
+    webkit_web_view_load_uri( d->view, url.utf8().data() );
 }
 
 void KWPEWidget::downloadURL( const QString& url )
@@ -899,6 +965,12 @@ void KWPEWidget::askAuthentication()
     d->dropAuthentication();
 }
 
+void KWPEWidget::reloadForFilters()
+{
+    if ( d->view )
+        webkit_web_view_reload( d->view );
+}
+
 void KWPEWidget::reloadAfterCrash()
 {
     if ( d->view )
@@ -931,6 +1003,7 @@ void KWPEWidget::reload( bool bypassCache )
 
 void KWPEWidget::stop()
 {
+    d->deferredURL = QString::null;
     if ( d->view )
         webkit_web_view_stop_loading( d->view );
 }
@@ -982,6 +1055,7 @@ KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString
     if ( it.data() == webkit_back_forward_list_get_current_item( list ) )
         return HistoryCurrent;
     d->ownBackForward = true;
+    KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
     webkit_web_view_go_to_back_forward_list_item( d->view, it.data() );
     return HistoryNavigating;
 }
