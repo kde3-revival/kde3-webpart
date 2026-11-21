@@ -152,6 +152,7 @@ private slots:
     void printFrameStats();
     void showContextMenu();
     void reloadAfterCrash();
+    void askAuthentication();
 
 private:
     friend class KWPEWidgetPrivate;

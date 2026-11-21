@@ -21,12 +21,15 @@
 #include <qapplication.h>
 #include <qclipboard.h>
 #include <qcursor.h>
+#include <qguardedptr.h>
 #include <qfile.h>
 #include <qmap.h>
 #include <qtimer.h>
 #include <qevent.h>
 
 #include <kglobal.h>
+#include <kio/passdlg.h>
+#include <klocale.h>
 #include <kurl.h>
 #include <kstandarddirs.h>
 
@@ -135,7 +138,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget )
         : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), cancellable( 0 ), insecureContent( false ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), cancellable( 0 ), insecureContent( false ), authRequest( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -161,6 +164,10 @@ public:
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
     static void onInsecureContent( WebKitWebView*, WebKitInsecureContentEvent, gpointer data );
+    static gboolean onAuthenticate( WebKitWebView*, WebKitAuthenticationRequest* request, gpointer data );
+    static void onAuthenticationCancelled( WebKitAuthenticationRequest*, gpointer data );
+    static void onSubmitForm( WebKitWebView*, WebKitFormSubmissionRequest* request, gpointer data );
+    void dropAuthentication();
     static gboolean onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer data );
     static gboolean onContextMenu( WebKitWebView*, WebKitContextMenu*, WebKitHitTestResult* hit, gpointer data );
     static void onSelectionText( GObject* view, GAsyncResult* result, gpointer data );
@@ -189,6 +196,7 @@ public:
     GCancellable* cancellable;   // pending JavaScript calls; cancelled with the view
 
     bool insecureContent;        // the page loaded http content (https page)
+    WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
     gint64 lastCrashReload;      // when the page was reloaded after a crash
     unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
@@ -264,6 +272,8 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "web-process-terminated", G_CALLBACK( onWebProcessTerminated ), this );
     g_signal_connect( view, "permission-request", G_CALLBACK( onPermissionRequest ), this );
     g_signal_connect( view, "insecure-content-detected", G_CALLBACK( onInsecureContent ), this );
+    g_signal_connect( view, "authenticate", G_CALLBACK( onAuthenticate ), this );
+    g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
     g_signal_connect( finder, "found-text", G_CALLBACK( onFoundText ), this );
@@ -293,6 +303,10 @@ void KWPEWidgetPrivate::destroy()
     g_object_set_data( G_OBJECT( view ), widgetKey, 0 );
     KWPE::attachView( wpeView, 0, 0 );
     forgetItems( 0 );
+    if ( authRequest ) {
+        webkit_authentication_request_cancel( authRequest );
+        dropAuthentication();
+    }
     if ( frameCallback )
         webkit_web_view_remove_frame_displayed_callback( view, frameCallback );
     frameCallback = 0;
@@ -636,6 +650,50 @@ void KWPEWidgetPrivate::onInsecureContent( WebKitWebView*, WebKitInsecureContent
     emit d->q->insecureContentDetected();
 }
 
+// HTTP (and proxy) authentication: KDE's password dialog.  Nothing is
+// stored yet: KWallet comes with the password manager (see onSubmitForm).
+gboolean KWPEWidgetPrivate::onAuthenticate( WebKitWebView*, WebKitAuthenticationRequest* request, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    switch ( webkit_authentication_request_get_scheme( request ) ) {
+    case WEBKIT_AUTHENTICATION_SCHEME_CLIENT_CERTIFICATE_REQUESTED:
+    case WEBKIT_AUTHENTICATION_SCHEME_SERVER_TRUST_EVALUATION_REQUESTED:
+    case WEBKIT_AUTHENTICATION_SCHEME_CLIENT_CERTIFICATE_PIN_REQUESTED:
+        return FALSE;   // WebKit's default: cancelled
+    default:
+        break;
+    }
+    if ( d->authRequest )
+        return FALSE;   // one dialog at a time
+    d->authRequest = WEBKIT_AUTHENTICATION_REQUEST( g_object_ref( request ) );
+    g_signal_connect( request, "cancelled", G_CALLBACK( onAuthenticationCancelled ), d );
+    // The dialog runs an event loop: not inside WebKit's signal.
+    QTimer::singleShot( 0, d->q, SLOT( askAuthentication() ) );
+    return TRUE;
+}
+
+void KWPEWidgetPrivate::onAuthenticationCancelled( WebKitAuthenticationRequest*, gpointer data )
+{
+    static_cast<KWPEWidgetPrivate*>( data )->dropAuthentication();
+}
+
+void KWPEWidgetPrivate::dropAuthentication()
+{
+    if ( !authRequest )
+        return;
+    g_signal_handlers_disconnect_by_data( authRequest, this );
+    g_object_unref( authRequest );
+    authRequest = 0;
+}
+
+// The password manager's hook: a form is submitted, with its text fields
+// (names and values, password fields included).  Stub: KWallet storage
+// and filling come later; for now the form is just sent.
+void KWPEWidgetPrivate::onSubmitForm( WebKitWebView*, WebKitFormSubmissionRequest* request, gpointer )
+{
+    webkit_form_submission_request_submit( request );
+}
+
 gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer )
 {
     // Geolocation, camera, microphone, notifications, ...: no UI to ask
@@ -788,6 +846,43 @@ void KWPEWidget::copySelection()
     if ( d->view )
         webkit_web_view_evaluate_javascript( d->view, script, -1, "kwpepart", 0, d->cancellable,
                                              KWPEWidgetPrivate::onSelectionText, 0 );
+}
+
+void KWPEWidget::askAuthentication()
+{
+    WebKitAuthenticationRequest* request = d->authRequest;
+    if ( !request )
+        return;
+    QString realm = QString::fromUtf8( webkit_authentication_request_get_realm( request ) );
+    QString host = QString::fromUtf8( webkit_authentication_request_get_host( request ) );
+    QString user, password;
+    WebKitCredential* proposed = webkit_authentication_request_get_proposed_credential( request );
+    if ( proposed ) {
+        user = QString::fromUtf8( webkit_credential_get_username( proposed ) );
+        webkit_credential_free( proposed );
+    }
+    QString prompt = webkit_authentication_request_is_for_proxy( request )
+        ? i18n( "The proxy %1 needs a user name and a password." ).arg( host )
+        : i18n( "%1 needs a user name and a password." ).arg( host );
+    if ( webkit_authentication_request_is_retry( request ) )
+        prompt = i18n( "Authentication failed." ) + " " + prompt;
+
+    QGuardedPtr<KWPEWidget> self( this );
+    int result = KIO::PasswordDialog::getNameAndPassword( user, password, 0, prompt, false,
+                                                         i18n( "Authorization Dialog" ),
+                                                         realm, i18n( "Site:" ) );
+    // Gone meanwhile: destroy() cancelled the request; or WebKit did.
+    if ( !self || d->authRequest != request )
+        return;
+    if ( result == QDialog::Accepted ) {
+        WebKitCredential* credential = webkit_credential_new( user.utf8().data(), password.utf8().data(),
+                                                              WEBKIT_CREDENTIAL_PERSISTENCE_FOR_SESSION );
+        webkit_authentication_request_authenticate( request, credential );
+        webkit_credential_free( credential );
+    } else {
+        webkit_authentication_request_cancel( request );
+    }
+    d->dropAuthentication();
 }
 
 void KWPEWidget::reloadAfterCrash()
