@@ -802,7 +802,10 @@ static gboolean kwpeViewRenderBuffer( WPEView* view, WPEBuffer* buffer, const WP
         gsize size = 0;
         const guchar* pixels = static_cast<const guchar*>( g_bytes_get_data( wpe_buffer_shm_get_data( shm ), &size ) );
         guint stride = wpe_buffer_shm_get_stride( shm );
-        if ( !pixels || size < gsize( stride ) * height || !ensureShmImage( st, width, height ) ) {
+        // The buffer comes from the web process: a row shorter than the
+        // width would make the copy below read past the pixels.
+        if ( !pixels || width <= 0 || height <= 0 || stride < guint( width ) * 4 || size < gsize( stride ) * height
+             || !ensureShmImage( st, width, height ) ) {
             g_set_error_literal( error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "cannot show the SHM buffer" );
             return FALSE;
         }
