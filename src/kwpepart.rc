@@ -1,5 +1,5 @@
 <!DOCTYPE kpartgui SYSTEM "kpartgui.dtd">
-<kpartgui name="kwpepart" version="1">
+<kpartgui name="kwpepart" version="2">
 <MenuBar>
  <Menu name="edit"><text>&amp;Edit</text>
   <Separator />
@@ -7,8 +7,16 @@
   <Action name="findNext" />
   <Action name="findPrevious" />
  </Menu>
+ <Menu name="view"><text>&amp;View</text>
+  <Action name="zoomIn" />
+  <Action name="zoomOut" />
+  <Action name="zoomNormal" />
+ </Menu>
 </MenuBar>
 <ToolBar name="mainToolBar"><text>Main Toolbar</text>
  <Action name="find" />
+ <Separator />
+ <Action name="zoomIn" />
+ <Action name="zoomOut" />
 </ToolBar>
 </kpartgui>

@@ -625,6 +625,56 @@ void KWPEWidget::downloadURL( const QString& url )
         g_object_unref( webkit_web_view_download_uri( d->view, url.utf8().data() ) );
 }
 
+// Zoom steps in percent, as in other browsers.
+static const int zoomSteps[] = { 30, 50, 67, 80, 90, 100, 110, 120, 133, 150, 170, 200, 240, 300 };
+static const int zoomStepCount = sizeof( zoomSteps ) / sizeof( zoomSteps[0] );
+
+int KWPEWidget::zoom() const
+{
+    return d->view ? int( webkit_web_view_get_zoom_level( d->view ) * 100.0 + 0.5 ) : 100;
+}
+
+void KWPEWidget::setZoom( int percent )
+{
+    if ( !d->view )
+        return;
+    percent = QMAX( zoomSteps[0], QMIN( percent, zoomSteps[zoomStepCount - 1] ) );
+    if ( percent == zoom() )
+        return;
+    webkit_web_view_set_zoom_level( d->view, percent / 100.0 );
+    emit zoomChanged( percent );
+}
+
+void KWPEWidget::zoomIn()
+{
+    int current = zoom();
+    for ( int i = 0; i < zoomStepCount; ++i )
+        if ( zoomSteps[i] > current ) {
+            setZoom( zoomSteps[i] );
+            return;
+        }
+}
+
+void KWPEWidget::zoomOut()
+{
+    int current = zoom();
+    for ( int i = zoomStepCount - 1; i >= 0; --i )
+        if ( zoomSteps[i] < current ) {
+            setZoom( zoomSteps[i] );
+            return;
+        }
+}
+
+bool KWPEWidget::canZoomIn() const
+{
+    return zoom() < zoomSteps[zoomStepCount - 1];
+}
+
+bool KWPEWidget::canZoomOut() const
+{
+    return zoom() > zoomSteps[0];
+}
+
 void KWPEWidget::find( const QString& text, bool caseSensitive, bool wholeWords, bool backwards )
 {
     if ( !d->view )
@@ -954,6 +1004,15 @@ void KWPEWidget::wheelEvent( QWheelEvent* e )
 {
     if ( !d->wpeView )
         return;
+    // Ctrl+wheel zooms, as in KHTML.
+    if ( e->state() & ControlButton ) {
+        if ( e->delta() > 0 )
+            zoomIn();
+        else if ( e->delta() < 0 )
+            zoomOut();
+        e->accept();
+        return;
+    }
     // Wheel notches (120 per notch, positive away from the user) as
     // WebKit's discrete steps (positive: scroll up/left); WebKit animates
     // them (smooth scrolling).  Pixel-precise XI2.1 scrolling: later.

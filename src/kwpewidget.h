@@ -53,6 +53,15 @@ public:
     /** The next (or previous) match of the last find(). */
     void findNext( bool forward );
 
+    /** Page zoom in percent (text and images; 100: none). */
+    int zoom() const;
+    void setZoom( int percent );
+    /** The next zoom step up/down (30 % ... 300 %). */
+    void zoomIn();
+    void zoomOut();
+    bool canZoomIn() const;
+    bool canZoomOut() const;
+
     /** Text is selected (in the page or in a field). */
     bool hasSelection() const;
     /** The selected text into the clipboard. */
@@ -103,6 +112,8 @@ signals:
     void contextMenuRequested( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
     /** The result of find(), findNext(): @p matches (up to 1000). */
     void findResult( bool found, unsigned matches );
+    /** zoom() changed (setZoom(), Ctrl+wheel). */
+    void zoomChanged( int percent );
     /** hasSelection() changed. */
     void copyAvailable( bool available );
 

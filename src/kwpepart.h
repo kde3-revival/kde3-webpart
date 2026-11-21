@@ -77,6 +77,10 @@ private slots:
     void slotFindNext();
     void slotFindPrevious();
     void slotFindResult( bool found, unsigned matches );
+    void slotZoomIn();
+    void slotZoomOut();
+    void slotZoomNormal();
+    void slotZoomChanged( int percent );
 
 private:
     friend class KWPEBrowserExtension;
@@ -95,6 +99,9 @@ private:
     QStringList m_findHistory;
     KAction* m_findNext;
     KAction* m_findPrevious;
+    KAction* m_zoomIn;
+    KAction* m_zoomOut;
+    KAction* m_zoomNormal;
 };
 
 class KWPEBrowserExtension : public KParts::BrowserExtension

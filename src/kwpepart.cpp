@@ -84,6 +84,16 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_findNext->setEnabled( false );
     m_findPrevious->setEnabled( false );
 
+    // Ctrl+= too: "+" needs Shift on most keyboards.
+    m_zoomIn = KStdAction::zoomIn( this, SLOT( slotZoomIn() ), actionCollection(), "zoomIn" );
+    m_zoomIn->setShortcut( KShortcut( "CTRL++;CTRL+=" ) );
+    m_zoomOut = KStdAction::zoomOut( this, SLOT( slotZoomOut() ), actionCollection(), "zoomOut" );
+    m_zoomNormal = KStdAction::actualSize( this, SLOT( slotZoomNormal() ), actionCollection(), "zoomNormal" );
+    m_zoomNormal->setText( i18n( "Reset Zoom" ) );
+    m_zoomNormal->setShortcut( KShortcut( "CTRL+0" ) );
+    m_zoomNormal->setEnabled( false );
+    connect( m_view, SIGNAL( zoomChanged( int ) ), SLOT( slotZoomChanged( int ) ) );
+
     setXMLFile( "kwpepart.rc" );
 }
 
@@ -333,6 +343,29 @@ void KWPEPart::slotFindResult( bool found, unsigned matches )
         KNotifyClient::beep();
         emit setStatusBarText( i18n( "No matches found for '%1'." ).arg( m_findText ) );
     }
+}
+
+void KWPEPart::slotZoomIn()
+{
+    m_view->zoomIn();
+}
+
+void KWPEPart::slotZoomOut()
+{
+    m_view->zoomOut();
+}
+
+void KWPEPart::slotZoomNormal()
+{
+    m_view->setZoom( 100 );
+}
+
+void KWPEPart::slotZoomChanged( int percent )
+{
+    m_zoomIn->setEnabled( m_view->canZoomIn() );
+    m_zoomOut->setEnabled( m_view->canZoomOut() );
+    m_zoomNormal->setEnabled( percent != 100 );
+    emit setStatusBarText( i18n( "Zoom: %1%" ).arg( percent ) );
 }
 
 void KWPEPart::slotCopyAvailable( bool available )
