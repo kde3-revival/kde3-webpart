@@ -1044,6 +1044,28 @@ bool splitScriptletArgs( const std::string& text, std::vector<std::string>& args
 }
 }
 
+static bool validUTF8( const std::string& s )
+{
+    size_t i = 0;
+    while ( i < s.size() ) {
+        unsigned char c = s[i];
+        unsigned n = c < 0x80 ? 0 : ( c & 0xe0 ) == 0xc0 ? 1 : ( c & 0xf0 ) == 0xe0 ? 2 : ( c & 0xf8 ) == 0xf0 ? 3 : 9;
+        if ( n == 9 || ( n == 1 && c < 0xc2 ) || ( n == 3 && c > 0xf4 ) || i + n >= s.size() )
+            return false;
+        unsigned cp = n == 0 ? c : c & ( 0x3f >> n );
+        for ( unsigned k = 1; k <= n; ++k ) {
+            unsigned char d = s[i + k];
+            if ( ( d & 0xc0 ) != 0x80 )
+                return false;
+            cp = ( cp << 6 ) | ( d & 0x3f );
+        }
+        if ( ( n == 2 && ( cp < 0x800 || ( cp >= 0xd800 && cp < 0xe000 ) ) ) || ( n == 3 && ( cp < 0x10000 || cp > 0x10ffff ) ) )
+            return false;
+        i += n + 1;
+    }
+    return true;
+}
+
 static std::string scriptletKey( const std::string& name, const std::vector<std::string>& args )
 {
     std::string key = name;
@@ -1082,6 +1104,14 @@ bool parseScriptlet( const std::string& bodyIn, bool trusted, std::string& name,
         return false;
     }
     name = sn->name;
+    // a byte sequence that is not UTF-8 would make WebKit refuse the
+    // whole script of the site
+    for ( size_t i = 1; i < parts.size(); ++i ) {
+        if ( !validUTF8( parts[i] ) ) {
+            whyNot = "scriptlet-syntax";
+            return false;
+        }
+    }
     // "noeval" is noeval-if without a needle
     if ( raw == "noeval" )
         parts.resize( 1 );

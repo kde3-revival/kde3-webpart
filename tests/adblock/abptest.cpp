@@ -418,6 +418,9 @@ int main()
                   "trusted-set-constant|x|1 @ a.com" );
     }
     dropped( "a.com##+js(no-such-scriptlet, x)", "scriptlet-unsupported" );
+    dropped( "a.com##+js(set, x\xc0\xaf, 1)", "scriptlet-syntax" );
+    expectEq( "scriptlet UTF-8 argument", scriptlets( "U:a.com##+js(nostif, \xc8\x99\xe2\x80\x93\xf0\x9f\x98\x80)" ),
+              "no-setTimeout-if|\xc8\x99\xe2\x80\x93\xf0\x9f\x98\x80 @ a.com" );
     dropped( "##+js(set, x, 1)", "scriptlet-generic" );
     dropped( "~a.com##+js(set, x, 1)", "scriptlet-generic" );
     dropped( "a.com>>##+js(set, x, 1)", "scriptlet-domain" );

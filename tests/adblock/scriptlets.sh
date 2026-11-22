@@ -73,14 +73,14 @@ check() {
 mark() { echo "--- $1" >> "$log"; }
 
 mark on
-view "http://127.0.0.1:$port/scriptlets.html" 8
+view "http://127.0.0.1:$port/scriptlets.html?run=$$" 8
 check on 127.0.0.1
 mark none
-view "http://localhost:$port/scriptlets.html" 8
+view "http://localhost:$port/scriptlets.html?run=$$" 8
 check none localhost
 mark off
 conf DisabledSites 127.0.0.1
-view "http://127.0.0.1:$port/scriptlets.html?expect=off" 8
+view "http://127.0.0.1:$port/scriptlets.html?expect=off&run=$$" 8
 check off 127.0.0.1
 conf DisabledSites ""
 if grep -q "^SERVED /ads-api/" "$log" && ! sed -n '/^--- none$/,$p' "$log" | grep -q "^SERVED /ads-api/"; then

@@ -143,6 +143,13 @@ check('frame of another site (127.0.0.2)', 'true', params.get('expect') === 'off
   document.getElementById('other').src = 'http://127.0.0.2:' + location.port + '/scriptlets-frame.html';
   setTimeout(() => resolve('no answer'), 3000);
 }));
+check('remove-node-text (script in two pieces)', 'undefined', 'true', () => new Promise(resolve => {
+  window.addEventListener('message', e => { if (e.data && 'slow' in e.data) resolve(e.data.slow); });
+  const f = document.createElement('iframe');
+  f.src = '/slowscript';
+  document.body.appendChild(f);
+  setTimeout(() => resolve('no answer'), 4000);
+}));
 window.addEventListener('load', () => { for (const c of checks) c(); });
 </script>
 </body>

@@ -371,7 +371,16 @@ before the page's own scripts.
   with the scriptlets switch.  User scripts are not subject to the page's
   CSP; the library itself adds no `<script>` and uses no `eval`.
 * **Cost**: about 3 ms per frame of a host with scriptlets (the library
-  is ~37 KB of source); frames of other hosts only parse it.
+  is ~37 KB of source); every frame of the view parses the scripts of
+  the other hosts too (at most 32 hosts per view; one library shared by
+  small per-host scripts would be cheaper).  Response edits read only
+  text/JSON bodies up to 16 MiB, and the page gets the response once all
+  of it arrived.
+* **Limits**: frames without a host (`about:blank`, `srcdoc`, `blob:`)
+  get no scriptlets (`trusted-prevent-dom-bypass` covers some of that);
+  `noeval-if` makes a direct `eval()` indirect on its sites (as uBlock);
+  a rebuilt `Response` keeps `url`/`type`/`redirected` but its `clone()`
+  does not.
 
 ### Which part Konqueror uses
 

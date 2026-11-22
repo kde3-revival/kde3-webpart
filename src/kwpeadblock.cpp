@@ -190,7 +190,9 @@ QStringList hostSites( const QString& host )
             break;
         h = h.mid( dot + 1 );
     }
-    const char* base = soup_tld_get_base_domain( host.utf8().data(), 0 );
+    // (a pointer into its argument)
+    QCString utf8 = host.utf8();
+    const char* base = soup_tld_get_base_domain( utf8.data(), 0 );
     if ( base ) {
         QString registrable = QString::fromUtf8( base );
         int dot = registrable.find( '.' );
@@ -466,8 +468,16 @@ void KWPEAdBlock::addFrameHost( WebKitUserContentManager* manager, const QString
         return;
     QString h = scriptHost( host );
     QStringList& hosts = s.viewFrameHosts[manager];
+    // many frames of rotating sites in a long visit: the oldest go (they
+    // were for frames that are gone, most likely)
     if ( h.isEmpty() || hosts.contains( h ) )
         return;
+    if ( hosts.count() >= 32 ) {
+        hosts.remove( hosts.at( 1 ) );   // not the main site
+        hosts.append( h );
+        applyScripts( manager );
+        return;
+    }
     hosts.append( h );
     // Only a script more (the others stay as they are): the request of
     // the frame comes after it, WebKit gets both in this order.
@@ -557,7 +567,7 @@ QString KWPEAdBlock::scriptletsSource( const QString& host )
 void KWPEAdBlock::loadScriptlets( const QStringList& ids )
 {
     QString prefix = ids.isEmpty() ? QString::null : ids.first().left( ids.first().findRev( '-' ) );
-    if ( prefix == s.scriptletsPrefix && !prefix.isEmpty() )
+    if ( prefix == s.scriptletsPrefix && !prefix.isEmpty() && !s.scriptletCalls.isEmpty() )
         return;
     s.scriptletsPrefix = prefix;
     s.scriptletCalls.clear();
@@ -1079,7 +1089,9 @@ void KWPEAdBlock::convert()
     s.newHash = QString::fromLatin1( md5.hexDigest() );
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
-    if ( s.newHash == c->readEntry( "ListsHash" ) && !s.filters.isEmpty() && s.filtersIds == s.filterIds ) {
+    // (the scriptlets of the set too: a lost file is written again)
+    if ( s.newHash == c->readEntry( "ListsHash" ) && !s.filters.isEmpty() && s.filtersIds == s.filterIds
+         && QFile::exists( baseDir() + s.scriptletsPrefix + ".scriptlets" ) ) {
         finishUpdate( true, QString::null );
         return;
     }

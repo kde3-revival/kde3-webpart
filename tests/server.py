@@ -20,6 +20,7 @@
 #                        (adPlacements, playerAds, adSlots), GET or POST
 #   /replace.json        JSON with "adSlots" (text replacement test)
 #   /ads-api/*           must never be requested (pages/scriptlets.html)
+#   /slowscript          an inline script that arrives in two pieces
 #   /report?host=&name=&expected=&result=
 #                        pages/adblock.html reports a result: printed on stdout
 
@@ -111,6 +112,17 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_body(body, ctype, extra)
         if url.path in ('/youtubei/v1/player', '/replace.json'):
             return self.send_body(PLAYER, 'application/json')
+        if url.path == '/slowscript':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<!DOCTYPE html><html><body><script>var first = 1;\n' + b'/* padding */\n' * 2000)
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.wfile.write(b'/* AD_SCRIPT_MARK */ window.slowRan = true;</script>'
+                             b'<script>parent.postMessage({ slow: String(window.slowRan) }, "*");</script></body></html>')
+            self.close_connection = True
+            return
         if url.path.startswith('/ads-api/'):
             print('SERVED %s' % url.path, flush=True)
             return self.send_body(b'ad answer', 'text/plain')

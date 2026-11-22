@@ -169,7 +169,10 @@ function trapChain( owner, chain, final )
 {
     const dot = chain.indexOf( '.' );
     if ( dot < 0 ) {
-        final( owner, chain );
+        try {
+            final( owner, chain );
+        } catch ( e ) {
+        }
         return;
     }
     const prop = chain.slice( 0, dot );
@@ -189,7 +192,8 @@ function trapChain( owner, chain, final )
     if ( desc && !desc.configurable )
         return;
     const prevGet = desc && desc.get, prevSet = desc && desc.set;
-    ObjectDefineProperty( owner, prop, {
+    // (a frozen object, a proxy: nothing to do, the page goes on)
+    tryDefine( owner, prop, {
         configurable: true,
         enumerable: desc ? desc.enumerable : true,
         get() {
@@ -199,10 +203,22 @@ function trapChain( owner, chain, final )
             if ( prevSet )
                 ReflectApply( prevSet, this, [ v ] );
             value = v;
-            if ( isObject( v ) )
-                trapChain( v, rest, final );
+            if ( isObject( v ) ) {
+                try {
+                    trapChain( v, rest, final );
+                } catch ( e ) {
+                }
+            }
         }
     } );
+}
+
+function tryDefine( owner, prop, desc )
+{
+    try {
+        ObjectDefineProperty( owner, prop, desc );
+    } catch ( e ) {
+    }
 }
 
 function constantValue( raw, trusted )
@@ -256,7 +272,7 @@ function setConstant( args, trusted )
         if ( desc && 'value' in desc && foreign( desc.value ) )
             return;
         let own = false, ownValue;
-        ObjectDefineProperty( owner, prop, {
+        tryDefine( owner, prop, {
             configurable: true,
             enumerable: desc ? desc.enumerable : true,
             get() {
@@ -281,7 +297,7 @@ function abortOnPropertyRead( args )
         const desc = ObjectGetOwnPropertyDescriptor( owner, prop );
         if ( desc && !desc.configurable )
             return;
-        ObjectDefineProperty( owner, prop, {
+        tryDefine( owner, prop, {
             configurable: true,
             get() {
                 throw new NativeReferenceError( magic );
@@ -301,7 +317,7 @@ function abortOnPropertyWrite( args )
         if ( desc && !desc.configurable )
             return;
         let value = desc && 'value' in desc ? desc.value : undefined;
-        ObjectDefineProperty( owner, prop, {
+        tryDefine( owner, prop, {
             configurable: true,
             get() {
                 return value;
@@ -322,7 +338,7 @@ function abortWhen( chain, shouldAbort )
             return;
         let value = desc && 'value' in desc ? desc.value : undefined;
         const prevGet = desc && desc.get, prevSet = desc && desc.set;
-        ObjectDefineProperty( owner, prop, {
+        tryDefine( owner, prop, {
             configurable: true,
             enumerable: desc ? desc.enumerable : true,
             get() {
@@ -576,7 +592,7 @@ function prunePath( obj, path, i )
 }
 
 // a function that prunes an object in place (true: something went)
-function makePruner( pruneText, needleText )
+function makePruner( pruneText, needleText, stack )
 {
     const prune = compilePaths( pruneText );
     const needles = compilePaths( needleText );
@@ -588,6 +604,11 @@ function makePruner( pruneText, needleText )
         for ( const n of needles )
             if ( !hasPath( obj, n, 0 ) )
                 return false;
+        // the caller (costly): only when there is something to prune
+        if ( stack && !prune.some( p => hasPath( obj, p, 0 ) ) )
+            return false;
+        if ( stack && !stack() )
+            return false;
         let any = false;
         for ( const p of prune )
             if ( prunePath( obj, p, 0 ) )
@@ -602,8 +623,7 @@ function pruneParsed( obj )
 {
     for ( const p of jsonPruners ) {
         try {
-            if ( !p.stack || p.stack() )
-                p.prune( obj );
+            p( obj );
         } catch ( e ) {
         }
     }
@@ -613,10 +633,10 @@ function pruneParsed( obj )
 function jsonPrune( args )
 {
     const [ prunePaths = '', needlePaths = '', stackNeedle = '' ] = args;
-    const prune = makePruner( prunePaths, needlePaths );
+    const prune = makePruner( prunePaths, needlePaths, stackMatcher( stackNeedle ) );
     if ( !prune )
         return;
-    jsonPruners.push( { prune, stack: stackMatcher( stackNeedle ) } );
+    jsonPruners.push( prune );
     if ( jsonPruners.length > 1 )
         return;
     JSON.parse = new NativeProxy( JSON.parse, {
@@ -710,8 +730,13 @@ function hookFetch()
             if ( edits.length === 0 )
                 return result;
             return result.then( response => {
-                // no body to read or none that may be read
+                // no body to read, none that may be read, not text (media,
+                // streams) or too large to hold
                 if ( response.type === 'opaque' || [ 101, 103, 204, 205, 304 ].includes( response.status ) )
+                    return response;
+                const type = ( response.headers.get( 'content-type' ) || '' ).toLowerCase();
+                const length = parseInt( response.headers.get( 'content-length' ) || '0', 10 ) || 0;
+                if ( !/json|text|javascript|^$/.test( type ) || length > 16 * 1024 * 1024 )
                     return response;
                 return response.clone().text().then( text => {
                     let changed = false;
@@ -739,6 +764,11 @@ function hookXHR()
     const proto = W.XMLHttpRequest.prototype;
     proto.open = new NativeProxy( proto.open, {
         apply( target, thisArg, args ) {
+            // a request we did not send before, with the same object
+            const old = xhrRequests.get( thisArg );
+            if ( old && old.prevented )
+                for ( const k of [ 'readyState', 'status', 'statusText', 'responseURL', 'response', 'responseText' ] )
+                    delete thisArg[k];
             xhrRequests.set( thisArg, { method: String( args[0] ).toUpperCase(), url: String( args[1] ), edited: null } );
             return ReflectApply( target, thisArg, args );
         }
@@ -818,6 +848,7 @@ function hookXHR()
 // a request that was not sent: as if an empty answer came
 function prevented( xhr, r )
 {
+    r.prevented = true;
     const json = xhr.responseType === 'json';
     const props = { readyState: 4, status: 200, statusText: 'OK', responseURL: r.url,
                     response: json ? null : '', responseText: '' };
@@ -933,7 +964,7 @@ function preventXHR( args )
 // ---------------------------------------------------------------------
 // the document: attributes, classes, inline scripts
 
-function whenReady( behavior, fn )
+function whenReady( behavior, fn, attributeFilter )
 {
     const tokens = behavior.split( /\s+/ );
     const run = () => {
@@ -957,7 +988,7 @@ function whenReady( behavior, fn )
                 pending = false;
                 run();
             }, 0 );
-        } ).observe( document, { childList: true, subtree: true, attributes: true } );
+        } ).observe( document, { childList: true, subtree: true, attributes: true, attributeFilter } );
     };
     if ( tokens.includes( 'complete' ) ) {
         if ( document.readyState === 'complete' )
@@ -994,7 +1025,7 @@ function removeAttr( args )
         for ( const e of document.querySelectorAll( selector ) )
             for ( const a of attrs )
                 e.removeAttribute( a );
-    } );
+    }, attrs );
 }
 
 function removeClass( args )
@@ -1009,7 +1040,7 @@ function removeClass( args )
     whenReady( behavior, () => {
         for ( const e of document.querySelectorAll( selector ) )
             e.classList.remove( ...classes );
-    } );
+    }, [ 'class' ] );
 }
 
 // Nodes as the parser adds them, before an inline script runs (the
@@ -1033,14 +1064,18 @@ function hookNodes()
     };
     nodeHooks.observer = new NativeMutationObserver( records => {
         for ( const r of records ) {
-            // text added to a script that was already seen
-            if ( r.target && r.target.nodeType === 1 && r.target !== document.documentElement && r.target.nodeName === 'SCRIPT' )
-                seen( r.target );
+            // text added to a script that was already seen (a new text
+            // node, or more text in it: a long script in several pieces)
+            let t = r.target;
+            if ( t && t.nodeType === 3 )
+                t = t.parentNode;
+            if ( t && t.nodeType === 1 && t.nodeName === 'SCRIPT' && t.isConnected )
+                seen( t );
             for ( const n of r.addedNodes )
                 seen( n );
         }
     } );
-    nodeHooks.observer.observe( document, { childList: true, subtree: true } );
+    nodeHooks.observer.observe( document, { childList: true, subtree: true, characterData: true } );
 }
 
 function removeNodeText( args )
@@ -1054,9 +1089,14 @@ function removeNodeText( args )
     nodeHooks.push( { name: nodeName.toLowerCase(), fn: node => {
         if ( !test( re, node.textContent ) )
             return true;
-        if ( node.nodeName === 'SCRIPT' )
-            node.textContent = '';
+        // removed before it runs (setting its text may be refused: Trusted Types)
         node.remove();
+        if ( node.nodeName === 'SCRIPT' ) {
+            try {
+                node.textContent = '';
+            } catch ( e ) {
+            }
+        }
         return false;
     } } );
     hookNodes();
