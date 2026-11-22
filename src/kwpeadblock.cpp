@@ -865,6 +865,11 @@ void KWPEAdBlock::checkSchedule()
         return;
     QDateTime now = QDateTime::currentDateTime();
     bool due = s.filterIds.isEmpty() || !s.lastUpdate.isValid() || s.lastUpdate.addSecs( s.updateHours * 3600 ) < now;
+    // A built-in list that was switched on without an update (uBlock's are
+    // added to older settings by readConfig()): the date of the last update
+    // says nothing about it.
+    for ( QValueList<List>::ConstIterator it = s.lists.begin(); !due && it != s.lists.end(); ++it )
+        due = ( *it ).enabled && !( *it ).custom && !QFile::exists( listDir( ( *it ).id ) + "list.txt" );
     // not again and again after a failure (every process, every hour)
     if ( due && s.lastAttempt.isValid() && s.lastAttempt.addSecs( retryMinutes * 60 ) > now && s.lastAttempt <= now )
         due = false;
