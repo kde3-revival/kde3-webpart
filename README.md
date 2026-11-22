@@ -651,3 +651,11 @@ their own), Twitch, digi24 render as before.
 6. **Settings module** (kcm): engine choice, JavaScript, plugins, user
    agent, fonts, cache; the ad blocker's page (now a dialog of the
    part).
+
+## WebKit deadlock under memory pressure
+
+`webkit/0002-Skia-Don-t-deadlock-when-releasing-GPU-resources-und.patch`
+(applies to 2.54.3 after 0001): stock WebKit hangs the web process when it
+frees GPU resources under critical memory pressure while display lists with
+promise images are pending (seen while playing YouTube, above 1.5 GB).
+`tests/deadlock` reproduces it.

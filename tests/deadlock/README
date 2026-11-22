@@ -1,0 +1,18 @@
+Reproducer of the deadlock fixed by webkit/0002-Skia-Don-t-deadlock-*.patch
+(SkiaGLContext::releaseUnusedResources() held m_lock over freeGpuResources()).
+
+  cc -O1 -g -o stress stress.c \
+     $(pkg-config --cflags --libs wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0)
+  ./run.sh LIBDIR below 30
+
+It is headless (no X or Wayland display; a render node is needed) and uses a
+private HOME and runtime directory.  Constant critical memory pressure meets
+tiles with promise images that change just below the visible area.
+
+  stock WPE WebKit 2.54.3:            HUNG within a second (exit code 3)
+  with the patch:                     OK (exit code 0)
+  stock, WEBKIT_SKIA_ENABLE_DDL=0:    OK (no promise images)
+
+WPEWebProcess is started from the library's compiled-in prefix, so test a
+library that is not installed yet over that prefix in a private mount
+namespace (bwrap --ro-overlay), not only with LD_LIBRARY_PATH.

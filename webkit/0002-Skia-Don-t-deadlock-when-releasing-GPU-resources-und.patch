@@ -1,0 +1,77 @@
+From 29ab45986071a0c21e58a67ac8221be07f11ca41 Mon Sep 17 00:00:00 2001
+From: Serghei Amelian <serghei.amelian@gmail.com>
+Date: Sun, 22 Nov 2026 14:47:49 +0200
+Subject: [PATCH] [Skia] Don't deadlock when releasing GPU resources under
+ memory pressure
+
+SkiaGLContext::releaseUnusedResources() held m_lock while it called
+GrDirectContext::freeGpuResources().  That flushes; the flush instantiates
+the promise images of display lists that are still pending, and their
+fulfill callback calls PlatformDisplay::skiaGLContext(), which takes
+m_lock again on the same thread.  The lock is not recursive: the
+compositor thread hangs, and with it the main thread, which waits for it
+in ThreadedCompositor::releaseMemory().  Seen while playing YouTube (the
+web process passes the strict threshold of 1.5 GB); reproduced with
+tests/deadlock in kde3-wpepart.
+
+Read the pointers with the lock held and call into Skia without it.  The
+context is thread_local and its members only change in its constructor
+and destructor; keep a reference to it during the call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/skia/PlatformDisplaySkia.cpp     | 25 +++++++++++++------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+index 22bcc67..6bed180 100644
+--- a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+@@ -312,17 +312,27 @@ public:
+ 
+     void releaseUnusedResources(WTF::Critical critical)
+     {
+-        Locker locker { m_lock };
+-        if (!m_skiaGLContext)
++        // Don't hold m_lock while calling into Skia: freeGpuResources() flushes, which instantiates
++        // the promise images of pending display lists, and their callbacks call
++        // PlatformDisplay::skiaGLContext() on this thread. m_lock is not recursive. The context
++        // is only used and destroyed in its own thread, and the caller keeps it alive.
++        GLContext* glContext;
++        sk_sp<GrDirectContext> grContext;
++        {
++            Locker locker { m_lock };
++            glContext = m_skiaGLContext.get();
++            grContext = m_skiaGrContext;
++        }
++        if (!glContext || !grContext)
+             return;
+ 
+-        GLContext::ScopedGLContextCurrent scopedCurrent(*m_skiaGLContext);
++        GLContext::ScopedGLContextCurrent scopedCurrent(*glContext);
+         switch (critical) {
+         case Critical::No:
+-            m_skiaGrContext->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
++            grContext->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
+             break;
+         case Critical::Yes:
+-            m_skiaGrContext->freeGpuResources();
++            grContext->freeGpuResources();
+             break;
+         }
+     }
+@@ -424,8 +434,9 @@ size_t PlatformDisplay::maxSkiaResourceCacheBytes() const
+ 
+ void PlatformDisplay::skiaReleaseUnusedResources(WTF::Critical critical)
+ {
+-    if (s_skiaGLContext)
+-        s_skiaGLContext->releaseUnusedResources(critical);
++    // Keep the context alive during the call, it runs Skia callbacks.
++    if (RefPtr context = s_skiaGLContext)
++        context->releaseUnusedResources(critical);
+ }
+ 
+ void PlatformDisplay::clearSkiaGLContext()
+-- 
+2.56.1
+
