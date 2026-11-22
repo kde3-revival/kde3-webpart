@@ -83,6 +83,38 @@ static const Rule* findRule( const std::vector<Rule>& rules, const std::string& 
     return 0;
 }
 
+// The scriptlets of a list ("name|arg|arg @ include / exclude" each);
+// lists: "T:" trusted, "U:" not, separated by "\n--\n".
+static std::string scriptlets( const std::string& text, ABP::Stats* stats = 0 )
+{
+    ABP::Converter c;
+    size_t start = 0;
+    for ( ;; ) {
+        size_t end = text.find( "\n--\n", start );
+        std::string part = text.substr( start, end == std::string::npos ? std::string::npos : end - start );
+        c.addList( part.substr( 2 ), part[0] == 'T' );
+        if ( end == std::string::npos )
+            break;
+        start = end + 4;
+    }
+    c.ruleLists();
+    if ( stats )
+        *stats = c.stats;
+    std::string out;
+    for ( size_t i = 0; i < c.scriptlets().size(); ++i ) {
+        const ABP::Converter::Scriptlet& sc = c.scriptlets()[i];
+        out += ( i ? "; " : "" ) + sc.name;
+        for ( size_t k = 0; k < sc.args.size(); ++k )
+            out += "|" + sc.args[k];
+        out += " @";
+        for ( size_t k = 0; k < sc.include.size(); ++k )
+            out += ( k ? "," : " " ) + sc.include[k];
+        for ( size_t k = 0; k < sc.exclude.size(); ++k )
+            out += ( k ? "," : " / " ) + sc.exclude[k];
+    }
+    return out;
+}
+
 static std::string join( const std::vector<std::string>& v )
 {
     std::string s;
@@ -332,7 +364,6 @@ int main()
     }
     dropped( "a.com##.x:has-text(Ad)", "procedural-cosmetic" );
     dropped( "a.com##.x:style(display: block !important)", "procedural-cosmetic" );
-    dropped( "a.com##+js(set-constant, x, 1)", "scriptlet" );
     dropped( "a.com##^script:has-text(ad)", "html-filter" );
     dropped( "a.com#?#.x:-abp-contains(Ad)", "extended-css" );
     dropped( "a.com#$#abort-on-property-read x", "snippet-or-css-injection" );
@@ -356,6 +387,55 @@ int main()
         if ( !matches( top, "https://a.com/" ) || !matches( top, "https://www.a.com:8080/" )
              || matches( top, "https://b.org/?next=https://a.com/" ) || matches( top, "https://xa.com/" ) )
             fail( "site pattern matching" );
+    }
+
+    // --- scriptlets -----------------------------------------------------
+    expectEq( "scriptlet alias", scriptlets( "U:a.com##+js(set, x.y, 1)" ), "set-constant|x.y|1 @ a.com" );
+    expectEq( "scriptlet .js name", scriptlets( "U:a.com##+js(json-prune.js, a b, c)" ), "json-prune|a b|c @ a.com" );
+    expectEq( "scriptlet escaped comma", scriptlets( "U:a.com##+js(nostif, a\\,b, 100)" ), "no-setTimeout-if|a,b|100 @ a.com" );
+    expectEq( "scriptlet quoted args",
+              scriptlets( "T:www.youtube.com##+js(trusted-rpfr, '\"adPlacements\"', '\"no_ads\"', player?)" ),
+              "trusted-replace-fetch-response|\"adPlacements\"|\"no_ads\"|player? @ www.youtube.com" );
+    expectEq( "scriptlet quoted comma", scriptlets( "T:a.com##+js(trusted-rpfr, \"a,b\", `x'y`)" ),
+              "trusted-replace-fetch-response|a,b|x'y @ a.com" );
+    expectEq( "scriptlet empty middle argument",
+              scriptlets( "U:a.com##+js(json-prune-fetch-response, ads, , propsToMatch, /\\/player(\\?|$)/)" ),
+              "json-prune-fetch-response|ads||propsToMatch|/\\/player(\\?|$)/ @ a.com" );
+    expectEq( "scriptlet trailing empty args", scriptlets( "U:a.com##+js(set, x, 1, )" ), "set-constant|x|1 @ a.com" );
+    expectEq( "scriptlet noeval", scriptlets( "U:a.com##+js(noeval)" ), "noeval-if @ a.com" );
+    expectEq( "scriptlet entity and exclusion", scriptlets( "U:youtube.*,~m.youtube.com##+js(aopr, ads)" ),
+              "abort-on-property-read|ads @ youtube.* / m.youtube.com" );
+    {
+        ABP::Stats stats;
+        expectEq( "trusted scriptlet from a list of the user's",
+                  scriptlets( "U:a.com##+js(trusted-set, x, {\"a\":1})\na.com##+js(rpnt, script, a, b)\n"
+                              "a.com##+js(trusted-prevent-dom-bypass, Node.prototype.appendChild, fetch)", &stats ), "" );
+        expectEq( "untrusted dropped", std::to_string( stats.dropped["scriptlet-untrusted"] ), "3" );
+        expectEq( "trusted scriptlet from a trusted list", scriptlets( "T:a.com##+js(trusted-set, x, {\"a\":1})" ),
+                  "trusted-set-constant|x|{\"a\":1} @ a.com" );
+        expectEq( "same filter in a trusted list too",
+                  scriptlets( "U:a.com##+js(trusted-set, x, 1)\n--\nT:a.com##+js(trusted-set, x, 1)" ),
+                  "trusted-set-constant|x|1 @ a.com" );
+    }
+    dropped( "a.com##+js(no-such-scriptlet, x)", "scriptlet-unsupported" );
+    dropped( "##+js(set, x, 1)", "scriptlet-generic" );
+    dropped( "~a.com##+js(set, x, 1)", "scriptlet-generic" );
+    dropped( "a.com>>##+js(set, x, 1)", "scriptlet-domain" );
+    expectEq( "scriptlet exception on a subdomain",
+              scriptlets( "U:a.com##+js(set, x, 1)\nsub.a.com#@#+js(set.js, x, 1)\nb.com##+js(set, x, 2)" ),
+              "set-constant|x|1 @ a.com / sub.a.com; set-constant|x|2 @ b.com" );
+    expectEq( "scriptlet exception everywhere", scriptlets( "U:a.com##+js(set, x, 1)\n#@#+js(set, x, 1)" ), "" );
+    expectEq( "all scriptlets of a site off", scriptlets( "U:a.com,b.com##+js(set, x, 1)\nb.com#@#+js()" ),
+              "set-constant|x|1 @ a.com,b.com / b.com" );
+    expectEq( "exception of a trusted scriptlet from any list",
+              scriptlets( "T:a.com##+js(trusted-set, x, 1)\n--\nU:a.com#@#+js(trusted-set, x, 1)" ),
+              "trusted-set-constant|x|1 @ a.com / a.com" );
+    {
+        ABP::Converter c;
+        c.addList( "a.com,b.*##+js(set, x, a\"b\\c)", false );
+        c.ruleLists();
+        expectEq( "scriptlets text", ABP::scriptletsText( c.scriptlets() ),
+                  "kwpe-scriptlets 1\na.com,b.*\t\t[\"set-constant\",\"x\",\"a\\\"b\\\\c\"]\n" );
     }
 
     // --- list syntax ----------------------------------------------------

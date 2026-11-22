@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Scriptlet test</title>
+<style>td.ok { background: #cfc } td.bad { background: #fcc } td { padding: 2px 8px }</style>
+<!-- YouTube's pattern: the player answer in an inline script -->
+<script>
+var ytInitialPlayerResponse = { videoDetails: { videoId: 'test' }, adPlacements: [ 1 ], playerAds: [ 1 ], adSlots: [ 1 ] };
+window.kwpeAcsTarget = 1;
+</script>
+<script>/* AD_SCRIPT_MARK */ window.adScriptRan = true;</script>
+<script>
+window.adProviderResult = 'read';
+try { window.adProvider.load(); } catch (e) { window.adProviderResult = e instanceof ReferenceError ? 'aborted' : 'error'; }
+</script>
+<script>
+// ACS_MARK
+window.acsResult = 'ran';
+try { window.kwpeAcsTarget; } catch (e) { window.acsResult = 'aborted'; }
+</script>
+</head>
+<body>
+<h1>Scriptlets</h1>
+<p><a href="#" id="link">link</a> <span data-ad="1" id="dataad">data-ad</span> <span class="sponsored keep" id="cls">class</span></p>
+<table id="results"><tr><th>check</th><th>expected</th><th>result</th></tr></table>
+<iframe id="same" src="/scriptlets-frame.html" width="200" height="40"></iframe>
+<iframe id="other" width="200" height="40"></iframe>
+<script>
+const params = new URLSearchParams(location.search);
+// on: this site has scriptlets (127.0.0.1), unless the test says otherwise
+const on = (params.get('expect') || (location.hostname === '127.0.0.1' ? 'on' : 'off')) === 'on';
+const table = document.getElementById('results');
+const checks = [];
+let pending = 0;
+function report(name, expected, result) {
+  const tr = table.insertRow();
+  tr.insertCell().textContent = name;
+  tr.insertCell().textContent = expected;
+  const td = tr.insertCell();
+  td.textContent = result;
+  td.className = result === expected ? 'ok' : 'bad';
+  fetch('/report?' + new URLSearchParams({ host: location.hostname, name, expected, result }));
+  if (--pending === 0) {
+    const bad = document.querySelectorAll('td.bad').length;
+    document.title = bad ? 'Scriptlet test: ' + bad + ' FAILED' : 'Scriptlet test: all passed';
+    fetch('/report?' + new URLSearchParams({ host: location.hostname, name: 'DONE', expected: '0', result: String(bad) }));
+  }
+}
+function check(name, on_, off_, fn) {
+  ++pending;
+  checks.push(async () => {
+    let r;
+    try { r = String(await fn()); } catch (e) { r = 'exception ' + e; }
+    report(name, on ? on_ : off_, r);
+  });
+}
+const has = o => ['adPlacements', 'playerAds', 'adSlots'].filter(k => o && o[k] !== undefined).join(',') || 'none';
+
+check('set-constant ytInitialPlayerResponse', 'adSlots', 'adPlacements,playerAds,adSlots', () => has(ytInitialPlayerResponse));
+check('set-constant keeps the rest', 'test', 'test', () => ytInitialPlayerResponse.videoDetails.videoId);
+check('json-prune-fetch-response (json())', 'none', 'adPlacements,playerAds,adSlots',
+      () => fetch('/youtubei/v1/player?key=x', { method: 'POST', body: '{}' }).then(r => r.json()).then(has));
+check('json-prune-fetch-response keeps the video', 'test', 'test',
+      () => fetch('/youtubei/v1/player').then(r => r.json()).then(o => o.videoDetails.videoId));
+check('fetch response url and status', '200 /youtubei/v1/player', '200 /youtubei/v1/player',
+      () => fetch('/youtubei/v1/player').then(r => r.status + ' ' + new URL(r.url).pathname));
+// (trusted-rpfr renamed adSlots there, json-prune took adPlacements)
+check('json-prune (JSON.parse of a text)', 'playerAds', 'adPlacements,playerAds,adSlots',
+      () => fetch('/replace.json?text').then(r => r.text()).then(t => has(JSON.parse(t))));
+check('json-prune needs its needle', 'adPlacements', 'adPlacements', () => has(JSON.parse('{"adPlacements":[1]}')));
+check('json-prune-xhr-response', 'none', 'adPlacements,playerAds,adSlots', () => new Promise(resolve => {
+  const x = new XMLHttpRequest();
+  x.open('GET', '/youtubei/v1/player?x=1');
+  x.onload = () => resolve(has(JSON.parse(x.responseText)));
+  x.send();
+}));
+check('json-prune-xhr-response (responseType json)', 'none', 'adPlacements,playerAds,adSlots', () => new Promise(resolve => {
+  const x = new XMLHttpRequest();
+  x.open('GET', '/youtubei/v1/player?x=2');
+  x.responseType = 'json';
+  x.onload = () => resolve(has(x.response));
+  x.send();
+}));
+check('trusted-replace-fetch-response', 'no_ads', 'adSlots',
+      () => fetch('/replace.json').then(r => r.text()).then(t => t.includes('"no_ads"') ? 'no_ads' : 'adSlots'));
+check('remove-node-text (inline script)', 'undefined', 'true', () => window.adScriptRan);
+check('abort-on-property-read', 'aborted', 'error', () => window.adProviderResult);
+check('abort-current-script', 'aborted', 'ran', () => window.acsResult);
+check('abort-current-script: other scripts', '1', '1', () => window.kwpeAcsTarget);
+check('no-setTimeout-if', 'undefined', '1', () => new Promise(resolve => {
+  setTimeout(function () { window.adTimer = 1; }, 10);
+  const name = 'ad' + 'Timer';   // (this callback must not match)
+  setTimeout(() => resolve(window[name]), 200);
+}));
+check('adjust-setTimeout', 'fast', 'slow', () => new Promise(resolve => {
+  let done = false;
+  setTimeout(function slowTimer() { done = true; }, 5000);
+  setTimeout(() => resolve(done ? 'fast' : 'slow'), 300);
+}));
+check('prevent-fetch', '200 empty', 'ad answer', () => fetch('/ads-api/1').then(r => r.text().then(t => r.status === 200 && t === '' ? '200 empty' : t)));
+check('prevent-xhr', '4 200 empty', '4 200 ad answer', () => new Promise(resolve => {
+  const x = new XMLHttpRequest();
+  x.open('GET', '/ads-api/2');
+  x.onload = () => resolve(x.readyState + ' ' + x.status + ' ' + (x.responseText || 'empty'));
+  x.send();
+}));
+check('remove-attr', 'null', '1', () => document.getElementById('dataad').getAttribute('data-ad'));
+check('remove-class (stay)', 'keep', 'keep sponsored', () => new Promise(resolve => {
+  const s = document.createElement('span');
+  s.className = 'sponsored keep';
+  document.body.appendChild(s);
+  setTimeout(() => resolve(s.className.split(' ').sort().join(' ')), 200);
+}));
+check('noeval-if', 'undefined', '3', () => eval('/* EVAL_AD */ 1 + 2'));
+check('eval of others', '7', '7', () => eval('3 + 4'));
+check('prevent-window-open', 'object', 'null', () => window.open('http://127.0.0.1:1/popunder') ? 'object' : 'null');
+check('prevent-addEventListener', 'no', 'yes', () => {
+  let called = 'no';
+  document.getElementById('link').addEventListener('click', function (e) { /* AELD_MARK */ called = 'yes'; e.preventDefault(); });
+  document.getElementById('link').click();
+  return called;
+});
+check('trusted-prevent-dom-bypass', 'patched', 'clean', () => {
+  const f = document.createElement('iframe');
+  document.body.appendChild(f);
+  const r = f.contentWindow.fetch === window.fetch ? 'patched' : 'clean';
+  f.remove();
+  return r;
+});
+check('#@#+js exception', 'undefined', 'undefined', () => window.kwpeExcepted);
+check('set-constant of a new global', 'true', 'undefined', () => window.kwpeEvery);
+check('functions stay native', 'native', 'native', () =>
+  [window.fetch, JSON.parse, window.setTimeout].every(f => Function.prototype.toString.call(f).includes('[native code]')) ? 'native' : 'patched');
+check('same-site frame', 'true', 'undefined', () => new Promise(resolve => {
+  const f = document.getElementById('same');
+  const read = () => resolve(String(f.contentWindow.kwpeFrameMark));
+  if (f.contentDocument && f.contentDocument.readyState === 'complete' && f.contentDocument.getElementById('v')) read(); else f.onload = read;
+}));
+// its scriptlets come with the frame, unless blocking is off for the page
+check('frame of another site (127.0.0.2)', 'true', params.get('expect') === 'off' ? 'undefined' : 'true', () => new Promise(resolve => {
+  window.addEventListener('message', e => { if (e.data && String(e.data.frame).startsWith('127.0.0.2')) resolve(e.data.mark); });
+  document.getElementById('other').src = 'http://127.0.0.2:' + location.port + '/scriptlets-frame.html';
+  setTimeout(() => resolve('no answer'), 3000);
+}));
+window.addEventListener('load', () => { for (const c of checks) c(); });
+</script>
+</body>
+</html>

@@ -634,6 +634,9 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
                 return TRUE;
             }
         }
+        // The scriptlets of the site, in the frame (main frame or not)
+        // that is about to load it, before its request.
+        KWPEAdBlock::self()->addFrameHost( d->contentManager, KURL( QString::fromUtf8( uri ) ).host() );
         return FALSE;
     }
 
@@ -654,6 +657,10 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
             const char* method = webkit_uri_request_get_http_method( webkit_response_policy_decision_get_request( response ) );
             if ( switched && ( !method || g_ascii_strcasecmp( method, "GET" ) == 0 ) && !d->redirected )
                 d->reloadForFilters = true;
+        } else {
+            // a subframe, perhaps redirected to a site not seen before
+            KWPEAdBlock::self()->addFrameHost( d->contentManager, KURL( QString::fromUtf8(
+                webkit_uri_response_get_uri( webkit_response_policy_decision_get_response( response ) ) ) ).host() );
         }
         // PDF: WebKit has a viewer (PDF.js), Konqueror's choice unless asked.
         bool pdfToKonqueror = g_strcmp0( webkit_uri_response_get_mime_type( webkit_response_policy_decision_get_response( response ) ),

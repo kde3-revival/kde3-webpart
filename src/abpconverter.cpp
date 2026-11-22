@@ -633,7 +633,8 @@ bool canMatchEmpty( const std::string& filterIn )
 
 Stats::Stats()
     : lines( 0 ), duplicates( 0 ), badfiltered( 0 ), networkBlock( 0 ), networkException( 0 ),
-      cosmeticGeneric( 0 ), cosmeticSpecific( 0 ), cosmeticExceptions( 0 ), regexConverted( 0 )
+      cosmeticGeneric( 0 ), cosmeticSpecific( 0 ), cosmeticExceptions( 0 ), regexConverted( 0 ),
+      scriptlets( 0 ), scriptletExceptions( 0 )
 {
 }
 
@@ -646,7 +647,7 @@ unsigned Stats::droppedTotal() const
 }
 
 Converter::Converter()
-    : verbose( false ), m_includeLoader( 0 ), m_includeData( 0 )
+    : verbose( false ), m_includeLoader( 0 ), m_includeData( 0 ), m_trusted( false )
 {
 }
 
@@ -715,10 +716,12 @@ static bool evalCondition( const std::string& expr )
     return result;
 }
 
-void Converter::addList( const std::string& text )
+void Converter::addList( const std::string& text, bool trusted )
 {
     m_ifStack.clear();
+    m_trusted = trusted;
     addText( text, 0 );
+    m_trusted = false;
     m_ifStack.clear();
 }
 
@@ -772,11 +775,17 @@ void Converter::addLine( const std::string& raw, int depth )
     if ( line[0] == '#' && line.size() > 1 && line[1] != '#' && line[1] != '@' && line[1] != '?' && line[1] != '$' && line[1] != '%' )
         return;
     stats.lines++;
-    if ( !m_seen.insert( line ).second ) {
+    std::map<std::string, size_t>::iterator seen = m_seen.find( line );
+    if ( seen != m_seen.end() ) {
         stats.duplicates++;
+        // a trusted list has it too: it is trusted
+        if ( m_trusted )
+            m_filterTrusted[seen->second] = true;
         return;
     }
+    m_seen[line] = m_filters.size();
     m_filters.push_back( line );
+    m_filterTrusted.push_back( m_trusted );
 }
 
 // The separator of a cosmetic filter ("##", "#@#", "#?#", ...): its
@@ -840,10 +849,6 @@ void Converter::convertCosmetic( const std::string& domainList, const std::strin
     selector = replaceAll( selector, ":-abp-has(", ":has(" );
     if ( selector.empty() ) {
         drop( "cosmetic-empty" );
-        return;
-    }
-    if ( startsWith( selector, "+js(" ) ) {
-        drop( "scriptlet" );
         return;
     }
     if ( selector[0] == '^' ) {
@@ -922,6 +927,252 @@ void Converter::convertCosmetic( const std::string& domainList, const std::strin
     c.include = include;
     c.exclude = exclude;
     m_cosmetic.push_back( c );
+}
+
+// ---------------------------------------------------------------------
+// scriptlets
+
+namespace
+{
+struct ScriptletName
+{
+    const char* name;      // canonical (the part's library has these)
+    const char* aliases;   // space-separated
+    bool trusted;          // only from trusted lists
+};
+
+// What the part's library implements (src/scriptlets.js).  Scriptlets
+// that can put code or arbitrary content into a page are trusted-only,
+// as in uBlock; replace-node-text too (it rewrites inline scripts).
+const ScriptletName scriptletNames[] = {
+    { "set-constant", "set", false },
+    { "abort-on-property-read", "aopr", false },
+    { "abort-on-property-write", "aopw", false },
+    { "abort-current-script", "acs abort-current-inline-script acis", false },
+    { "abort-on-stack-trace", "aost", false },
+    { "no-setTimeout-if", "nostif prevent-setTimeout setTimeout-defuser", false },
+    { "no-setInterval-if", "nosiif prevent-setInterval setInterval-defuser", false },
+    { "adjust-setTimeout", "nano-stb nano-setTimeout-booster", false },
+    { "adjust-setInterval", "nano-sib nano-setInterval-booster", false },
+    { "noeval-if", "prevent-eval-if noeval", false },
+    { "remove-attr", "ra", false },
+    { "remove-class", "rc", false },
+    { "json-prune", "", false },
+    { "json-prune-fetch-response", "", false },
+    { "json-prune-xhr-response", "", false },
+    { "prevent-fetch", "no-fetch-if", false },
+    { "prevent-xhr", "no-xhr-if", false },
+    { "remove-node-text", "rmnt", false },
+    { "prevent-window-open", "nowoif window.open-defuser no-window-open-if", false },
+    { "prevent-addEventListener", "aeld addEventListener-defuser", false },
+    { "trusted-set-constant", "trusted-set", true },
+    { "trusted-replace-fetch-response", "trusted-rpfr", true },
+    { "trusted-replace-xhr-response", "trusted-rpxr", true },
+    { "trusted-prevent-dom-bypass", "", true },
+    { "replace-node-text", "rpnt", true },
+    { "trusted-replace-node-text", "trusted-rpnt", true },
+};
+
+const ScriptletName* findScriptlet( const std::string& name )
+{
+    for ( unsigned i = 0; i < sizeof( scriptletNames ) / sizeof( scriptletNames[0] ); ++i ) {
+        if ( name == scriptletNames[i].name )
+            return &scriptletNames[i];
+        std::vector<std::string> aliases = split( scriptletNames[i].aliases, ' ' );
+        for ( size_t a = 0; a < aliases.size(); ++a )
+            if ( !aliases[a].empty() && name == aliases[a] )
+                return &scriptletNames[i];
+    }
+    return 0;
+}
+
+// The arguments of "+js(...)": separated by commas ("\," is one), each
+// trimmed; an argument in quotes (' " `) is what is inside them (commas
+// need no escape there, "\<quote>" is the quote).
+bool splitScriptletArgs( const std::string& text, std::vector<std::string>& args )
+{
+    size_t i = 0;
+    const size_t n = text.size();
+    for ( ;; ) {
+        while ( i < n && ( text[i] == ' ' || text[i] == '\t' ) )
+            ++i;
+        std::string arg;
+        char q = i < n ? text[i] : 0;
+        bool quoted = false;
+        if ( q == '\'' || q == '"' || q == '`' ) {
+            // a quoted argument: up to the closing quote, then a comma
+            size_t j = i + 1;
+            std::string inner;
+            bool closed = false;
+            for ( ; j < n; ++j ) {
+                if ( text[j] == '\\' && j + 1 < n && text[j + 1] == q ) {
+                    inner += q;
+                    ++j;
+                } else if ( text[j] == q ) {
+                    closed = true;
+                    break;
+                } else {
+                    inner += text[j];
+                }
+            }
+            size_t k = j + 1;
+            while ( closed && k < n && ( text[k] == ' ' || text[k] == '\t' ) )
+                ++k;
+            if ( closed && ( k == n || text[k] == ',' ) ) {
+                arg = inner;
+                quoted = true;
+                i = k;
+            }
+        }
+        if ( !quoted ) {
+            while ( i < n && text[i] != ',' ) {
+                if ( text[i] == '\\' && i + 1 < n && text[i + 1] == ',' ) {
+                    arg += ',';
+                    i += 2;
+                } else {
+                    arg += text[i++];
+                }
+            }
+            arg = trim( arg );
+        }
+        args.push_back( arg );
+        if ( i >= n )
+            break;
+        ++i;   // the comma
+    }
+    return true;
+}
+}
+
+static std::string scriptletKey( const std::string& name, const std::vector<std::string>& args )
+{
+    std::string key = name;
+    for ( size_t i = 0; i < args.size(); ++i ) {
+        key += '\0';
+        key += args[i];
+    }
+    return key;
+}
+
+bool parseScriptlet( const std::string& bodyIn, bool trusted, std::string& name, std::vector<std::string>& args,
+                     std::string& whyNot )
+{
+    std::string body = trim( bodyIn );
+    args.clear();
+    name.clear();
+    if ( !startsWith( body, "+js(" ) || body[body.size() - 1] != ')' ) {
+        whyNot = "scriptlet-syntax";
+        return false;
+    }
+    std::string inner = body.substr( 4, body.size() - 5 );
+    if ( trim( inner ).empty() )
+        return true;   // "+js()": every scriptlet (exceptions only)
+    std::vector<std::string> parts;
+    splitScriptletArgs( inner, parts );
+    std::string raw = parts[0];
+    if ( endsWith( raw, ".js" ) )
+        raw = raw.substr( 0, raw.size() - 3 );
+    const ScriptletName* sn = findScriptlet( raw );
+    if ( !sn ) {
+        whyNot = "scriptlet-unsupported";
+        return false;
+    }
+    if ( sn->trusted && !trusted ) {
+        whyNot = "scriptlet-untrusted";
+        return false;
+    }
+    name = sn->name;
+    // "noeval" is noeval-if without a needle
+    if ( raw == "noeval" )
+        parts.resize( 1 );
+    args.assign( parts.begin() + 1, parts.end() );
+    // trailing empty arguments mean nothing ("set, x, 1, " = "set, x, 1")
+    while ( !args.empty() && args.back().empty() )
+        args.pop_back();
+    if ( args.size() > 32 ) {
+        whyNot = "scriptlet-syntax";
+        return false;
+    }
+    return true;
+}
+
+void Converter::convertScriptlet( const std::string& domainList, const std::string& body, bool exception, bool trusted )
+{
+    std::string name, why;
+    std::vector<std::string> args;
+    // exceptions name scriptlets of any list
+    if ( !parseScriptlet( body, trusted || exception, name, args, why ) ) {
+        drop( why.c_str() );
+        return;
+    }
+    if ( !exception && name.empty() ) {
+        drop( "scriptlet-syntax" );
+        return;
+    }
+    std::vector<std::string> include, exclude;
+    bool unsupportedInclude = false, unsupportedExclude = false;
+    std::vector<std::string> entries = split( domainList, ',' );
+    for ( size_t i = 0; i < entries.size(); ++i ) {
+        std::string d = trim( entries[i] );
+        if ( d.empty() )
+            continue;
+        bool neg = d[0] == '~';
+        if ( neg )
+            d.erase( 0, 1 );
+        if ( d == "*" && !neg )
+            continue;
+        if ( !normalizeDomain( d ) ) {
+            ( neg ? unsupportedExclude : unsupportedInclude ) = true;
+            continue;
+        }
+        ( neg ? exclude : include ).push_back( d );
+    }
+    if ( exception ) {
+        // one we cannot read completely: everywhere (injecting less is safe)
+        std::set<std::string>& sites = m_scriptletExceptions[name.empty() ? std::string() : scriptletKey( name, args )];
+        if ( include.empty() || unsupportedInclude )
+            sites.insert( std::string() );
+        else
+            sites.insert( include.begin(), include.end() );
+        return;
+    }
+    if ( unsupportedExclude || ( unsupportedInclude && include.empty() ) ) {
+        drop( "scriptlet-domain" );
+        return;
+    }
+    if ( include.empty() ) {
+        // uBlock runs generic scriptlets on every page; that is not
+        // worth the cost (and a risk) for a handful of filters
+        drop( "scriptlet-generic" );
+        return;
+    }
+    Scriptlet sc;
+    sc.name = name;
+    sc.args = args;
+    sc.include = include;
+    sc.exclude = exclude;
+    m_scriptlets.push_back( sc );
+}
+
+std::string scriptletsText( const std::vector<Converter::Scriptlet>& scriptlets )
+{
+    std::string out = "kwpe-scriptlets 1\n";
+    for ( size_t i = 0; i < scriptlets.size(); ++i ) {
+        const Converter::Scriptlet& sc = scriptlets[i];
+        for ( size_t k = 0; k < sc.include.size(); ++k )
+            out += ( k ? "," : "" ) + sc.include[k];
+        out += '\t';
+        for ( size_t k = 0; k < sc.exclude.size(); ++k )
+            out += ( k ? "," : "" ) + sc.exclude[k];
+        out += "\t[";
+        appendJSONString( out, sc.name );
+        for ( size_t k = 0; k < sc.args.size(); ++k ) {
+            out += ',';
+            appendJSONString( out, sc.args[k] );
+        }
+        out += "]\n";
+    }
+    return out;
 }
 
 namespace
@@ -1318,7 +1569,9 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
         if ( sep != std::string::npos ) {
             std::string domains = f.substr( 0, sep );
             std::string body = f.substr( sep + kind.size() );
-            if ( kind == "##" )
+            if ( ( kind == "##" || kind == "#@#" ) && startsWith( trim( body ), "+js(" ) )
+                convertScriptlet( domains, trim( body ), kind == "#@#", m_filterTrusted[i] );
+            else if ( kind == "##" )
                 convertCosmetic( domains, body, false );
             else if ( kind == "#@#" )
                 convertCosmetic( domains, body, true );
@@ -1332,6 +1585,36 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
         }
         convertNetwork( f );
     }
+
+    // scriptlets, with the exceptions applied
+    if ( !m_scriptletExceptions.empty() ) {
+        std::vector<Scriptlet> kept;
+        const std::set<std::string>* all = 0;
+        if ( m_scriptletExceptions.count( std::string() ) )
+            all = &m_scriptletExceptions[std::string()];
+        for ( size_t i = 0; i < m_scriptlets.size(); ++i ) {
+            Scriptlet& sc = m_scriptlets[i];
+            std::string key = scriptletKey( sc.name, sc.args );
+            std::map<std::string, std::set<std::string> >::const_iterator ex = m_scriptletExceptions.find( key );
+            const std::set<std::string>* lists[] = { all, ex != m_scriptletExceptions.end() ? &ex->second : 0 };
+            bool everywhere = false;
+            for ( unsigned l = 0; l < 2; ++l ) {
+                if ( !lists[l] )
+                    continue;
+                stats.scriptletExceptions++;
+                for ( std::set<std::string>::const_iterator it = lists[l]->begin(); it != lists[l]->end(); ++it ) {
+                    if ( it->empty() )
+                        everywhere = true;
+                    else
+                        sc.exclude.push_back( *it );
+                }
+            }
+            if ( !everywhere )
+                kept.push_back( sc );
+        }
+        m_scriptlets.swap( kept );
+    }
+    stats.scriptlets = m_scriptlets.size();
 
     // cosmetic filters, with the exceptions applied
     std::vector<Rule> generic, specific;

@@ -1,3 +1,9 @@
+# The scriptlet library, as a C string literal for kwpeadblock.cpp
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scriptlets.js)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/scriptlets.js KWPE_SCRIPTLETS_JS)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/scriptlets.js.h.new "R\"KWPEJS(${KWPE_SCRIPTLETS_JS})KWPEJS\"\n")
+configure_file(${CMAKE_CURRENT_BINARY_DIR}/scriptlets.js.h.new ${CMAKE_CURRENT_BINARY_DIR}/scriptlets.js.h COPYONLY)
+
 # The part: a KDE module loaded by Konqueror (KParts::GenericFactory)
 kde3_add_module(libkwpepart
   SOURCES
@@ -23,6 +29,7 @@ kde3_add_module(libkwpepart
     PkgConfig::WPEWEBKIT
     PkgConfig::KWPEX11
 )
+target_include_directories(libkwpepart PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 install(FILES kwpepart.desktop DESTINATION ${KDE3_SERVICES_INSTALL_DIR})
 install(FILES kwpepart.rc DESTINATION ${KDE3_DATA_INSTALL_DIR}/kwpepart)

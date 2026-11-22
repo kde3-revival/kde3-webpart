@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Test server: tests/pages plus a few dynamic answers.
 #
-#   server.py [PORT]   (default 8383, 127.0.0.1 only)
+#   server.py [PORT] [ADDRESS]   (default 8383, 127.0.0.1; another
+#                                 loopback address is another site)
 #
 #   /attachment/NAME     Content-Disposition: attachment (a download)
 #   /blob?size=N         N bytes of application/octet-stream, slowly
@@ -15,6 +16,10 @@
 #   /frames/*            a small third-party frame
 #   /typed?type=T&name=N a small body of content type T (application/pdf: a
 #                        real one-page PDF), Content-Disposition inline; N
+#   /youtubei/v1/player  JSON shaped like YouTube's player answer, with ads
+#                        (adPlacements, playerAds, adSlots), GET or POST
+#   /replace.json        JSON with "adSlots" (text replacement test)
+#   /ads-api/*           must never be requested (pages/scriptlets.html)
 #   /report?host=&name=&expected=&result=
 #                        pages/adblock.html reports a result: printed on stdout
 
@@ -36,6 +41,14 @@ PDF = (b'%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
        b'4 0 obj<</Length 44>>stream\nBT /F1 24 Tf 40 100 Td (kwpepart PDF) Tj ET\nendstream endobj\n'
        b'5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n'
        b'trailer<</Root 1 0 R>>\n%%EOF\n')
+
+
+# YouTube's pattern: the ads come in the same answer as the video.
+PLAYER = (b'{"responseContext":{},"playabilityStatus":{"status":"OK"},'
+          b'"videoDetails":{"videoId":"test","title":"kwpepart"},'
+          b'"adPlacements":[{"adPlacementRenderer":{"kind":"preroll"}}],'
+          b'"playerAds":[{"playerLegacyDesktopWatchAdsRenderer":{}}],'
+          b'"adSlots":[{"adSlotRenderer":{}}]}')
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -96,6 +109,11 @@ class Handler(SimpleHTTPRequestHandler):
             body = PDF if ctype == 'application/pdf' else ('typed %s\n' % ctype).encode() * 20
             extra = [('Content-Disposition', 'inline; filename="%s"' % name)] if name else []
             return self.send_body(body, ctype, extra)
+        if url.path in ('/youtubei/v1/player', '/replace.json'):
+            return self.send_body(PLAYER, 'application/json')
+        if url.path.startswith('/ads-api/'):
+            print('SERVED %s' % url.path, flush=True)
+            return self.send_body(b'ad answer', 'text/plain')
         if url.path == '/report':
             print('REPORT %s: %s | expected %s | got %s' % (query.get('host', [''])[0], query.get('name', [''])[0],
                                                            query.get('expected', [''])[0], query.get('result', [''])[0]),
@@ -125,6 +143,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', '0'))
         data = self.rfile.read(length)
+        if self.path.startswith('/youtubei/v1/player'):
+            return self.send_body(PLAYER, 'application/json')
         if self.path == '/post':
             return self.send_body(b'posted: ' + data + b'\n', 'application/octet-stream',
                                   [('Content-Disposition', 'attachment; filename="posted.bin"')])
@@ -135,4 +155,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8383
-    ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
+    address = sys.argv[2] if len(sys.argv) > 2 else '127.0.0.1'
+    if not address.startswith('127.'):
+        sys.exit('server.py: loopback addresses only')
+    ThreadingHTTPServer((address, port), Handler).serve_forever()

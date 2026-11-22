@@ -15,12 +15,16 @@
  * EasyList and compiling the result into WebKit's byte code takes
  * seconds and a few hundred MiB, which should not happen in Konqueror.
  *
- *   kwpe-filterconv [--store DIR --id PREFIX] [--json DIR] [--max-rules N] [--verbose] LIST...
+ *   kwpe-filterconv [--store DIR --id PREFIX] [--json DIR] [--scriptlets FILE] [--max-rules N]
+ *                   [--verbose] [--trusted] LIST...
  *
  * --store: compile into the WebKitUserContentFilterStore at DIR, as
  *          PREFIX-0, PREFIX-1, ... (one per rule list);
  * --json:  also write the rule lists as DIR/PREFIX-N.json (for testing);
- * --verbose: every dropped filter on stderr.
+ * --scriptlets: write the scriptlets (uBlock's "##+js(...)") there, for
+ *          the part to inject (see ABP::scriptletsText());
+ * --verbose: every dropped filter on stderr;
+ * --trusted: the next LIST is one of ours ("trusted-" scriptlets run).
  * Included files ("!#include name") are read from the directory of the
  * list that includes them (a plain file name only).
  *
@@ -153,7 +157,10 @@ int main( int argc, char** argv )
     std::string storeDir, prefix = "kwpe", jsonDir;
     unsigned maxRules = 50000;
     bool verbose = false;
+    std::string scriptletsFile;
     std::vector<std::string> lists;
+    std::vector<bool> trusted;
+    bool nextTrusted = false;
     for ( int i = 1; i < argc; ++i ) {
         std::string a = argv[i];
         if ( a == "--store" && i + 1 < argc )
@@ -162,18 +169,25 @@ int main( int argc, char** argv )
             prefix = argv[++i];
         else if ( a == "--json" && i + 1 < argc )
             jsonDir = argv[++i];
+        else if ( a == "--scriptlets" && i + 1 < argc )
+            scriptletsFile = argv[++i];
         else if ( a == "--verbose" )
             verbose = true;
+        else if ( a == "--trusted" )
+            nextTrusted = true;
         else if ( a == "--max-rules" && i + 1 < argc )
             maxRules = unsigned( atoi( argv[++i] ) );
         else if ( !a.empty() && a[0] == '-' ) {
-            fprintf( stderr, "usage: %s [--store DIR --id PREFIX] [--json DIR] [--max-rules N] LIST...\n", argv[0] );
+            fprintf( stderr, "usage: %s [--store DIR --id PREFIX] [--json DIR] [--scriptlets FILE] [--max-rules N] [--trusted] LIST...\n", argv[0] );
             return 2;
-        } else
+        } else {
             lists.push_back( a );
+            trusted.push_back( nextTrusted );
+            nextTrusted = false;
+        }
     }
     if ( lists.empty() || maxRules < 1000 || maxRules > 150000 ) {
-        fprintf( stderr, "usage: %s [--store DIR --id PREFIX] [--json DIR] [--max-rules N] LIST...\n", argv[0] );
+        fprintf( stderr, "usage: %s [--store DIR --id PREFIX] [--json DIR] [--scriptlets FILE] [--max-rules N] [--trusted] LIST...\n", argv[0] );
         return 2;
     }
     setvbuf( stdout, 0, _IOLBF, 0 );
@@ -190,15 +204,17 @@ int main( int argc, char** argv )
         size_t slash = lists[i].rfind( '/' );
         std::string dir = slash == std::string::npos ? std::string( "." ) : lists[i].substr( 0, slash );
         conv.setIncludeLoader( loadInclude, &dir );
-        conv.addList( text );
+        conv.addList( text, trusted[i] );
     }
     std::vector<std::vector<ABP::Converter::Rule> > ruleLists = conv.ruleLists( maxRules );
     const ABP::Stats& s = conv.stats;
     printf( "stats lines %u\nstats duplicates %u\nstats badfiltered %u\nstats network-block %u\n"
             "stats network-exception %u\nstats cosmetic-generic %u\nstats cosmetic-specific %u\n"
-            "stats cosmetic-exceptions %u\nstats regex-converted %u\nstats dropped %u\n",
+            "stats cosmetic-exceptions %u\nstats regex-converted %u\nstats scriptlets %u\n"
+            "stats scriptlet-exceptions %u\nstats dropped %u\n",
             s.lines, s.duplicates, s.badfiltered, s.networkBlock, s.networkException, s.cosmeticGeneric,
-            s.cosmeticSpecific, s.cosmeticExceptions, s.regexConverted, s.droppedTotal() );
+            s.cosmeticSpecific, s.cosmeticExceptions, s.regexConverted, s.scriptlets, s.scriptletExceptions,
+            s.droppedTotal() );
     for ( std::map<std::string, unsigned>::const_iterator it = s.dropped.begin(); it != s.dropped.end(); ++it )
         printf( "dropped %s %u\n", it->first.c_str(), it->second );
     printf( "time convert %.0f\n", msSince( start ) );
@@ -217,6 +233,21 @@ int main( int argc, char** argv )
                 return 1;
             }
             fclose( f );
+        }
+    }
+
+    if ( !scriptletsFile.empty() ) {
+        // complete or not there: a new name, then renamed
+        std::string text = ABP::scriptletsText( conv.scriptlets() );
+        std::string tmp = scriptletsFile + ".part";
+        FILE* f = fopen( tmp.c_str(), "wb" );
+        bool ok = f && fwrite( text.data(), 1, text.size(), f ) == text.size();
+        if ( f && fclose( f ) != 0 )
+            ok = false;
+        if ( !ok || rename( tmp.c_str(), scriptletsFile.c_str() ) != 0 ) {
+            remove( tmp.c_str() );
+            printf( "error cannot write %s\n", scriptletsFile.c_str() );
+            return 1;
         }
     }
 

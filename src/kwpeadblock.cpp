@@ -11,6 +11,7 @@
 
 // WebKit (GLib) before any Qt header: Qt 3's "signals"/"slots" macros.
 #include <wpe/webkit.h>
+#include <libsoup/soup.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 
 #include <kconfig.h>
 #include <kglobal.h>
+#include <kidna.h>
 #include <kio/job.h>
 #include <klocale.h>
 #include <klockfile.h>
@@ -51,7 +53,9 @@ struct BuiltinList
 const BuiltinList builtinLists[] = {
     { "easylist", I18N_NOOP( "EasyList" ), "https://easylist.to/easylist/easylist.txt", true },
     { "easyprivacy", I18N_NOOP( "EasyPrivacy" ), "https://easylist.to/easylist/easyprivacy.txt", true },
-    { "ublock", I18N_NOOP( "uBlock filters" ), "https://ublockorigin.github.io/uAssets/filters/filters.txt", false },
+    { "ublock", I18N_NOOP( "uBlock filters" ), "https://ublockorigin.github.io/uAssets/filters/filters.txt", true },
+    { "ublock-quickfixes", I18N_NOOP( "uBlock filters \xe2\x80\x93 Quick fixes" ),
+      "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt", true },
     { "ublock-annoyances", I18N_NOOP( "uBlock filters \xe2\x80\x93 Annoyances" ),
       "https://ublockorigin.github.io/uAssets/filters/annoyances.txt", false },
     { "rolist", I18N_NOOP( "ROList (Romanian)" ), "https://www.zoso.ro/pages/rolist.txt", false },
@@ -60,7 +64,9 @@ const unsigned builtinCount = sizeof( builtinLists ) / sizeof( builtinLists[0] )
 
 const unsigned maxListSize = 16 * 1024 * 1024;   // EasyList: 2 MiB
 const unsigned maxIncludes = 32;                 // uBlock filters: 10
-const int updateIntervalDays = 7;
+// uBlock's lists change several times a week (YouTube); unchanged lists
+// are not compiled again
+const int defaultUpdateHours = 24;
 const int retryMinutes = 60;                     // after a failed update
 const char filterPrefix[] = "kwpe";
 
@@ -75,10 +81,12 @@ struct Download
 
 struct State
 {
-    State() : enabled( true ), rules( 0 ), store( 0 ), setSerial( 0 ), loadSerial( 0 ), loadStart( 0 ), loadPending( 0 ),
+    State() : enabled( true ), scriptletsEnabled( true ), updateHours( defaultUpdateHours ), rules( 0 ), store( 0 ), setSerial( 0 ), loadSerial( 0 ), loadStart( 0 ), loadPending( 0 ),
               loadFailed( false ), loadFromUpdate( false ), updating( false ), job( 0 ), total( 0 ), includes( 0 ), process( 0 ) {}
 
     bool enabled;
+    bool scriptletsEnabled;
+    int updateHours;
     QValueList<KWPEAdBlock::List> lists;
     QStringList sites;
     QStringList filterIds;      // in kwpepartrc: the set to use
@@ -94,6 +102,16 @@ struct State
     unsigned setSerial;                              // changes with the set
     QMap<WebKitUserContentManager*, QString> viewHost;
     QMap<WebKitUserContentManager*, unsigned> viewSet;   // set attached (0: none)
+
+    // scriptlets of the set in use: calls ([name, args...] in JSON),
+    // their sites and exceptions; site ("example.com", "example.*") ->
+    // calls, in list order
+    QString scriptletsPrefix;                        // the set they belong to
+    QStringList scriptletCalls;
+    QValueList<QStringList> scriptletExcludes;
+    QMap<QString, QValueList<unsigned> > scriptletSites;
+    QMap<QString, WebKitUserScript*> hostScripts;   // made so far (0: none for that host)
+    QMap<WebKitUserContentManager*, QStringList> viewFrameHosts;   // hosts with scripts in the view
 
     // loading a set from the store
     unsigned loadSerial;
@@ -154,6 +172,62 @@ bool hostMatches( const QString& host, const QString& site )
 {
     return host == site || host.endsWith( "." + site );
 }
+
+// The sites a host belongs to, as scriptlet filters name them:
+// "a.b.example.co.uk": itself, its parent domains, and the entities
+// "a.b.example.*", "b.example.*", "example.*" (the public suffix from
+// libsoup's list).
+QStringList hostSites( const QString& host )
+{
+    QStringList sites;
+    if ( host.isEmpty() )
+        return sites;
+    QString h = host;
+    for ( ;; ) {
+        sites.append( h );
+        int dot = h.find( '.' );
+        if ( dot < 0 )
+            break;
+        h = h.mid( dot + 1 );
+    }
+    const char* base = soup_tld_get_base_domain( host.utf8().data(), 0 );
+    if ( base ) {
+        QString registrable = QString::fromUtf8( base );
+        int dot = registrable.find( '.' );
+        if ( dot > 0 ) {
+            // host minus the public suffix
+            QString name = host.left( host.length() - ( registrable.length() - dot ) );
+            for ( ;; ) {
+                sites.append( name + ".*" );
+                int d = name.find( '.' );
+                if ( d < 0 )
+                    break;
+                name = name.mid( d + 1 );
+            }
+        }
+    }
+    return sites;
+}
+
+// A host as the scriptlets know it: punycode (as in the lists and in
+// location.hostname); nothing that could leave a JavaScript string.
+QString scriptHost( const QString& host )
+{
+    QString h = KIDNA::toAscii( normalizedHost( host ) );
+    if ( h.isEmpty() || h.length() > 253 )
+        return QString::null;
+    for ( unsigned i = 0; i < h.length(); ++i ) {
+        QChar c = h[i];
+        if ( !( ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) || c == '.' || c == '-' || c == '_' ) )
+            return QString::null;
+    }
+    return h;
+}
+
+// The library (src/scriptlets.js)
+const char scriptletLibrary[] =
+#include "scriptlets.js.h"
+    ;
 
 QString customId( const QString& url )
 {
@@ -224,6 +298,12 @@ struct KWPEAdBlockGlue
                 webkit_user_content_filter_store_remove( s.store, *id, 0, removed, 0 );
         }
         g_strfreev( ids );
+        // scriptlets of other sets (also of a compilation that failed)
+        QDir base( baseDir() );
+        QStringList old = base.entryList( "*.scriptlets*", QDir::Files );
+        for ( QStringList::ConstIterator it = old.begin(); it != old.end(); ++it )
+            if ( *it != s.scriptletsPrefix + ".scriptlets" )
+                base.remove( *it );
         // downloaded lists nobody uses any more
         QDir lists( baseDir() + "lists" );
         QStringList dirs = lists.entryList( QDir::Dirs | QDir::NoSymLinks );
@@ -284,11 +364,24 @@ void KWPEAdBlock::readConfig()
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
     s.enabled = c->readBoolEntry( "Enabled", true );
+    s.scriptletsEnabled = c->readBoolEntry( "Scriptlets", true );
+    s.updateHours = QMAX( 1, c->readNumEntry( "UpdateIntervalHours", defaultUpdateHours ) );
     QStringList enabled = c->readListEntry( "EnabledLists" );
     if ( !c->hasKey( "EnabledLists" ) )
         for ( unsigned i = 0; i < builtinCount; ++i )
             if ( builtinLists[i].enabled )
                 enabled << builtinLists[i].id;
+    // Once, for a choice made before there were scriptlets: uBlock's
+    // lists, which carry them (YouTube's ads), are added.
+    if ( c->hasKey( "EnabledLists" ) && !c->readBoolEntry( "ScriptletListsAdded", false ) ) {
+        if ( !enabled.contains( "ublock" ) )
+            enabled << "ublock";
+        if ( !enabled.contains( "ublock-quickfixes" ) )
+            enabled << "ublock-quickfixes";
+        c->writeEntry( "EnabledLists", enabled );
+        c->writeEntry( "ScriptletListsAdded", true );
+        c->sync();
+    }
     s.lists.clear();
     for ( unsigned i = 0; i < builtinCount; ++i ) {
         List l;
@@ -347,14 +440,151 @@ void KWPEAdBlock::removeView( WebKitUserContentManager* manager )
 {
     s.viewHost.remove( manager );
     s.viewSet.remove( manager );
+    s.viewFrameHosts.remove( manager );
 }
 
 bool KWPEAdBlock::setViewHost( WebKitUserContentManager* manager, const QString& host )
 {
     if ( !s.viewHost.contains( manager ) )
         return false;
-    s.viewHost[manager] = normalizedHost( host );
-    return apply( manager );
+    QString h = normalizedHost( host );
+    bool hostChanged = s.viewHost[manager] != h;
+    s.viewHost[manager] = h;
+    bool switched = apply( manager );
+    // Another site in the view: its scriptlets only (subframes add theirs).
+    if ( hostChanged || switched ) {
+        QString ascii = scriptHost( h );
+        s.viewFrameHosts[manager] = ascii.isEmpty() ? QStringList() : QStringList( ascii );
+        applyScripts( manager );
+    }
+    return switched;
+}
+
+void KWPEAdBlock::addFrameHost( WebKitUserContentManager* manager, const QString& host )
+{
+    if ( !s.viewHost.contains( manager ) )
+        return;
+    QString h = scriptHost( host );
+    QStringList& hosts = s.viewFrameHosts[manager];
+    if ( h.isEmpty() || hosts.contains( h ) )
+        return;
+    hosts.append( h );
+    // Only a script more (the others stay as they are): the request of
+    // the frame comes after it, WebKit gets both in this order.
+    if ( s.enabled && s.scriptletsEnabled && isBlocking( s.viewHost[manager] ) ) {
+        QMap<QString, WebKitUserScript*>::ConstIterator it = s.hostScripts.find( h );
+        if ( it == s.hostScripts.end() ) {
+            scriptletsSource( h );
+            it = s.hostScripts.find( h );
+        }
+        if ( it.data() )
+            webkit_user_content_manager_add_script( manager, it.data() );
+    }
+}
+
+// The user scripts of the view: one for each host shown in it that has
+// scriptlets, if blocking is on for the site of the view.
+void KWPEAdBlock::applyScripts( WebKitUserContentManager* manager )
+{
+    webkit_user_content_manager_remove_all_scripts( manager );
+    if ( !s.enabled || !s.scriptletsEnabled || !isBlocking( s.viewHost[manager] ) )
+        return;
+    const QStringList& hosts = s.viewFrameHosts[manager];
+    for ( QStringList::ConstIterator h = hosts.begin(); h != hosts.end(); ++h ) {
+        QMap<QString, WebKitUserScript*>::ConstIterator it = s.hostScripts.find( *h );
+        if ( it == s.hostScripts.end() ) {
+            scriptletsSource( *h );
+            it = s.hostScripts.find( *h );
+        }
+        if ( it.data() )
+            webkit_user_content_manager_add_script( manager, it.data() );
+    }
+}
+
+// The scriptlets for @p host (also made into its user script, kept in
+// hostScripts); empty if it has none.
+QString KWPEAdBlock::scriptletsSource( const QString& host )
+{
+    // many sites visited in a long session: made again when needed (the
+    // views hold references to theirs)
+    if ( s.hostScripts.count() > 256 ) {
+        for ( QMap<QString, WebKitUserScript*>::Iterator it = s.hostScripts.begin(); it != s.hostScripts.end(); ++it )
+            if ( it.data() )
+                webkit_user_script_unref( it.data() );
+        s.hostScripts.clear();
+    }
+    QStringList sites = hostSites( host );
+    QValueList<unsigned> calls;
+    for ( QStringList::ConstIterator site = sites.begin(); site != sites.end(); ++site ) {
+        QMap<QString, QValueList<unsigned> >::ConstIterator it = s.scriptletSites.find( *site );
+        if ( it != s.scriptletSites.end() )
+            calls += it.data();
+    }
+    qHeapSort( calls );
+    QString source;
+    unsigned previous = unsigned( -1 ), count = 0;
+    for ( QValueList<unsigned>::ConstIterator c = calls.begin(); c != calls.end(); ++c ) {
+        if ( *c == previous )
+            continue;
+        previous = *c;
+        // an excluded site (a subdomain, an exception)
+        bool excluded = false;
+        const QStringList& ex = s.scriptletExcludes[*c];
+        for ( QStringList::ConstIterator e = ex.begin(); e != ex.end() && !excluded; ++e )
+            excluded = sites.contains( *e );
+        if ( excluded )
+            continue;
+        source += ( count++ ? ",\n" : "" ) + s.scriptletCalls[*c];
+    }
+    WebKitUserScript* script = 0;
+    if ( count ) {
+        // Every frame of the view gets the scripts of every host shown in
+        // it: WebKit matches the allow list of a user script against the
+        // URL of the main frame, not the frame's.  Each one runs only in
+        // the frames of its host.
+        source = "if (location.hostname === \"" + host + "\") (function () {\n" + QString::fromUtf8( scriptletLibrary )
+                 + "\nrun([\n" + source + "\n]);\n})();\n";
+        script = webkit_user_script_new( source.utf8().data(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                                         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, 0, 0 );
+        if ( getenv( "KWPE_STATS" ) )
+            fprintf( stderr, "kwpe: %u scriptlets for %s\n", count, host.latin1() );
+    }
+    s.hostScripts[host] = script;
+    return count ? source : QString::null;
+}
+
+// The scriptlets kwpe-filterconv wrote with the filters of a set.
+void KWPEAdBlock::loadScriptlets( const QStringList& ids )
+{
+    QString prefix = ids.isEmpty() ? QString::null : ids.first().left( ids.first().findRev( '-' ) );
+    if ( prefix == s.scriptletsPrefix && !prefix.isEmpty() )
+        return;
+    s.scriptletsPrefix = prefix;
+    s.scriptletCalls.clear();
+    s.scriptletExcludes.clear();
+    s.scriptletSites.clear();
+    for ( QMap<QString, WebKitUserScript*>::Iterator it = s.hostScripts.begin(); it != s.hostScripts.end(); ++it )
+        if ( it.data() )
+            webkit_user_script_unref( it.data() );
+    s.hostScripts.clear();
+    QFile f( baseDir() + prefix + ".scriptlets" );
+    if ( prefix.isEmpty() || !f.open( IO_ReadOnly ) )
+        return;
+    QByteArray data = f.readAll();
+    QStringList lines = QStringList::split( '\n', QString::fromUtf8( data.data(), data.size() ) );
+    if ( lines.isEmpty() || lines.first() != "kwpe-scriptlets 1" )
+        return;
+    for ( QStringList::ConstIterator it = ++lines.begin(); it != lines.end(); ++it ) {
+        QStringList fields = QStringList::split( '\t', *it, true );
+        if ( fields.count() != 3 || !fields[2].startsWith( "[" ) || !fields[2].endsWith( "]" ) )
+            continue;
+        unsigned index = s.scriptletCalls.count();
+        s.scriptletCalls.append( fields[2] );
+        s.scriptletExcludes.append( QStringList::split( ',', fields[1] ) );
+        QStringList sites = QStringList::split( ',', fields[0] );
+        for ( QStringList::ConstIterator site = sites.begin(); site != sites.end(); ++site )
+            s.scriptletSites[*site].append( index );
+    }
 }
 
 bool KWPEAdBlock::apply( WebKitUserContentManager* manager )
@@ -372,8 +602,10 @@ bool KWPEAdBlock::apply( WebKitUserContentManager* manager )
 
 void KWPEAdBlock::applyToViews()
 {
-    for ( QMap<WebKitUserContentManager*, QString>::ConstIterator it = s.viewHost.begin(); it != s.viewHost.end(); ++it )
+    for ( QMap<WebKitUserContentManager*, QString>::ConstIterator it = s.viewHost.begin(); it != s.viewHost.end(); ++it ) {
         apply( it.key() );
+        applyScripts( it.key() );
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -390,6 +622,32 @@ void KWPEAdBlock::setEnabled( bool enabled )
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
     c->writeEntry( "Enabled", enabled );
+}
+
+bool KWPEAdBlock::scriptletsEnabled() const
+{
+    return s.scriptletsEnabled;
+}
+
+void KWPEAdBlock::setScriptletsEnabled( bool enabled )
+{
+    s.scriptletsEnabled = enabled;
+    KConfig* c = KWPESettings::config();
+    c->setGroup( "AdBlock" );
+    c->writeEntry( "Scriptlets", enabled );
+}
+
+int KWPEAdBlock::updateInterval() const
+{
+    return s.updateHours;
+}
+
+void KWPEAdBlock::setUpdateInterval( int hours )
+{
+    s.updateHours = QMAX( 1, hours );
+    KConfig* c = KWPESettings::config();
+    c->setGroup( "AdBlock" );
+    c->writeEntry( "UpdateIntervalHours", s.updateHours );
 }
 
 bool KWPEAdBlock::isSiteDisabled( const QString& host ) const
@@ -562,6 +820,7 @@ void KWPEAdBlock::filtersLoaded( unsigned )
     s.filters = s.loading;
     s.filtersIds = ids;
     s.loading.clear();
+    loadScriptlets( ids );
     ++s.setSerial;
     for ( QMap<WebKitUserContentManager*, unsigned>::Iterator it = s.viewSet.begin(); it != s.viewSet.end(); ++it )
         it.data() = unsigned( -1 );   // whatever it has: not the new set
@@ -595,7 +854,7 @@ void KWPEAdBlock::checkSchedule()
     if ( !s.enabled || s.updating )
         return;
     QDateTime now = QDateTime::currentDateTime();
-    bool due = s.filterIds.isEmpty() || !s.lastUpdate.isValid() || s.lastUpdate.addDays( updateIntervalDays ) < now;
+    bool due = s.filterIds.isEmpty() || !s.lastUpdate.isValid() || s.lastUpdate.addSecs( s.updateHours * 3600 ) < now;
     // not again and again after a failure (every process, every hour)
     if ( due && s.lastAttempt.isValid() && s.lastAttempt.addSecs( retryMinutes * 60 ) > now && s.lastAttempt <= now )
         due = false;
@@ -816,7 +1075,7 @@ void KWPEAdBlock::convert()
                 md5.update( f );
         }
     }
-    md5.update( QCString( "kwpe-filterconv 1" ) );
+    md5.update( QCString( "kwpe-filterconv 2" ) );
     s.newHash = QString::fromLatin1( md5.hexDigest() );
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );
@@ -825,7 +1084,11 @@ void KWPEAdBlock::convert()
         return;
     }
 
-    QString exe = KStandardDirs::findExe( "kwpe-filterconv" );
+    // in the order of KDEDIRS (the converter of the same installation as
+    // the part; findExe() looks into the compiled-in prefix first)
+    QString exe = KGlobal::dirs()->findResource( "exe", "kwpe-filterconv" );
+    if ( exe.isEmpty() )
+        exe = KStandardDirs::findExe( "kwpe-filterconv" );
     if ( exe.isEmpty() ) {
         finishUpdate( false, i18n( "kwpe-filterconv is not installed." ) );
         return;
@@ -834,9 +1097,15 @@ void KWPEAdBlock::convert()
     s.output = QCString();
     s.newIds.clear();
     s.process = new KProcess( this );
-    *s.process << exe << "--store" << storeDir() << "--id" << s.newPrefix;
-    for ( QStringList::ConstIterator it = s.files.begin(); it != s.files.end(); ++it )
+    *s.process << exe << "--store" << storeDir() << "--id" << s.newPrefix
+                << "--scriptlets" << baseDir() + s.newPrefix + ".scriptlets";
+    for ( QStringList::ConstIterator it = s.files.begin(); it != s.files.end(); ++it ) {
+        // uBlock's own lists (fixed https URLs): their "trusted-"
+        // scriptlets run; never those of a list of the user's
+        if ( *it == listDir( "ublock" ) + "list.txt" || *it == listDir( "ublock-quickfixes" ) + "list.txt" )
+            *s.process << "--trusted";
         *s.process << *it;
+    }
     s.process->setPriority( 10 );
     connect( s.process, SIGNAL( receivedStdout( KProcess*, char*, int ) ), SLOT( slotConverterOutput( KProcess*, char*, int ) ) );
     connect( s.process, SIGNAL( processExited( KProcess* ) ), SLOT( slotConverterExited( KProcess* ) ) );

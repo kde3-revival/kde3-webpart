@@ -226,9 +226,11 @@ Adblock Plus filter lists become WebKit **content filters**
 compiles them once into byte code (a DFA) and matches every load itself,
 in the web process; the part is not called per request.
 
-* **Lists**: EasyList and EasyPrivacy by default; uBlock filters,
-  uBlock filters – Annoyances and ROList (Romanian) can be switched on;
-  more by URL.  Downloaded with KIO over **HTTPS only** (or read from a
+* **Lists**: EasyList, EasyPrivacy, uBlock filters and uBlock filters –
+  Quick fixes by default (the uBlock lists carry the scriptlets, e.g.
+  YouTube's; a choice saved before them gets them added once); uBlock
+  filters – Annoyances and ROList (Romanian) can be switched on; more by
+  URL.  Downloaded with KIO over **HTTPS only** (or read from a
   local file): no cookies, no language header, no authentication, a
   certificate that does not validate fails the download (no dialog), a
   redirect must stay on HTTPS, at most 16 MiB, HTML (a captive portal)
@@ -241,7 +243,7 @@ in the web process; the part is not called per request.
   What WebKit cannot express is **dropped and counted, never widened**
   (a rule that blocks more than its list says breaks sites):
   `$redirect`, `$csp`, `$removeparam`, `$denyallow`, `$to`, scriptlets
-  (`##+js`), procedural cosmetics (`:has-text`, `:upward`, `:style`, ...),
+  the part does not implement, procedural cosmetics (`:has-text`, `:upward`, `:style`, ...),
   HTML filters, `$method` (WebKit compares it with the *page's* method),
   regular expressions with `\b`, look-around or long `{n,m}`, patterns
   that could match an empty URL, `$elemhide` & co. on blocking filters,
@@ -269,7 +271,9 @@ in the web process; the part is not called per request.
   `$elemhide`, `$generichide` exceptions; site-specific element hiding +
   `$document`, `$elemhide`, `$specifichide` exceptions.  `#@#`
   exceptions are folded into the hiding rules (`unless-top-url`).
-* **Updates**: weekly (checked hourly), on "Update Now", when the choice
+* **Updates**: daily by default (uBlock's lists follow YouTube several
+  times a week; every 3 days or weekly in the dialog, kwpepartrc
+  `[AdBlock] UpdateIntervalHours`; checked hourly), on "Update Now", when the choice
   of lists changes; at most once an hour after a failure.  One process
   at a time (`KLockFile`, a dead holder's lock is taken over).  A new
   set gets new identifiers; kwpepartrc names the set in use only after
@@ -302,12 +306,72 @@ in the web process; the part is not called per request.
   used.  A failed load of the stored set (another WebKit version)
   compiles anew at once.
 * **UI**: Settings → "Configure WPE WebKit..." (smooth scrolling; ad
-  blocking on/off, lists with checkboxes, another list by URL, Update
+  blocking on/off, scriptlets on/off, update interval, lists with checkboxes, another list by URL, Update
   Now, last update and rule count, the sites where it is off) and a
   status bar label ("Ads: blocked / allowed / off"; a click shows the
   menu).  WebKit does not report what its content filters blocked (no
   signal, no failed resource), so there is no count.  No Konqueror
   control center page yet.
+
+### Scriptlets (`scriptlets.js`, `abpconverter.cpp`, `kwpeadblock.cpp`)
+
+Some ads cannot be blocked as requests: YouTube sends them in the same
+answers as the video (`ytInitialPlayerResponse` in an inline script, the
+`/youtubei/v1/player` answers of `fetch()`/XHR: `adPlacements`,
+`playerAds`, `adSlots`).  uBlock's lists remove them with **scriptlets**,
+`site##+js(name, args...)`: small patches of the page's JavaScript run
+before the page's own scripts.
+
+* **Converter**: `##+js(...)` and `#@#+js(...)` filters are parsed with
+  uBlock's argument rules (`\,` is a comma; an argument in `'`, `"` or
+  `` ` `` quotes needs no escapes), names and aliases resolved (`set`,
+  `set-constant.js` → `set-constant`, `rmnt`, `nostif`, `trusted-rpfr`,
+  ...).  Exceptions become excluded sites (`#@#+js()`: all scriptlets of
+  the site); generic scriptlets (no site) are dropped.  `kwpe-filterconv
+  --scriptlets FILE` writes them next to the compiled filters, with the
+  set's identifier (`<set>.scriptlets`, written to a temporary name and
+  renamed), one line per scriptlet: sites, excluded sites (domains or
+  `example.*` entities) and the call as a JSON array.  The part reads it
+  with the filters of the set (same atomic switch, old files removed with
+  the old set).
+* **Trust**: scriptlets that can put arbitrary content or code into a
+  page (`trusted-*`, and `replace-node-text`, which rewrites inline
+  scripts) run **only from uBlock's own lists** ("uBlock filters" with
+  its includes and "Quick fixes", fetched from their fixed HTTPS URLs,
+  `--trusted`), never from a list the user added; they are dropped as
+  `scriptlet-untrusted`.  An exception of any list may switch any
+  scriptlet off.
+* **Library** (`src/scriptlets.js`, built into the part): written for
+  kde3-wpepart from the documented behaviour (uBlock's own resources are
+  GPLv3 and were not used).  `set-constant`, `trusted-set-constant`,
+  `abort-on-property-read`/`-write`, `abort-current-script` (inline
+  scripts), `abort-on-stack-trace`, `no-setTimeout-if`/`-setInterval-if`,
+  `adjust-setTimeout`/`-setInterval`, `noeval-if`, `prevent-window-open`,
+  `prevent-addEventListener`, `remove-attr`, `remove-class`,
+  `json-prune` (`JSON.parse` and `Response.json()`; paths with `[]`,
+  `*`, `[-]`), `json-prune-fetch-response`/`-xhr-response`,
+  `trusted-replace-fetch-response`/`-xhr-response`, `prevent-fetch`,
+  `prevent-xhr`, `remove-node-text`, `replace-node-text`,
+  `trusted-prevent-dom-bypass`.  Patched functions are `Proxy`s of the
+  originals (still `[native code]`); everything else stays in a closure.
+  Not implemented (dropped as `scriptlet-unsupported`, ~830 filters of
+  uBlock's lists): `trusted-edit-inbound-object`, `trusted-replace-argument`,
+  `nowebrtc`, cookies and storage items, `json-edit`, `xml-prune`, ...
+* **Injection**: a `WebKitUserScript` per host (document start, all
+  frames, the page's own world), made from the library and the host's
+  calls (its domain, parent domains and entities via libsoup's public
+  suffix list, minus excluded sites).  WebKit matches a user script's
+  allow list against the **main frame's** URL, not the frame's, so the
+  scripts carry no allow list and each one first checks
+  `location.hostname`; every view's content manager gets the scripts of
+  the hosts it shows: the main site (set before the request) and each
+  frame's site, added in the navigation (and response) policy decision,
+  which WebKit sees before the frame's document.  Off with the filters
+  ("Disable Ad Blocking on This Site" covers the frames of that page) or
+  with the scriptlets switch.  User scripts are not subject to the page's
+  CSP; the library itself adds no `<script>` and uses no `eval`.
+* **Cost**: about 3 ms per frame of a host with scriptlets (the library
+  is ~37 KB of source); frames of other hosts only parse it.
 
 ### Which part Konqueror uses
 
@@ -377,6 +441,10 @@ HTML or a PNG like another program, for paste tests), `wpemem.sh`
 `server.py` serves the pages plus downloads, POST, cookies, Basic
 authentication and `/typed?type=T&name=N` answers of any type (a real
 PDF for `application/pdf`); its log says whether KIO or WebKit asked.
+`tests/adblock/scriptlets.sh DISPLAY` checks the scriptlets with
+`pages/scriptlets.html` (YouTube's pattern and every scriptlet, in a frame
+of the same and of another site, with blocking off for the site, and on a
+site without scriptlets).
 Pages for stage 3: `probe.html` (PDF, archive, attachment, mailto:),
 `paste.html`, `upload.html`, `dialogs.html`.
 
@@ -444,6 +512,15 @@ In use: the set is read from the store in 20 ms; kwpeview with a still
 page, filters off/on: RSS 347 / 352 MiB, PSS 183 / 188 MiB (+5 MiB, in
 the web process).  dailymail.co.uk: 1586 → 1060 MiB RSS, no ad slots
 and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
+
+Scriptlets (2026-11-22): EasyList, EasyPrivacy, uBlock filters and Quick
+fixes give 9 092 scriptlet injections (828 unsupported, 76 exceptions
+applied), 22 of them for www.youtube.com.  Three videos without
+scriptlets: pre-rolls on two (a skippable "Sponsored" ad, then a second
+one); with them: no ad, the video plays (autoplay needs a click in a new
+profile either way) — screenshots in `/var/tmp/kwpe-scriptlets/`.
+Google, Wikipedia, BBC, CNN (5 scriptlets), Daily Mail (frames with
+their own), Twitch, digi24 render as before.
 
 ## Known problems
 
@@ -528,7 +605,7 @@ and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
 * No password manager yet (KWallet for forms; the `submit-form` hook is
   a stub).
 * Ad blocking: no count of blocked requests (WebKit does not report
-  them); uBlock's scriptlets, procedural cosmetics, `$redirect` and
+  them); some uBlock scriptlets (see above), procedural cosmetics, `$redirect` and
   `$removeparam` are not supported; a link between a site where ad
   blocking is off and one where it is on loads the page twice (after a
   redirect it keeps the previous site's element hiding instead);

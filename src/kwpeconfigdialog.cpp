@@ -100,6 +100,11 @@ KWPEConfigDialog::KWPEConfigDialog( QWidget* parent )
     QVBoxLayout* top = new QVBoxLayout( ads, 0, KDialog::spacingHint() );
     m_enabled = new QCheckBox( i18n( "&Block advertisements and trackers" ), ads );
     top->addWidget( m_enabled );
+    m_scriptlets = new QCheckBox( i18n( "Run the lists' page &scripts (uBlock scriptlets: YouTube ads)" ), ads );
+    QWhatsThis::add( m_scriptlets, i18n( "Some ads (YouTube's) come in the same answer as the page or the video and "
+                                         "cannot be blocked as requests. The uBlock lists remove them with small "
+                                         "scripts run in the pages of those sites before the sites' own scripts." ) );
+    top->addWidget( m_scriptlets );
 
     top->addWidget( new QLabel( i18n( "Filter lists (Adblock Plus syntax, fetched over HTTPS):" ), ads ) );
     m_lists = new QListView( ads );
@@ -121,7 +126,12 @@ KWPEConfigDialog::KWPEConfigDialog( QWidget* parent )
     m_status = new QLabel( ads );
     m_status->setAlignment( Qt::AlignVCenter | Qt::WordBreak );
     m_update = new QPushButton( i18n( "&Update Now" ), ads );
+    m_interval = new QComboBox( false, ads );
+    m_interval->insertItem( i18n( "Update daily" ) );
+    m_interval->insertItem( i18n( "Update every 3 days" ) );
+    m_interval->insertItem( i18n( "Update weekly" ) );
     row->addWidget( m_status, 1 );
+    row->addWidget( m_interval );
     row->addWidget( m_update );
 
     top->addWidget( new QLabel( i18n( "Sites where ad blocking is off:" ), ads ) );
@@ -153,6 +163,9 @@ void KWPEConfigDialog::load()
 
     KWPEAdBlock* adblock = KWPEAdBlock::self();
     m_enabled->setChecked( adblock->isEnabled() );
+    m_scriptlets->setChecked( adblock->scriptletsEnabled() );
+    int hours = adblock->updateInterval();
+    m_interval->setCurrentItem( hours <= 24 ? 0 : hours <= 72 ? 1 : 2 );
     m_lists->clear();
     QValueList<KWPEAdBlock::List> lists = adblock->lists();
     QListViewItem* last = 0;
@@ -182,6 +195,9 @@ void KWPEConfigDialog::save()
         lists.append( static_cast<ListItem*>( item )->list() );
     bool wasEnabled = adblock->isEnabled();
     adblock->setEnabled( m_enabled->isChecked() );
+    adblock->setScriptletsEnabled( m_scriptlets->isChecked() );
+    static const int hours[] = { 24, 72, 168 };
+    adblock->setUpdateInterval( hours[m_interval->currentItem()] );
     adblock->setLists( lists );
     QStringList sites;
     for ( unsigned i = 0; i < m_sites->count(); ++i )

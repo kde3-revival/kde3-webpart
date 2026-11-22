@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<html><body style="background:#eef">
+frame <span id="v"></span>
+<script>
+document.getElementById('v').textContent = String(window.kwpeFrameMark);
+parent.postMessage({ frame: location.host, mark: String(window.kwpeFrameMark) }, '*');
+</script>
+</body></html>

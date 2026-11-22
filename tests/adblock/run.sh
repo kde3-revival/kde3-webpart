@@ -34,6 +34,7 @@ conf() { kwriteconfig --file kwpepartrc --group AdBlock --key "$1" "$2"; }
 conf Enabled true
 conf CustomLists "$list"
 conf EnabledLists "$id"
+conf ScriptletListsAdded true
 conf DisabledSites ""
 conf Filters ""
 conf ListsHash ""

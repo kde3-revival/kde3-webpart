@@ -48,6 +48,8 @@ struct Stats
     unsigned cosmeticSpecific;   // css-display-none rules for some sites
     unsigned cosmeticExceptions; // #@# filters applied
     unsigned regexConverted;     // /regex/ filters WebKit understands after rewriting
+    unsigned scriptlets;         // scriptlet injections written
+    unsigned scriptletExceptions; // #@#+js filters applied
 
     // dropped, by reason
     std::map<std::string, unsigned> dropped;
@@ -76,8 +78,27 @@ public:
         Rule() : caseSensitive( false ) {}
     };
 
-    /** The text of a filter list ("!#include name": see setIncludeLoader()). */
-    void addList( const std::string& text );
+    /**
+     * The text of a filter list ("!#include name": see setIncludeLoader()).
+     * @p trusted: a list of ours (uBlock's own lists, from their fixed
+     * URLs), whose "trusted-" scriptlets run; never a list of the user's.
+     */
+    void addList( const std::string& text, bool trusted = false );
+
+    /**
+     * A scriptlet ("sites##+js(name, args)") the part runs in the pages
+     * of those sites, before their own scripts.  Sites: domains (and
+     * their subdomains) or uBlock entities ("example.*").
+     */
+    struct Scriptlet
+    {
+        std::string name;                  // canonical: "set-constant", not "set" or "set.js"
+        std::vector<std::string> args;
+        std::vector<std::string> include;  // never empty
+        std::vector<std::string> exclude;  // sites below them, "#@#+js" exceptions
+    };
+    /** The scriptlets, after ruleLists(); scriptletsText() writes them. */
+    const std::vector<Scriptlet>& scriptlets() const { return m_scriptlets; }
 
     /**
      * The rule lists, each at most @p maxRules rules (WebKit's limit is
@@ -102,13 +123,16 @@ private:
     bool active() const;
     void convertNetwork( const std::string& filter );
     void convertCosmetic( const std::string& domains, const std::string& selector, bool exception );
+    void convertScriptlet( const std::string& domains, const std::string& body, bool exception, bool trusted );
     void drop( const char* reason );
 
     IncludeLoader m_includeLoader;
     void* m_includeData;
 
     std::vector<std::string> m_filters;     // in order, unique
-    std::set<std::string> m_seen;
+    std::vector<bool> m_filterTrusted;      // ... from a trusted list
+    std::map<std::string, size_t> m_seen;   // filter -> index
+    bool m_trusted;                         // the list being read
 
     // results
     std::vector<Rule> m_block;              // network blocks
@@ -130,6 +154,8 @@ private:
     std::vector<Cosmetic> m_cosmetic;
     std::map<std::string, std::set<std::string> > m_cosmeticExceptions; // selector -> sites ("" = all)
     std::set<std::string> m_badfilters;
+    std::vector<Scriptlet> m_scriptlets;
+    std::map<std::string, std::set<std::string> > m_scriptletExceptions; // name+args ("" = all) -> sites ("" = all)
     std::string m_current;            // the filter being converted (verbose)
     std::vector<bool> m_ifStack;      // !#if ... !#endif: active?
 };
@@ -150,6 +176,22 @@ bool regexToURLFilters( const std::string& regex, std::vector<std::string>& urlF
 
 /** The url-filter can match an empty string (WebKit: every URL). */
 bool canMatchEmpty( const std::string& urlFilter );
+
+/**
+ * The body of a scriptlet filter ("+js(name, arg, ...)") as its canonical
+ * name (aliases resolved) and arguments (uBlock's quoting and "\\,"
+ * escapes); false if it is not one we run (whyNot: why).  @p trusted:
+ * from a trusted list ("trusted-" scriptlets are refused otherwise).
+ */
+bool parseScriptlet( const std::string& body, bool trusted, std::string& name, std::vector<std::string>& args,
+                     std::string& whyNot );
+
+/**
+ * The scriptlets for the part: a first line "kwpe-scriptlets 1", then
+ * one line per scriptlet: sites TAB excluded sites TAB a JSON array
+ * [name, args...] (sites comma-separated).
+ */
+std::string scriptletsText( const std::vector<Converter::Scriptlet>& scriptlets );
 
 /** The rules as a WebKit JSON array. */
 std::string toJSON( const std::vector<Converter::Rule>& rules );

@@ -68,9 +68,21 @@ public:
      * it.  True if that switched them (on to off or off to on).
      */
     bool setViewHost( WebKitUserContentManager* manager, const QString& host );
+    /**
+     * A frame of the view is about to show a page of @p host (a subframe,
+     * or the main frame before setViewHost()): its scriptlets, if any,
+     * are injected into it.
+     */
+    void addFrameHost( WebKitUserContentManager* manager, const QString& host );
 
     bool isEnabled() const;
     void setEnabled( bool enabled );
+    /** uBlock's scriptlets ("site##+js(...)") run in the pages. */
+    bool scriptletsEnabled() const;
+    void setScriptletsEnabled( bool enabled );
+    /** Hours between two updates of the lists. */
+    int updateInterval() const;
+    void setUpdateInterval( int hours );
 
     /** The site list contains @p host or a parent domain of it. */
     bool isSiteDisabled( const QString& host ) const;
@@ -121,6 +133,9 @@ private:
     void filtersLoaded( unsigned serial );
     void applyToViews();
     bool apply( WebKitUserContentManager* manager );
+    void applyScripts( WebKitUserContentManager* manager );
+    void loadScriptlets( const QStringList& identifiers );
+    QString scriptletsSource( const QString& host );
     void downloadNext();
     void convert();
     void finishUpdate( bool ok, const QString& message );

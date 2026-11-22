@@ -54,6 +54,8 @@ private:
     QComboBox* m_smooth;
     QCheckBox* m_pdfInPage;
     QCheckBox* m_enabled;
+    QCheckBox* m_scriptlets;
+    QComboBox* m_interval;
     QListView* m_lists;
     KLineEdit* m_url;
     QPushButton* m_add;
