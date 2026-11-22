@@ -870,6 +870,9 @@ void KWPEAdBlock::checkSchedule()
     // says nothing about it.
     for ( QValueList<List>::ConstIterator it = s.lists.begin(); !due && it != s.lists.end(); ++it )
         due = ( *it ).enabled && !( *it ).custom && !QFile::exists( listDir( ( *it ).id ) + "list.txt" );
+    // The last attempt failed or was cut short: the lists may be saved
+    // already, but the filters and scriptlets in use don't have them.
+    due = due || ( s.lastAttempt.isValid() && s.lastAttempt > s.lastUpdate );
     // not again and again after a failure (every process, every hour)
     if ( due && s.lastAttempt.isValid() && s.lastAttempt.addSecs( retryMinutes * 60 ) > now && s.lastAttempt <= now )
         due = false;
