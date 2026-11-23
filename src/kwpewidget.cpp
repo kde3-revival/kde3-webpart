@@ -537,12 +537,13 @@ static bool ensureMailWebKit()
     webkit_settings_set_enable_developer_extras( s_mailSettings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
     // (enable-dns-prefetching and enable-hyperlink-auditing do nothing in
     // WebKit 2.54.)  What loads by itself, WebKit's features (all exposed
-    // boolean preferences; LinkPreconnect is on by default on GLib):
+    // boolean preferences; LinkPreconnect is on by default on GLib; WebXR
+    // is not built into WPE WebKit 2.54):
     static const char* const offFeatures[] = {
         "LinkPreconnect", "LinkPreconnectEarlyHints", "LinkPrefetch", "LinkPreload", "MediaPreloading",
         "SpeculationRulesPrefetch", "BeaconAPI", "DownloadAttribute", "WebSocket", "WebTransport", "ServiceWorkers",
         "SharedWorker", "IndexedDBAPI", "CacheAPI", "Notifications", "NotificationEvent", "PushAPI",
-        "GeolocationAPI", "Gamepads", "AsyncClipboardAPI", "BroadcastChannel", "WebXR", 0
+        "GeolocationAPI", "Gamepads", "AsyncClipboardAPI", "BroadcastChannel", 0
     };
     if ( !mailLayerDisabled( "settings" ) ) {
         WebKitFeatureList* features = webkit_settings_get_all_features();
