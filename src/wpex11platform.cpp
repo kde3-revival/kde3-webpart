@@ -857,10 +857,18 @@ static gboolean kwpeViewRenderBuffer( WPEView* view, WPEBuffer* buffer, const WP
         guint stride = wpe_buffer_shm_get_stride( shm );
         // The buffer comes from the web process: a row shorter than the
         // width would make the copy below read past the pixels.
+        // A new image and backing pixmap (the first frame, a new size):
+        // they hold nothing yet, the whole frame goes in, not only what
+        // WebKit damaged (the rest showed black until the next frame).
+        bool fresh = !( st->image && st->backingWidth == width && st->backingHeight == height );
         if ( !pixels || width <= 0 || height <= 0 || stride < guint( width ) * 4 || size < gsize( stride ) * height
              || !ensureShmImage( st, width, height ) ) {
             g_set_error_literal( error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "cannot show the SHM buffer" );
             return FALSE;
+        }
+        if ( fresh ) {
+            XRectangle all = { 0, 0, (unsigned short) width, (unsigned short) height };
+            damage.assign( 1, all );
         }
 
         // ARGB8888 premultiplied in memory is what a 32 bpp ZPixmap of a
