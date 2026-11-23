@@ -14,7 +14,9 @@
 #include <gumbo.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unordered_set>
 #include <vector>
 
 namespace KWPEMailSanitizer
@@ -561,11 +563,10 @@ enum ElementAction { Keep, Unwrap, Drop, RenameToPre };
 
 struct Serializer
 {
-    Serializer( Profile p, bool e ) : profile( p ), external( e ) {}
+    Serializer( Profile p, bool e ) : profile( p ), external( e ), depth( 0 ) {}
 
-    void node( const GumboNode* n );
-    void element( const GumboNode* n );
-    void children( const GumboNode* n );
+    void open( const GumboNode* n, std::string& close, bool& descend );
+    void walk( const GumboNode* root );
     void text( const char* t );
     void attribute( const char* name, const std::string& value );
     ElementAction actionFor( const GumboElement& e, std::string& name ) const;
@@ -574,6 +575,8 @@ struct Serializer
     Profile profile;
     bool external;
     std::string out;
+    unsigned depth;   // elements written and open
+    static const unsigned maxDepth = 400;
 };
 
 static bool inList( const std::string& s, const char* const* list )
@@ -733,15 +736,21 @@ static bool isBodyFrame( const std::string& src )
     return src.size() > 10;
 }
 
-void Serializer::element( const GumboNode* n )
+// An element's start tag (and what it is if it has no content of its
+// own); @p close gets its end tag, @p descend whether its children follow.
+void Serializer::open( const GumboNode* n, std::string& close, bool& descend )
 {
     const GumboElement& e = n->v.element;
     std::string name;
+    close = std::string();
+    descend = false;
     ElementAction action = actionFor( e, name );
     if ( action == Drop )
         return;
-    if ( action == Unwrap ) {
-        children( n );
+    if ( action == Unwrap || ( action != Drop && depth >= maxDepth ) ) {
+        // Deeper than WebKit would build the tree anyway (its parser stops
+        // nesting at 512): the content without the element.
+        descend = true;
         return;
     }
     if ( action == RenameToPre )
@@ -817,6 +826,7 @@ void Serializer::element( const GumboNode* n )
         return;
     if ( name == "pre" )
         out += '\n';   // the parser drops one newline after <pre>
+    close = "</" + name + ">";
     if ( name == "style" ) {
         std::string css;
         for ( unsigned i = 0; i < e.children.length; ++i ) {
@@ -825,45 +835,180 @@ void Serializer::element( const GumboNode* n )
                 css += c->v.text.text;
         }
         out += sanitizeCss( css, profile, external );
-    } else {
-        children( n );
+        return;
     }
-    out += "</";
-    out += name;
-    out += '>';
+    descend = true;
 }
 
-void Serializer::children( const GumboNode* n )
+// The tree without recursion: a message may nest elements 100000 deep
+// (Gumbo builds that tree; WebKit's parser would flatten it at 512).  The
+// stack lives on the heap; elements deeper than maxDepth are unwrapped.
+void Serializer::walk( const GumboNode* root )
 {
-    const GumboVector& c = n->v.element.children;
-    for ( unsigned i = 0; i < c.length; ++i )
-        node( static_cast<const GumboNode*>( c.data[i] ) );
-}
-
-void Serializer::node( const GumboNode* n )
-{
-    switch ( n->type ) {
-    case GUMBO_NODE_ELEMENT:
-        element( n );
-        break;
-    case GUMBO_NODE_TEXT:
-    case GUMBO_NODE_WHITESPACE:
-        text( n->v.text.text );
-        break;
-    case GUMBO_NODE_TEMPLATE:   // inert content, dropped
-    case GUMBO_NODE_CDATA:      // foreign content only, dropped with it
-    case GUMBO_NODE_COMMENT:
-    default:
-        break;
+    struct Frame
+    {
+        const GumboNode* node;
+        unsigned next;
+        std::string close;
+        bool counted;
+    };
+    std::vector<Frame> stack;
+    Frame f;
+    f.node = root;
+    f.next = 0;
+    bool descend = false;
+    open( root, f.close, descend );
+    if ( !descend ) {
+        out += f.close;
+        return;
+    }
+    f.counted = !f.close.empty();
+    depth += f.counted ? 1 : 0;
+    stack.push_back( f );
+    while ( !stack.empty() ) {
+        Frame& top = stack.back();
+        const GumboVector& c = top.node->v.element.children;
+        if ( top.next >= c.length ) {
+            out += top.close;
+            if ( top.counted )
+                --depth;
+            stack.pop_back();
+            continue;
+        }
+        const GumboNode* child = static_cast<const GumboNode*>( c.data[top.next++] );
+        if ( child->type == GUMBO_NODE_TEXT || child->type == GUMBO_NODE_WHITESPACE ) {
+            text( child->v.text.text );
+            continue;
+        }
+        if ( child->type != GUMBO_NODE_ELEMENT )
+            continue;   // template (inert), CDATA (foreign content), comments
+        Frame g;
+        g.node = child;
+        g.next = 0;
+        open( child, g.close, descend );
+        if ( !descend ) {
+            out += g.close;
+            continue;
+        }
+        g.counted = !g.close.empty();
+        depth += g.counted ? 1 : 0;
+        stack.push_back( g );   // may move "top": not used after this
     }
 }
 
 } // namespace
 
+// Gumbo needs time quadratic in the nesting depth (100000 nested <div>:
+// 12 s, 10000: 0.1 s): a message nested deeper than this (estimated
+// without parsing) is shown as its source text.  WebKit's own parser
+// stops nesting at 512.
+static const unsigned maxEstimatedDepth = 5000;
+
+static bool isTagNameChar( char c )
+{
+    return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '-';
+}
+
+// An upper estimate of the elements' nesting: start tags of elements that
+// need an end tag count up, end tags down; comments and raw text (script,
+// style, ...) are skipped.
+static unsigned estimatedDepth( const std::string& html )
+{
+    static const char* const noEndTag[] = {
+        // void
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
+        "wbr", "keygen", "basefont", "bgsound", "frame", "image", "isindex",
+        // end tag optional (closed by the next one)
+        "p", "li", "dt", "dd", "tr", "td", "th", "tbody", "thead", "tfoot", "colgroup", "option", "optgroup",
+        "rt", "rp", "rb", "rtc", "html", "head", "body", 0
+    };
+    static const char* const rawText[] = {
+        "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", 0
+    };
+    long depth = 0, max = 0;
+    size_t i = 0, n = html.size();
+    while ( i < n ) {
+        size_t lt = html.find( '<', i );
+        if ( lt == std::string::npos )
+            break;
+        i = lt + 1;
+        if ( html.compare( lt, 4, "<!--" ) == 0 ) {
+            size_t end = html.find( "-->", lt + 4 );
+            i = end == std::string::npos ? n : end + 3;
+            continue;
+        }
+        bool endTag = i < n && html[i] == '/';
+        if ( endTag )
+            ++i;
+        if ( i >= n || !( ( html[i] >= 'a' && html[i] <= 'z' ) || ( html[i] >= 'A' && html[i] <= 'Z' ) ) )
+            continue;
+        size_t start = i;
+        while ( i < n && isTagNameChar( html[i] ) )
+            ++i;
+        std::string name = lower( html.substr( start, i - start ) );
+        if ( inList( name, noEndTag ) )
+            continue;
+        if ( endTag ) {
+            if ( depth > 0 )
+                --depth;
+            continue;
+        }
+        if ( inList( name, rawText ) ) {
+            // its text up to its end tag
+            for ( size_t j = html.find( "</", i ); j != std::string::npos; j = html.find( "</", j + 2 ) ) {
+                if ( lower( html.substr( j + 2, name.size() ) ) == name ) {
+                    i = j;
+                    break;
+                }
+            }
+            continue;
+        }
+        if ( ++depth > max )
+            max = depth;
+    }
+    return unsigned( max );
+}
+
+// Gumbo's memory, freed in one go after the tree has been written.
+typedef std::unordered_set<void*> Allocations;
+
+static void* allocate( void* userdata, size_t size )
+{
+    void* p = malloc( size ? size : 1 );
+    if ( p )
+        static_cast<Allocations*>( userdata )->insert( p );
+    return p;
+}
+
+static void deallocate( void* userdata, void* p )
+{
+    if ( !p )
+        return;
+    static_cast<Allocations*>( userdata )->erase( p );
+    free( p );
+}
+
+static void freeAll( Allocations* arena )
+{
+    for ( Allocations::const_iterator it = arena->begin(); it != arena->end(); ++it )
+        free( *it );
+    arena->clear();
+}
+
 std::string sanitizeHtml( const std::string& html, Profile profile, bool external )
 {
+    if ( estimatedDepth( html ) > maxEstimatedDepth ) {
+        // Not parsed (see maxEstimatedDepth): its text, as text.
+        std::string out = "<!DOCTYPE html>\n<html><body><p>[This message is nested too deeply to be shown; its source:]</p><pre>\n";
+        escapeInto( out, html.c_str(), false );
+        return out + "</pre></body></html>\n";
+    }
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
+    Allocations arena;
+    options.allocator = allocate;
+    options.deallocator = deallocate;
+    options.userdata = &arena;
     GumboOutput* output = gumbo_parse_with_options( &options, html.data(), html.size() );
     Serializer s( profile, external );
     // The document's mode as Gumbo found it (tables of mails depend on
@@ -880,8 +1025,11 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     default:
         break;
     }
-    s.node( output->root );
-    gumbo_destroy_output( &options, output );
+    s.walk( output->root );
+    // Not gumbo_destroy_output(): Gumbo frees its tree recursively (a deep
+    // message would exhaust the stack there).  Everything Gumbo allocated
+    // is ours to free.
+    freeAll( &arena );
     return s.out;
 }
 
