@@ -1127,6 +1127,8 @@ void KWPEWidgetPrivate::destroy()
     QValueList<PendingPermission> permissions = pendingPermissions;
     pendingPermissions.clear();
     for ( QValueList<PendingPermission>::Iterator it = permissions.begin(); it != permissions.end(); ++it ) {
+        if ( !( *it ).request )
+            continue;
         webkit_permission_request_deny( ( *it ).request );
         g_object_unref( ( *it ).request );
     }
@@ -2045,7 +2047,19 @@ gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView* view, WebKitPerm
     } else {
         pending.kind = QString::fromLatin1( "other" );
     }
-    pending.request = WEBKIT_PERMISSION_REQUEST( g_object_ref( request ) );
+    if ( pending.kind != "notifications" ) {
+        // WebKit does not say which frame asks (a frame of another site
+        // the application's page shows, with the permission delegated):
+        // the top level's origin is not the requester's.  Refused; the
+        // host only learns of it (no origin, its answer is not used).
+        // Notifications: WebKit refuses a frame of another origin
+        // itself, the requester is the main frame's origin.
+        webkit_permission_request_deny( request );
+        pending.origin = QString::null;
+        pending.request = 0;
+    } else {
+        pending.request = WEBKIT_PERMISSION_REQUEST( g_object_ref( request ) );
+    }
     d->pendingPermissions.append( pending );
     // The host may ask the user (an event loop): not inside WebKit's signal.
     QTimer::singleShot( 0, d->q, SLOT( askPermissions() ) );
@@ -2439,6 +2453,8 @@ void KWPEWidget::askPermissions()
         d->pendingPermissions.remove( d->pendingPermissions.begin() );
         bool allow = false;
         emit permissionRequested( pending.kind, pending.origin, allow );
+        if ( !pending.request )
+            continue;   // refused already (no requester known)
         // Answered even if the widget went meanwhile (destroy() denied
         // only those still in the list).
         if ( allow )

@@ -240,7 +240,10 @@ signals:
      * "camera", "screen", "geolocation", "other") for @p origin; @p allow
      * is false unless set.  Emitted outside WebKit's signal; the answer
      * for notifications is kept in the data directory (and the page is
-     * not asked again).
+     * not asked again).  Only notifications are the host's to decide:
+     * WebKit does not tell which frame asks for the others (a frame of
+     * another site can), so they are refused, @p origin is empty and
+     * @p allow is not used.
      */
     void permissionRequested( const QString& kind, const QString& origin, bool& allow );
     /** Something the user should know (a drop the page did not take, ...). */

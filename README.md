@@ -437,7 +437,11 @@ of its own:
   `activateNotification(id)` gives the page its click.
 * **Permissions:** every request (notifications, microphone, camera,
   screen, geolocation, others) is `permissionRequested(kind, origin,
-  bool& allow)` for the host, outside WebKit's signal.  The answer for
+  bool& allow)` for the host, outside WebKit's signal.  Only
+  notifications are the host's to decide (WebKit refuses them to frames
+  of another origin, so the requester is the main frame's origin): for
+  the other kinds WebKit does not say which frame asks, so the part
+  refuses them and the host only learns of it (empty origin).  The answer for
   notifications is kept in `DIR/kwpepart-permissions` and given to every
   new web process (`initialize-notification-permissions`, also for
   `navigator.permissions.query()`): `Notification.permission` is

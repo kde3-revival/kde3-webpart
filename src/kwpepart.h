@@ -129,6 +129,9 @@ signals:
      * "microphone", "camera", "screen", "geolocation" or "other".  Set
      * @p allow to grant it (false: denied).  The answer for notifications
      * is kept in the storage directory: the page is not asked again.
+     * Only notifications are decided by the host: for the other kinds
+     * WebKit does not say which frame asks (a frame of another site can),
+     * the part refuses them, @p origin is empty and @p allow is not used.
      */
     void permissionRequested( const QString& kind, const QString& origin, bool& allow );
     /**
