@@ -37,12 +37,17 @@ Built with -DKWPE_RENDER_ONLY_TEST=ON (nothing of it is installed):
       (every connection attempt sends a packet), nftables counters of DNS
       queries, TCP SYNs and other UDP packets, tcpdump on every interface.
       First sanitize-timing.py: hostile documents (deep nesting, closing
-      tags the parser ignores, tags in quoted attributes, unclosed raw
-      text, formatting-element reconstruction, ...) must each be
-      sanitized within LIMIT_MS (default 100), parsed or shown as source
-      text.  Then every message (messages/ and two generated ones: 100000
-      nested <div>, which the sanitizer shows as source text, and 1500
-      nested, flattened, whose deepest text must render) runs in a fresh driver process and HOME
+      tags the parser ignores, tags in quoted attributes and comments,
+      unclosed raw text, formatting-element reconstruction, ...) and
+      large ordinary ones (KMail's HTML of long plain text messages, up to
+      200000 lines) must each be sanitized within LIMIT_MS (default 100)
+      plus four times the time per byte of an ordinary message there,
+      parsed or shown as source text: the hostile ones whose parse would
+      not be linear as source text, the ordinary ones parsed.  Then every
+      message (messages/ and two generated ones: 100000 nested <div>,
+      which the sanitizer shows as source text, and 1500 nested,
+      flattened, whose deepest text must render) runs in a fresh driver
+      process and HOME
       in these configurations (check.py gives the verdicts):
         all            every layer: no lookup, no connection, no packet
                        at all (not even to the closed proxy)

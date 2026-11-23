@@ -2,56 +2,133 @@
 # sanitize-timing.py KWPE_SANITIZE [LIMIT_MS]: hostile documents that make
 # an HTML parser slow (deep nesting, closing tags the parser ignores, tags
 # in quoted attributes, unclosed raw text, formatting reconstruction, ...)
-# must each be sanitized within LIMIT_MS (default 100); each must either
-# be parsed or shown as its source text (never anything else), and the
-# source text must keep a NUL's neighbours.  Exit 0 if all passed.
+# and large ordinary ones (KMail's HTML of long plain text messages) must
+# each be sanitized within LIMIT_MS (default 100) plus four times the time
+# per byte of an ordinary message on this machine (parsing is linear at
+# best: a large message may take longer, but not more than linearly).
+# Each must either be parsed or shown as its source text (never anything
+# else), as expected where a verdict is expected: what the parser would
+# work on too long (or allocate too much for) shown as source text, the
+# ordinary ones parsed; the source text must keep a NUL's neighbours.
+# Exit 0 if all passed.
 import subprocess, sys, time
 
 tool = sys.argv[1]
 limit = float(sys.argv[2]) if len(sys.argv) > 2 else 100.0
 FALLBACK = b'[This message is too complex to be shown; its source:]'
 
+
+def kmail(lines, line=None):
+    # KMail's reader for a text/plain part (kmail/objecttreeparser.cpp,
+    # quotedHTML()): every non-empty line in its own <div dir="ltr">, an
+    # empty one <br>, all in <div class="noquote">; spaces kept as
+    # "&nbsp; ", URLs as links.  Synthetic: a cron job's log.
+    if line is None:
+        def line(i):
+            if i % 40 == 39:
+                return '<br>'
+            if i % 25 == 24:
+                return '<div dir="ltr">see <a href="https://example.org/log/%d">https://example.org/log/%d</a></div>' % (i, i)
+            return '<div dir="ltr">04:%02d:%02d job-%d:&nbsp; step %d done, exit status 0</div>' % (i % 60, i % 60, i // 7, i)
+    return ('<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">\n<html><head><title></title>'
+            '<style type="text/css">div.noquote { margin: 0 }</style></head><body>\n'
+            '<div class="header" dir="ltr"><table cellspacing="1" cellpadding="0" width="100%"><tr><td>'
+            '<b>From:</b>&nbsp;</td><td>Cron Daemon &lt;root@example.org&gt;</td></tr></table></div>\n'
+            '<div style="position: relative"><div class="noquote">' + ''.join(line(i) for i in range(lines)) +
+            '</div></div>\n</body></html>\n')
+
+
+SOURCE, PARSED, ANY = 'source text', 'parsed', None
 cases = [
-    ('nested-div-100000', '<div>' * 100000 + 'x' + '</div>' * 100000),
-    ('ignored-closers-30000', '<div></z>' * 30000 + 'x'),
-    ('quoted-closers-10000', '<div title="</z>">' * 10000),
-    ('unclosed-script-32000', '<script>' * 32000),
-    ('unclosed-style-32000', '<style>' * 32000),
-    ('span-div-10000', '<span><div></span>' * 10000),
-    ('li-ul-10000', '<li><ul>' * 10000),
-    ('font-reconstruction', '<p>' + ''.join('<font color=%d>' % i for i in range(2000)) + '</p>' + '<p>x' * 20000),
-    ('b-div-20000', '<b><div>' * 20000 + 'x'),
-    ('a-nested-30000', '<a href=x>' * 30000 + 'x'),
-    ('tables-20000', '<table><tr><td>' * 20000),
-    ('comments-100000', '<!--<div>-->' * 100000),
-    ('paragraphs-50000', '<p>x' * 50000),
-    # under the counting bound, parsed: nesting just below it, and node
-    # reconstruction that only the allocation budget stops
-    ('nested-div-1500', '<div>' * 1500 + 'x' + '</div>' * 1500),
-    ('font-reconstruction-150x30000', '<p>' + ''.join('<font color=%d>' % i for i in range(150)) + '</p>' + '<p>x' * 30000),
-    ('nul-source', '<div>' * 20000 + 'BEFORE\0AFTER'),
+    # deep stacks of open elements, which closing tags must not hide
+    ('nested-div-100000', SOURCE, '<div>' * 100000 + 'x' + '</div>' * 100000),
+    ('ignored-closers-30000', SOURCE, '<div></z>' * 30000 + 'x'),
+    ('quoted-closers-10000', SOURCE, '<div title="</z>">' * 10000),
+    ('quoted-end-tags-10000', SOURCE, '<div title="</div>">' * 10000),
+    ('attribute-name-quote-10000', SOURCE, '<div =" b="></div>">' * 10000),
+    ('commented-end-tags-10000', SOURCE, '<div><!--</div>-->' * 10000),
+    ('cdata-end-tags-10000', SOURCE, '<div><![CDATA[</div>]]>' * 10000),
+    ('body-end-30000', SOURCE, ('<div>' * 100 + '</body>') * 300),
+    ('form-end-3000', SOURCE, '<form>' + '<div>' * 3000 + '</form>' * 3000 + 'x'),
+    ('script-escape-5000', SOURCE, '<script><!--<script></script>' + '</div>' * 10000 + '</script>' + '<div>' * 5000),
+    ('svg-style-30000', SOURCE, ('<svg><style>' + '<div>' * 100 + '</style>') * 300),
+    ('span-div-10000', SOURCE, '<span><div></span>' * 10000),
+    ('li-ul-10000', SOURCE, '<li><ul>' * 10000),
+    ('dd-dl-10000', SOURCE, '<dl><dd>' * 10000),
+    ('option-span-10000', SOURCE, '<option><span>' * 10000),
+    ('heading-span-10000', SOURCE, '<h1><span>' * 10000),
+    ('template-div-10000', SOURCE, '<template><div>' * 10000),
+    ('b-div-20000', SOURCE, '<b><div>' * 20000 + 'x'),
+    ('a-div-10000', SOURCE, '<a href=x><div>' * 10000 + 'x'),
+    ('nobr-div-10000', SOURCE, '<nobr><div>' * 10000 + 'x'),
+    # where an estimate of the depth went wrong before (found by comparing
+    # it with a Gumbo counting its steps): end tags that close nothing
+    # there, tags it does not ignore, CDATA outside svg and math
+    ('select-details-20000', SOURCE, '<b>' + '<details></select><select><div></i><tbody>' * 20000),
+    ('caption-table-20000', SOURCE, '<table>' + '<caption><table><g/>' * 20000),
+    ('object-colgroup-20000', SOURCE, '<table>' + '</x><wbr>></em><object><colgroup><</br><em>' * 20000),
+    ('svg-a-20000', SOURCE, '<svg>' + '=<a href=x></script>' * 20000),
+    ('th-outside-table-3000', SOURCE, '<dl></div></tbody><i><th></li><!-- x --></title><p>' * 3000),
+    ('cdata-in-html-10000', SOURCE, '<p><pre></nobr></x><keygen><![CDATA[<rt><ol>' * 10000),
+    ('math-br-10000', SOURCE, '<p>' + '<marquee></ x></br><wbr><td></s><table><math><frame>' * 10000),
+    ('math-self-closing-3000', SOURCE, '<!-- x --><frame></nobr></font></applet><math/><<noscript><font color=1>' * 3000),
+    # formatting elements: reconstruction, and text after a deep one
+    ('font-reconstruction', SOURCE, '<p>' + ''.join('<font color=%d>' % i for i in range(2000)) + '</p>' + '<p>x' * 20000),
+    ('font-reconstruction-150x30000', SOURCE, '<p>' + ''.join('<font color=%d>' % i for i in range(150)) + '</p>' + '<p>x' * 30000),
+    ('formatting-text-1M', SOURCE, '<div>' * 1500 + '<b>' + 'x' * 1000000),
+    ('reconstruction-2x250000', SOURCE, '<p><font color=1><font color=2></p>' + '<p>x' * 250000),
+    ('misnested-b-text', SOURCE, '<div>' * 1000 + ('<b>' + '<div>' * 9 + '</b>') * 300 + 'x' * 300000),
+    ('nul-source', SOURCE, '<div>' * 20000 + 'BEFORE\0AFTER'),
+    # linear for the parser: either verdict
+    ('unclosed-script-32000', ANY, '<script>' * 32000),
+    ('unclosed-style-32000', ANY, '<style>' * 32000),
+    ('a-nested-30000', ANY, '<a href=x>' * 30000 + 'x'),
+    ('tables-20000', ANY, '<table><tr><td>' * 20000),
+    ('comments-100000', ANY, '<!--<div>-->' * 100000),
+    ('paragraphs-50000', ANY, '<p>x' * 50000),
+    # ordinary: parsed (nesting below the bound; KMail's plain text)
+    ('nested-div-1500', PARSED, '<div>' * 1500 + 'x' + '</div>' * 1500),
+    ('kmail-2300-lines', PARSED, kmail(2300)),
+    ('kmail-20000-lines', PARSED, kmail(20000)),
+    ('kmail-100000-lines', PARSED, kmail(100000)),
+    ('kmail-200000-empty-lines', PARSED, kmail(200000, lambda i: '<br>')),
+    ('kmail-200000-short-lines', PARSED, kmail(200000, lambda i: '<div dir="ltr">%d</div>' % i)),
 ]
-failed = 0
-for name, doc in cases:
-    data = doc.encode()
+
+
+def run(data):
     start = time.monotonic()
-    p = subprocess.run([tool, 'html', 'content', 'render-only'], input=data, capture_output=True, timeout=60)
-    ms = (time.monotonic() - start) * 1000
+    p = subprocess.run([tool, 'html', 'content', 'render-only'], input=data, capture_output=True, timeout=120)
+    return p, (time.monotonic() - start) * 1000
+
+
+# this machine's time per byte of an ordinary message (the best of three)
+reference = kmail(20000).encode()
+perByte = min(run(reference)[1] for _ in range(3)) / len(reference)
+print('reference: %.0f ns per byte (kmail-20000-lines)' % (perByte * 1e6))
+failed = 0
+for name, expected, doc in cases:
+    data = doc.encode()
+    p, ms = run(data)
+    allowed = limit + 4 * perByte * len(data)
     out = p.stdout
     fallback = FALLBACK in out
+    verdict = SOURCE if fallback else PARSED
     why = []
     if p.returncode != 0:
         why.append('exit %d' % p.returncode)
-    if ms > limit:
-        why.append('%.0f ms > %.0f ms' % (ms, limit))
+    if ms > allowed:
+        why.append('%.0f ms > %.0f ms' % (ms, allowed))
     if not out.strip():
         why.append('no output')
+    if expected and verdict != expected:
+        why.append('expected: ' + expected)
     if name == 'nul-source' and not (fallback and b'BEFORE\xef\xbf\xbdAFTER' in out):
         why.append('NUL: source text cut')
     if fallback and b'<div' in out.split(FALLBACK)[1]:
         why.append('markup in the source text')
     failed |= bool(why)
-    print('%-4s %-24s %8d bytes %7.1f ms %s%s' % ('FAIL' if why else 'ok', name, len(data), ms,
-          'source text' if fallback else 'parsed', (' -> ' + ', '.join(why)) if why else ''))
+    print('%-4s %-30s %8d bytes %7.1f ms %s%s' % ('FAIL' if why else 'ok', name, len(data), ms, verdict,
+          (' -> ' + ', '.join(why)) if why else ''))
 print('PASS' if not failed else 'FAILED')
 sys.exit(failed)
