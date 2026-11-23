@@ -15,6 +15,7 @@
 #include <qstringlist.h>
 #include <qwidget.h>
 
+class QImage;
 class QTimer;
 class KWPEWidgetPrivate;
 
@@ -233,6 +234,14 @@ signals:
      * Emitted outside WebKit's signal.
      */
     void notificationShown( int id, const QString& title, const QString& body );
+    /**
+     * App mode: the same, with the notification's picture (its icon, at
+     * most 96 pixels; a null image without one).  Emitted right after
+     * the one above: connect one of them.  The picture is only of the
+     * page's own origin or a data:/blob: URL, drawn by the page's web
+     * process: nothing is fetched for it.
+     */
+    void notificationShown( int id, const QString& title, const QString& body, const QImage& icon );
     /** App mode: the page (or WebKit) closed the notification @p id. */
     void notificationClosed( int id );
     /**

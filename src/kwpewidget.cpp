@@ -31,6 +31,7 @@
 #include <qdir.h>
 #include <qfileinfo.h>
 #include <qguardedptr.h>
+#include <qimage.h>
 #include <qfile.h>
 #include <qmap.h>
 #include <qvaluelist.h>
@@ -189,6 +190,66 @@ static WebKitSettings* s_mailSettings = 0;
 static const char mailScheme[] = "kwpemail";
 static const char mailWorld[] = "kwpemail";
 static const char mailStateHandler[] = "kwpeMailState";
+
+// App mode: the picture of the page's notifications.  WebKit's
+// notification has no icon (WebKitNotification: title, body, tag), so
+// this script (the page's own world, the top frame of the application's
+// site, before the page's scripts) wraps the Notification constructor:
+// options.icon of the page's own origin, data: or blob: (nothing of
+// another site) is drawn into a canvas of at most 96 pixels in the web
+// process and handed to us as a PNG data: URL; the host fetches nothing.
+// "pending" comes before the notification itself (the constructor), the
+// picture or "" when it is ready (at most 1.5 seconds later).
+static const char appNotificationHandler[] = "kwpeNotification";
+static const char appNotificationScript[] =
+    "(function () {\n"
+    "  'use strict';\n"
+    "  var N = window.Notification;\n"
+    "  var handlers = window.webkit && window.webkit.messageHandlers;\n"
+    "  var handler = handlers && handlers.kwpeNotification;\n"
+    "  if (typeof N !== 'function' || !handler) return;\n"
+    "  var post = handler.postMessage.bind(handler);\n"
+    "  var serial = 0, size = 96;\n"
+    "  function source(icon) {\n"
+    "    try {\n"
+    "      var url = new URL(String(icon), document.baseURI);\n"
+    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === location.origin) return url.href;\n"
+    "    } catch (e) {}\n"
+    "    return null;\n"
+    "  }\n"
+    "  function text(value) { return value === undefined ? '' : String(value); }\n"
+    "  function announce(title, options) {\n"
+    "    if (!options || !options.icon) return;\n"
+    "    var src = source(options.icon);\n"
+    "    if (!src) return;\n"
+    "    var s = ++serial, done = false, img = new Image();\n"
+    "    post({ kind: 'pending', serial: s, title: String(title), body: text(options.body), tag: text(options.tag) });\n"
+    "    function finish(data) { if (!done) { done = true; post({ kind: 'icon', serial: s, data: data }); } }\n"
+    "    img.onload = function () {\n"
+    "      try {\n"
+    "        var w = img.naturalWidth, h = img.naturalHeight;\n"
+    "        if (!w || !h) { finish(''); return; }\n"
+    "        var k = Math.min(1, size / Math.max(w, h)), c = document.createElement('canvas');\n"
+    "        c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));\n"
+    "        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);\n"
+    "        finish(c.toDataURL('image/png'));\n"
+    "      } catch (e) { finish(''); }\n"
+    "    };\n"
+    "    img.onerror = function () { finish(''); };\n"
+    "    setTimeout(function () { finish(''); }, 1500);\n"
+    "    img.src = src;\n"
+    "  }\n"
+    "  function Notification(title, options) {\n"
+    "    if (!new.target) return N.apply(this, arguments);\n"
+    "    try { announce(title, options); } catch (e) {}\n"
+    "    return Reflect.construct(N, arguments, new.target);\n"
+    "  }\n"
+    "  Object.setPrototypeOf(Notification, N);\n"
+    "  Object.defineProperty(Notification, 'prototype', { value: N.prototype });\n"
+    "  Object.defineProperty(window, 'Notification', { value: Notification, writable: true, configurable: true, enumerable: false });\n"
+    "})();\n";
+// The picture: a PNG of at most this size (the script makes 96 pixels).
+static const int appNotificationIconMax = 256;
 
 struct KWPEMailDocument
 {
@@ -838,6 +899,8 @@ public:
     static gboolean onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data );
     static void onNotificationClosed( WebKitNotification* notification, gpointer data );
     void forgetNotifications();
+    static void onAppNotification( WebKitUserContentManager*, JSCValue* value, gpointer data );
+    static QImage notificationImage( const QString& dataURL );
     static gboolean onQueryPermissionState( WebKitWebView*, WebKitPermissionStateQuery* query, gpointer data );
     static void onDropDone( GObject* view, GAsyncResult* result, gpointer data );
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
@@ -888,6 +951,20 @@ public:
     QValueList<PendingPermission> pendingPermissions;   // for the host, outside WebKit's signal
     QMap<int, WebKitNotification*> notifications;   // shown by the page, not closed yet (ref)
     QValueList<int> notificationsToShow;   // for the host, outside WebKit's signal
+    // The pictures our script announced (appNotificationScript), oldest
+    // first: a notification waits for its picture (at most 2 seconds).
+    struct NotificationIcon
+    {
+        int serial;      // the script's
+        QString title;   // the notification it is for
+        QString body;
+        QString tag;
+        int id;          // ... once it is shown (0: not yet)
+        bool done;       // the picture came (or none will)
+        QImage image;
+        QTime announced;
+    };
+    QValueList<NotificationIcon> notificationIcons;
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
     bool menuEditable;   // the context menu was asked for over a text field
@@ -1065,6 +1142,14 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "script-dialog", G_CALLBACK( onScriptDialog ), this );
     if ( isApp() ) {
         g_signal_connect( view, "show-notification", G_CALLBACK( onShowNotification ), this );
+        // The notifications' pictures (see appNotificationScript).
+        WebKitUserScript* script = webkit_user_script_new( appNotificationScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                                           WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, 0, 0 );
+        webkit_user_content_manager_add_script( contentManager, script );
+        webkit_user_script_unref( script );
+        g_signal_connect( contentManager, ( QCString( "script-message-received::" ) + appNotificationHandler ).data(),
+                          G_CALLBACK( onAppNotification ), this );
+        webkit_user_content_manager_register_script_message_handler( contentManager, appNotificationHandler, 0 );
         g_signal_connect( view, "query-permission-state", G_CALLBACK( onQueryPermissionState ), this );
     }
 
@@ -1662,6 +1747,11 @@ void KWPEWidgetPrivate::onNotificationClosed( WebKitNotification* notification, 
         d->notifications.remove( it );
         g_object_unref( notification );
         d->notificationsToShow.remove( id );
+        for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
+            if ( ( *icon ).id == id ) {
+                d->notificationIcons.remove( icon );
+                break;
+            }
         emit d->q->notificationClosed( id );
         return;
     }
@@ -1675,6 +1765,83 @@ void KWPEWidgetPrivate::forgetNotifications()
     }
     notifications.clear();
     notificationsToShow.clear();
+    notificationIcons.clear();
+}
+
+static QString jsString( JSCValue* object, const char* name )
+{
+    JSCValue* value = jsc_value_object_get_property( object, name );
+    QString result;
+    if ( jsc_value_is_string( value ) ) {
+        char* text = jsc_value_to_string( value );
+        result = QString::fromUtf8( text );
+        g_free( text );
+    }
+    g_object_unref( value );
+    return result;
+}
+
+// Our script's message: a picture announced ("pending") or ready
+// ("icon"; data: a PNG data: URL or empty).  The page can post anything
+// here (its own world): only for the application's site, a bounded
+// list, a small PNG or nothing.
+void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* value, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( !jsc_value_is_object( value ) || !d->view || !d->isAppDocument( webkit_web_view_get_uri( d->view ) ) )
+        return;
+    QString kind = jsString( value, "kind" );
+    JSCValue* serialValue = jsc_value_object_get_property( value, "serial" );
+    int serial = jsc_value_is_number( serialValue ) ? jsc_value_to_int32( serialValue ) : 0;
+    g_object_unref( serialValue );
+    if ( kind == "pending" ) {
+        while ( d->notificationIcons.count() >= 20 )
+            d->notificationIcons.remove( d->notificationIcons.begin() );
+        NotificationIcon icon;
+        icon.serial = serial;
+        icon.title = jsString( value, "title" );
+        icon.body = jsString( value, "body" );
+        icon.tag = jsString( value, "tag" );
+        icon.id = 0;
+        icon.done = false;
+        icon.announced.start();
+        d->notificationIcons.append( icon );
+    } else if ( kind == "icon" ) {
+        for ( QValueList<NotificationIcon>::Iterator it = d->notificationIcons.begin(); it != d->notificationIcons.end(); ++it ) {
+            if ( ( *it ).serial != serial || ( *it ).done )
+                continue;
+            ( *it ).done = true;
+            ( *it ).image = notificationImage( jsString( value, "data" ) );
+            if ( ( *it ).id )
+                QTimer::singleShot( 0, d->q, SLOT( emitNotifications() ) );
+            break;
+        }
+    }
+}
+
+// A PNG data: URL (base64) of at most appNotificationIconMax pixels each
+// way (from the IHDR, before anything is decoded); a null image else.
+QImage KWPEWidgetPrivate::notificationImage( const QString& dataURL )
+{
+    static const char prefix[] = "data:image/png;base64,";
+    if ( !dataURL.startsWith( prefix ) || dataURL.length() > 400000 )
+        return QImage();
+    QByteArray png;
+    QCString encoded = dataURL.mid( sizeof( prefix ) - 1 ).latin1();
+    KCodecs::base64Decode( encoded, png );
+    static const unsigned char signature[] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    if ( png.size() < 24 || memcmp( png.data(), signature, sizeof( signature ) ) != 0
+         || memcmp( png.data() + 12, "IHDR", 4 ) != 0 )
+        return QImage();
+    const unsigned char* header = reinterpret_cast<const unsigned char*>( png.data() );
+    unsigned long width = ( (unsigned long)header[16] << 24 ) | ( header[17] << 16 ) | ( header[18] << 8 ) | header[19];
+    unsigned long height = ( (unsigned long)header[20] << 24 ) | ( header[21] << 16 ) | ( header[22] << 8 ) | header[23];
+    if ( width == 0 || height == 0 || width > appNotificationIconMax || height > appNotificationIconMax )
+        return QImage();
+    QImage image;
+    if ( !image.loadFromData( png, "PNG" ) || image.width() != int( width ) || image.height() != int( height ) )
+        return QImage();
+    return image;
 }
 
 // navigator.permissions.query(): what the user answered before, for
@@ -2431,17 +2598,51 @@ void KWPEWidget::activateNotification( int id )
         webkit_notification_clicked( it.data() );
 }
 
+// In the page's order; one waiting for its picture holds the later ones.
 void KWPEWidget::emitNotifications()
 {
+    // Pictures of notifications WebKit did not show (denied): gone.
+    for ( QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
+          icon != d->notificationIcons.end(); ) {
+        int age = ( *icon ).announced.elapsed();
+        if ( ( *icon ).id == 0 && ( age < 0 || age > 10000 ) )
+            icon = d->notificationIcons.remove( icon );
+        else
+            ++icon;
+    }
     QGuardedPtr<KWPEWidget> self( this );
     while ( self && !d->notificationsToShow.isEmpty() ) {
         int id = d->notificationsToShow.first();
-        d->notificationsToShow.remove( d->notificationsToShow.begin() );
         QMap<int, WebKitNotification*>::ConstIterator it = d->notifications.find( id );
-        if ( it == d->notifications.end() )
+        if ( it == d->notifications.end() ) {
+            d->notificationsToShow.remove( d->notificationsToShow.begin() );
             continue;   // closed meanwhile
-        emit notificationShown( id, QString::fromUtf8( webkit_notification_get_title( it.data() ) ),
-                                QString::fromUtf8( webkit_notification_get_body( it.data() ) ) );
+        }
+        QString title = QString::fromUtf8( webkit_notification_get_title( it.data() ) );
+        QString body = QString::fromUtf8( webkit_notification_get_body( it.data() ) );
+        QString tag = QString::fromUtf8( webkit_notification_get_tag( it.data() ) );
+        QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
+        for ( ; icon != d->notificationIcons.end(); ++icon )
+            if ( ( *icon ).id == id
+                 || ( ( *icon ).id == 0 && ( *icon ).title == title && ( *icon ).body == body && ( *icon ).tag == tag ) )
+                break;
+        QImage image;
+        if ( icon != d->notificationIcons.end() ) {
+            ( *icon ).id = id;
+            if ( !( *icon ).done ) {
+                int waited = ( *icon ).announced.elapsed();
+                if ( waited >= 0 && waited < 2000 ) {
+                    QTimer::singleShot( 2000 - waited + 10, this, SLOT( emitNotifications() ) );
+                    return;
+                }
+            }
+            image = ( *icon ).image;
+            d->notificationIcons.remove( icon );
+        }
+        d->notificationsToShow.remove( d->notificationsToShow.begin() );
+        emit notificationShown( id, title, body );
+        if ( self )
+            emit notificationShown( id, title, body, image );
     }
 }
 

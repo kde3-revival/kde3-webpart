@@ -194,6 +194,8 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     if ( m_app ) {
         connect( m_view, SIGNAL( notificationShown( int, const QString&, const QString& ) ),
                  SIGNAL( notificationShown( int, const QString&, const QString& ) ) );
+        connect( m_view, SIGNAL( notificationShown( int, const QString&, const QString&, const QImage& ) ),
+                 SIGNAL( notificationShown( int, const QString&, const QString&, const QImage& ) ) );
         connect( m_view, SIGNAL( notificationClosed( int ) ), SIGNAL( notificationClosed( int ) ) );
         connect( m_view, SIGNAL( permissionRequested( const QString&, const QString&, bool& ) ),
                  SIGNAL( permissionRequested( const QString&, const QString&, bool& ) ) );

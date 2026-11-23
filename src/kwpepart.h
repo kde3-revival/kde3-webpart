@@ -22,6 +22,7 @@ class KAboutData;
 class KAction;
 class KFindDialog;
 class KToggleAction;
+class QImage;
 class QLabel;
 namespace KParts { class StatusBarExtension; }
 class KWPEWidget;
@@ -122,6 +123,13 @@ signals:
      * with @p id when the user clicks it.  No event loop in a slot.
      */
     void notificationShown( int id, const QString& title, const QString& body );
+    /**
+     * App mode: the same with the notification's picture (a null image
+     * without one), emitted right after the one above: connect one of
+     * them.  Only a picture of the page's own origin or a data:/blob:
+     * URL, drawn by the page's web process (at most 96 pixels).
+     */
+    void notificationShown( int id, const QString& title, const QString& body, const QImage& icon );
     /** App mode: the page closed the notification @p id. */
     void notificationClosed( int id );
     /**

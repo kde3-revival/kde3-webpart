@@ -433,8 +433,15 @@ of its own:
   so is what the view cannot show (PDF too).  Downloads, uploads, the
   page's dialogs and HTTP authentication work as in Konqueror.
 * **Notifications:** the page's Notification API reaches the host as
-  `notificationShown(id, title, body)` (kwhatsapp hands them to KNotify);
-  `activateNotification(id)` gives the page its click.
+  `notificationShown(id, title, body)` and, right after it, the same with
+  the notification's picture, `notificationShown(id, title, body, QImage)`
+  (kwhatsapp shows it in its balloon); `activateNotification(id)` gives the
+  page its click.  WebKit's notification has no icon: a script in the
+  page's world (top frame) wraps the `Notification` constructor and draws
+  `options.icon` into a canvas of at most 96 pixels in the web process,
+  only for a picture of the page's own origin or a `data:`/`blob:` URL;
+  the host decodes a small PNG and fetches nothing.  A notification waits
+  for its picture at most 2 seconds.
 * **Permissions:** every request (notifications, microphone, camera,
   screen, geolocation, others) is `permissionRequested(kind, origin,
   bool& allow)` for the host, outside WebKit's signal.  Only
