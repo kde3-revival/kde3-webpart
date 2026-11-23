@@ -1091,7 +1091,7 @@ class ParseCost
 {
 public:
     ParseCost( const std::string& html, double limit )
-        : m_html( html ), m_limit( limit ), m_work( 0 ), m_textWork( 0 ), m_serial( 0 ),
+        : m_html( html ), m_limit( limit ), m_work( 0 ), m_textWork( 0 ), m_startTags( 0 ), m_serial( 0 ),
           m_foreign( 0 ), m_fakeFormatting( false ), m_frameset( false ), m_commentEnd( "-->" ), m_commentBangEnd( "--!>" ),
           m_cdataEnd( "]]>" ), m_scriptComment( "<!--" )
     {
@@ -1100,6 +1100,7 @@ public:
     // false: the work exceeds the limit (the pass stops there)
     bool run();
     double work() const { return m_work + m_textWork / 8; }
+    size_t startTags() const { return m_startTags; }
 
 private:
     struct Element
@@ -1165,6 +1166,7 @@ private:
     const std::string& m_html;
     double m_limit;
     double m_work, m_textWork;
+    size_t m_startTags;
     unsigned long m_serial;
     unsigned m_foreign;   // svg and math on the stack
     bool m_fakeFormatting;
@@ -1360,6 +1362,7 @@ void ParseCost::endFormatting( const std::string& name )
 void ParseCost::fakeStartTag( const std::string& name )
 {
     charge();
+    ++m_startTags;
     unsigned flags = elementFlags( name );
     if ( flags & Void )
         return;
@@ -1401,6 +1404,7 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
                           bool selfClosing )
 {
     charge();
+    ++m_startTags;
     unsigned flags = elementFlags( name );
     static const std::string font( "font" );
     if ( inForeignContent() ) {
@@ -1864,11 +1868,14 @@ bool ParseCost::run()
 
 } // namespace
 
-// Whether Gumbo would work too much on @p html.
-static bool tooMuchParsing( const std::string& html )
+// Whether Gumbo would work too much on @p html; @p startTags: the start
+// tags in it (for the allocation budget).
+static bool tooMuchParsing( const std::string& html, size_t& startTags )
 {
     ParseCost cost( html, maxParseWork + maxParseWorkPerByte * double( html.size() ) );
-    return !cost.run();
+    bool ok = cost.run();
+    startTags = cost.startTags();
+    return !ok;
 }
 
 // The source text in a <pre>: every character as text, NUL as U+FFFD.
@@ -1934,14 +1941,20 @@ static std::string sourceText( const std::string& html )
 
 std::string sanitizeHtml( const std::string& html, Profile profile, bool external )
 {
-    if ( tooMuchParsing( html ) )
+    size_t startTags = 0;
+    if ( tooMuchParsing( html, startTags ) )
         return sourceText( html );   // not parsed (see maxParseWork)
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
     Allocations arena;
     arena.allocated = 0;
-    // The corpus's newsletters: 5-6 times their size (0.2 MB for 40 KB).
-    arena.budget = 4 * 1024 * 1024 + 16 * html.size();
+    // Gumbo makes an element for each start tag (175-500 bytes with its
+    // attributes and text: KMail's plain text, one <div dir="ltr"> per
+    // line, 450-490 bytes per tag; an empty line, <br>, 175 bytes for 4),
+    // and keeps text and attributes 3-7 times their size (the corpus's
+    // newsletters: 5-6 times theirs).  Elements beyond that are clones of
+    // formatting elements.
+    arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * startTags;
     options.allocator = allocate;
     options.deallocator = deallocate;
     options.userdata = &arena;
