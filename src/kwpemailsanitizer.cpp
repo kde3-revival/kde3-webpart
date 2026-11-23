@@ -13,6 +13,7 @@
 
 #include <gumbo.h>
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -898,85 +899,92 @@ void Serializer::walk( const GumboNode* root )
 
 } // namespace
 
-// Gumbo needs time quadratic in the nesting depth (100000 nested <div>:
-// 12 s, 10000: 0.1 s): a message nested deeper than this (estimated
-// without parsing) is shown as its source text.  WebKit's own parser
-// stops nesting at 512.
-static const unsigned maxEstimatedDepth = 5000;
+// Gumbo's work grows with the depth of its stack of open elements times
+// the number of tags (100000 nested <div>: 12 s), and reconstructing
+// formatting elements multiplies nodes (1000 open <font> before 1000
+// paragraphs: a million elements).  A bound that nothing in the document
+// can lower: D, every start tag of an element that can hold others (not
+// void, not one whose end tag is implied by a sibling: those nest only
+// inside elements that count), times T, every tag; both counted without
+// regard to quotes, comments or raw text (counting too many is safe,
+// skipping one is not).  Above the bound the document is not parsed: it
+// is shown as its source text.  The corpus's newsletters (35-45 KB) have
+// D x T = 2e4-4e4; at 5e6 the worst shapes measured take a few ms.  What
+// the bound cannot see, the nodes Gumbo makes by reconstructing formatting
+// elements, the allocation budget below stops (parseBudget()).
+static const double maxParseWork = 5e6;
 
 static bool isTagNameChar( char c )
 {
     return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '-';
 }
 
-// An upper estimate of the elements' nesting: start tags of elements that
-// need an end tag count up, end tags down; comments and raw text (script,
-// style, ...) are skipped.
-static unsigned estimatedDepth( const std::string& html )
+static bool tooMuchParsing( const std::string& html )
 {
-    static const char* const noEndTag[] = {
+    static const char* const noContentNesting[] = {
         // void
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
         "wbr", "keygen", "basefont", "bgsound", "frame", "image", "isindex",
-        // end tag optional (closed by the next one)
+        // end tag implied by a sibling; nested only inside counted elements
         "p", "li", "dt", "dd", "tr", "td", "th", "tbody", "thead", "tfoot", "colgroup", "option", "optgroup",
         "rt", "rp", "rb", "rtc", "html", "head", "body", 0
     };
-    static const char* const rawText[] = {
-        "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", 0
-    };
-    long depth = 0, max = 0;
-    size_t i = 0, n = html.size();
-    while ( i < n ) {
-        size_t lt = html.find( '<', i );
-        if ( lt == std::string::npos )
-            break;
-        i = lt + 1;
-        if ( html.compare( lt, 4, "<!--" ) == 0 ) {
-            size_t end = html.find( "-->", lt + 4 );
-            i = end == std::string::npos ? n : end + 3;
+    double containers = 0, tags = 0;
+    size_t n = html.size();
+    for ( size_t i = html.find( '<' ); i != std::string::npos && i + 1 < n; i = html.find( '<', i + 1 ) ) {
+        char c = html[i + 1];
+        if ( c == '/' || c == '!' || c == '?' ) {
+            tags += 1;
             continue;
         }
-        bool endTag = i < n && html[i] == '/';
-        if ( endTag )
-            ++i;
-        if ( i >= n || !( ( html[i] >= 'a' && html[i] <= 'z' ) || ( html[i] >= 'A' && html[i] <= 'Z' ) ) )
+        if ( !( ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) ) )
             continue;
-        size_t start = i;
-        while ( i < n && isTagNameChar( html[i] ) )
-            ++i;
-        std::string name = lower( html.substr( start, i - start ) );
-        if ( inList( name, noEndTag ) )
-            continue;
-        if ( endTag ) {
-            if ( depth > 0 )
-                --depth;
-            continue;
-        }
-        if ( inList( name, rawText ) ) {
-            // its text up to its end tag
-            for ( size_t j = html.find( "</", i ); j != std::string::npos; j = html.find( "</", j + 2 ) ) {
-                if ( lower( html.substr( j + 2, name.size() ) ) == name ) {
-                    i = j;
-                    break;
-                }
-            }
-            continue;
-        }
-        if ( ++depth > max )
-            max = depth;
+        tags += 1;
+        size_t end = i + 1;
+        while ( end < n && end - i <= 16 && isTagNameChar( html[end] ) )
+            ++end;
+        if ( !inList( lower( html.substr( i + 1, end - i - 1 ) ), noContentNesting ) )
+            containers += 1;
     }
-    return unsigned( max );
+    return containers * tags > maxParseWork;
 }
 
-// Gumbo's memory, freed in one go after the tree has been written.
-typedef std::unordered_set<void*> Allocations;
+// The source text in a <pre>: every character as text, NUL as U+FFFD.
+static void escapeSource( std::string& out, const std::string& text )
+{
+    for ( size_t i = 0; i < text.size(); ++i ) {
+        switch ( text[i] ) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '\0': out += "\xef\xbf\xbd"; break;
+        default: out += text[i]; break;
+        }
+    }
+}
+
+// Gumbo's memory, freed in one go after the tree has been written, and
+// a budget of what Gumbo may allocate (in all, freed or not): beyond it
+// the parse is abandoned (longjmp out of Gumbo, which is C: no destructors
+// are skipped; everything it allocated is in "pointers") and the document
+// is shown as its source text.
+struct Allocations
+{
+    std::unordered_set<void*> pointers;
+    size_t allocated;
+    size_t budget;
+    jmp_buf abandon;
+};
 
 static void* allocate( void* userdata, size_t size )
 {
+    Allocations* a = static_cast<Allocations*>( userdata );
+    a->allocated += size;
+    if ( a->allocated > a->budget )
+        longjmp( a->abandon, 1 );
     void* p = malloc( size ? size : 1 );
     if ( p )
-        static_cast<Allocations*>( userdata )->insert( p );
+        a->pointers.insert( p );
     return p;
 }
 
@@ -984,31 +992,41 @@ static void deallocate( void* userdata, void* p )
 {
     if ( !p )
         return;
-    static_cast<Allocations*>( userdata )->erase( p );
+    static_cast<Allocations*>( userdata )->pointers.erase( p );
     free( p );
 }
 
 static void freeAll( Allocations* arena )
 {
-    for ( Allocations::const_iterator it = arena->begin(); it != arena->end(); ++it )
+    for ( std::unordered_set<void*>::const_iterator it = arena->pointers.begin(); it != arena->pointers.end(); ++it )
         free( *it );
-    arena->clear();
+    arena->pointers.clear();
+}
+
+static std::string sourceText( const std::string& html )
+{
+    std::string out = "<!DOCTYPE html>\n<html><body><p>[This message is too complex to be shown; its source:]</p><pre>\n";
+    escapeSource( out, html );
+    return out + "</pre></body></html>\n";
 }
 
 std::string sanitizeHtml( const std::string& html, Profile profile, bool external )
 {
-    if ( estimatedDepth( html ) > maxEstimatedDepth ) {
-        // Not parsed (see maxEstimatedDepth): its text, as text.
-        std::string out = "<!DOCTYPE html>\n<html><body><p>[This message is nested too deeply to be shown; its source:]</p><pre>\n";
-        escapeInto( out, html.c_str(), false );
-        return out + "</pre></body></html>\n";
-    }
+    if ( tooMuchParsing( html ) )
+        return sourceText( html );   // not parsed (see maxParseWork)
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
     Allocations arena;
+    arena.allocated = 0;
+    // The corpus's newsletters: 5-6 times their size (0.2 MB for 40 KB).
+    arena.budget = 8 * 1024 * 1024 + 32 * html.size();
     options.allocator = allocate;
     options.deallocator = deallocate;
     options.userdata = &arena;
+    if ( setjmp( arena.abandon ) ) {
+        freeAll( &arena );
+        return sourceText( html );
+    }
     GumboOutput* output = gumbo_parse_with_options( &options, html.data(), html.size() );
     Serializer s( profile, external );
     // The document's mode as Gumbo found it (tables of mails depend on
