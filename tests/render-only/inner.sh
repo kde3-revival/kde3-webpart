@@ -136,6 +136,10 @@ run_one(){ # CONFIG MESSAGE
     if [ $n = 00-control ] || [ $n = deep-flattened ]; then
       { [ "$rendered" = none ] || [ "$rendered" -lt 30000 ]; } && { verdict=FAIL; why="$why not-rendered:$rendered"; }
     fi
+    # every switch of the settings layer exists in this WebKit
+    if grep -q "WebKit has no feature" $d/err; then
+      verdict=FAIL; why="$why $(grep -o 'no feature [A-Za-z]*' $d/err | sort -u | tr ' ' _ | tr '\n' ' ')"
+    fi
     if [ $n = deep-nesting ] || [ $n = deep-flattened ]; then
       [ $completed -ge $k ] || { verdict=FAIL; why="$why completed:$completed/$k"; }
     fi

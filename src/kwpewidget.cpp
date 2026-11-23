@@ -455,21 +455,20 @@ static void compileMailFilters()
     g_object_unref( store );
 }
 
-static void setFeature( WebKitSettings* settings, const char* identifier, bool enabled )
+// @p identifier as WebKitFeature has it: the preference's name without a
+// trailing "Enabled" (BeaconAPIEnabled -> BeaconAPI).  A feature WebKit
+// does not have is reported: a switch that silently does nothing is what
+// happened here before.
+static void setFeature( WebKitSettings* settings, WebKitFeatureList* features, const char* identifier, bool enabled )
 {
-    WebKitFeatureList* features = webkit_settings_get_all_features();
-    bool found = false;
     for ( gsize i = 0; i < webkit_feature_list_get_length( features ); ++i ) {
         WebKitFeature* feature = webkit_feature_list_get( features, i );
         if ( strcmp( webkit_feature_get_identifier( feature ), identifier ) == 0 ) {
             webkit_settings_set_feature_enabled( settings, feature, enabled );
-            found = true;
-            break;
+            return;
         }
     }
-    webkit_feature_list_unref( features );
-    if ( !found && getenv( "KWPE_DEBUG" ) )
-        fprintf( stderr, "kwpe: mail: WebKit has no feature %s\n", identifier );
+    fprintf( stderr, "kwpe: mail: WebKit has no feature %s (not switched off)\n", identifier );
 }
 
 static bool ensureMailWebKit()
@@ -540,15 +539,17 @@ static bool ensureMailWebKit()
     // WebKit 2.54.)  What loads by itself, WebKit's features (all exposed
     // boolean preferences; LinkPreconnect is on by default on GLib):
     static const char* const offFeatures[] = {
-        "LinkPreconnect", "LinkPreconnectEarlyHintsEnabled", "LinkPrefetchEnabled", "LinkPreloadEnabled",
-        "MediaPreloadingEnabled", "SpeculationRulesPrefetchEnabled", "BeaconAPIEnabled", "DownloadAttributeEnabled",
-        "WebSocketEnabled", "WebTransportEnabled", "ServiceWorkersEnabled", "SharedWorkerEnabled",
-        "IndexedDBAPIEnabled", "CacheAPIEnabled", "NotificationsEnabled", "NotificationEventEnabled",
-        "PushAPIEnabled", "GeolocationAPIEnabled", "GamepadsEnabled", "AsyncClipboardAPIEnabled",
-        "BroadcastChannelEnabled", "WebXREnabled", 0
+        "LinkPreconnect", "LinkPreconnectEarlyHints", "LinkPrefetch", "LinkPreload", "MediaPreloading",
+        "SpeculationRulesPrefetch", "BeaconAPI", "DownloadAttribute", "WebSocket", "WebTransport", "ServiceWorkers",
+        "SharedWorker", "IndexedDBAPI", "CacheAPI", "Notifications", "NotificationEvent", "PushAPI",
+        "GeolocationAPI", "Gamepads", "AsyncClipboardAPI", "BroadcastChannel", "WebXR", 0
     };
-    for ( const char* const* f = offFeatures; *f && !mailLayerDisabled( "settings" ); ++f )
-        setFeature( s_mailSettings, *f, false );
+    if ( !mailLayerDisabled( "settings" ) ) {
+        WebKitFeatureList* features = webkit_settings_get_all_features();
+        for ( const char* const* f = offFeatures; *f; ++f )
+            setFeature( s_mailSettings, features, *f, false );
+        webkit_feature_list_unref( features );
+    }
     KWPEWidget::applySettings();
     return true;
 }
