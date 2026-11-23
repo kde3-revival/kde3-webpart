@@ -142,7 +142,10 @@ run_one(){ # CONFIG MESSAGE
     DETECTED_DNS=$((DETECTED_DNS + q)); DETECTED_SYN=$((DETECTED_SYN + syn))
   fi
   if [ "$verdict" != info ]; then
-    if [ "$n" = 00-control ] || [ "$n" = deep-flattened ]; then
+    # deep-flattened proves what the sanitizer keeps of deep content;
+    # without it WebKit gets 1500 levels (its parser stops nesting at 512)
+    # and shows none of the deepest text
+    if [ "$n" = 00-control ] || { [ "$n" = deep-flattened ] && ! echo ",$layers," | grep -q ",sanitizer,"; }; then
       { [ "$rendered" = none ] || [ "$rendered" -lt 30000 ]; } && { verdict=FAIL; why="$why not-rendered:$rendered"; }
     fi
     # every switch of the settings layer exists in this WebKit
