@@ -14,10 +14,14 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <qapplication.h>
 #include <qclipboard.h>
@@ -2434,6 +2438,52 @@ void KWPEWidget::startDownloads()
 
 static const unsigned maxDropBytes = 64 * 1024 * 1024;
 
+enum DropRead { DropReadOk, DropReadTooLarge, DropReadFailed };
+
+// The whole regular file @p path, if it has at most @p limit bytes: the
+// size of the opened file (64 bits), at most @p limit + 1 bytes read, a
+// short or failed read is an error.
+static DropRead readDroppedFile( const QString& path, unsigned long long limit, QByteArray* data, time_t* modified )
+{
+    int fd = ::open( QFile::encodeName( path ).data(), O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK );
+    if ( fd < 0 )
+        return DropReadFailed;
+    struct stat st;
+    if ( fstat( fd, &st ) != 0 || !S_ISREG( st.st_mode ) || st.st_size < 0 ) {
+        ::close( fd );
+        return DropReadFailed;
+    }
+    if ( (unsigned long long)st.st_size > limit ) {
+        ::close( fd );
+        return DropReadTooLarge;
+    }
+    size_t size = size_t( st.st_size );
+    if ( !data->resize( size ) ) {
+        ::close( fd );
+        return DropReadFailed;
+    }
+    size_t done = 0;
+    while ( done < size ) {
+        ssize_t got = ::read( fd, data->data() + done, size - done );
+        if ( got < 0 && errno == EINTR )
+            continue;
+        if ( got <= 0 )
+            break;
+        done += size_t( got );
+    }
+    // The file grew since fstat(): one more byte must not be there.
+    char extra;
+    ssize_t more;
+    do
+        more = ::read( fd, &extra, 1 );
+    while ( more < 0 && errno == EINTR );
+    ::close( fd );
+    if ( done != size || more != 0 )
+        return more > 0 ? DropReadTooLarge : DropReadFailed;
+    *modified = st.st_mtime;
+    return DropReadOk;
+}
+
 static bool droppedFiles( QMimeSource* source, QStringList* files )
 {
     QStringList list;
@@ -2513,24 +2563,24 @@ void KWPEWidget::dropEvent( QDropEvent* e )
 
     GVariantBuilder list;
     g_variant_builder_init( &list, G_VARIANT_TYPE( "a{sv}" ) );
-    Q_ULLONG total = 0;
+    unsigned long long total = 0;
     int n = 0;
     for ( QStringList::ConstIterator it = files.begin(); it != files.end(); ++it ) {
-        QFile file( *it );
         QFileInfo info( *it );
-        total += info.size();
-        if ( total > maxDropBytes ) {
-            emit statusMessage( i18n( "Files of more than %1 MB cannot be dropped here; use the page's own button "
-                                      "to attach them." ).arg( maxDropBytes / 1024 / 1024 ) );
+        QByteArray data;
+        time_t modified = 0;
+        // What is read is bounded, not what the name said a moment ago.
+        DropRead result = readDroppedFile( *it, maxDropBytes - total, &data, &modified );
+        if ( result != DropReadOk ) {
+            if ( result == DropReadTooLarge )
+                emit statusMessage( i18n( "Files of more than %1 MB cannot be dropped here; use the page's own button "
+                                          "to attach them." ).arg( maxDropBytes / 1024 / 1024 ) );
+            else
+                emit statusMessage( i18n( "Cannot read %1" ).arg( *it ) );
             g_variant_builder_clear( &list );
             return;
         }
-        if ( !file.open( IO_ReadOnly ) ) {
-            emit statusMessage( i18n( "Cannot read %1" ).arg( *it ) );
-            g_variant_builder_clear( &list );
-            return;
-        }
-        QByteArray data = file.readAll();
+        total += data.size();
         QCString base64 = KCodecs::base64Encode( data, false );
         QString mimeType = KMimeType::findByPath( *it, 0, false )->name();
         if ( mimeType == KMimeType::defaultMimeType() )
@@ -2539,7 +2589,7 @@ void KWPEWidget::dropEvent( QDropEvent* e )
         g_variant_builder_init( &entry, G_VARIANT_TYPE( "a{sv}" ) );
         g_variant_builder_add( &entry, "{sv}", "name", g_variant_new_string( info.fileName().utf8().data() ) );
         g_variant_builder_add( &entry, "{sv}", "type", g_variant_new_string( mimeType.utf8().data() ) );
-        g_variant_builder_add( &entry, "{sv}", "modified", g_variant_new_double( double( info.lastModified().toTime_t() ) * 1000.0 ) );
+        g_variant_builder_add( &entry, "{sv}", "modified", g_variant_new_double( double( modified ) * 1000.0 ) );
         g_variant_builder_add( &entry, "{sv}", "data", g_variant_new_string( base64.isNull() ? "" : base64.data() ) );
         g_variant_builder_add( &list, "{sv}", QString::number( n++ ).latin1(), g_variant_builder_end( &entry ) );
     }

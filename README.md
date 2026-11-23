@@ -445,7 +445,8 @@ of its own:
   events at that point with a `DataTransfer` of `File` objects, made in
   the part's script world (the page's listeners see them like any drop;
   `isTrusted` is false).  The bytes travel as base64 in the script's
-  arguments: 64 MB at most per drop (the page's own file chooser has no
+  arguments: 64 MB at most per drop (counted on the opened files, read
+  with that bound; a short or failed read refuses the drop) (the page's own file chooser has no
   limit).
 * **Signals and slots for the host:** `pageTitleChanged()`,
   `statusMessage()` (a dropped file the page did not take, a crash), the
