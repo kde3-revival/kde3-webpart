@@ -22,7 +22,10 @@
 #include <qapplication.h>
 #include <qclipboard.h>
 #include <qcursor.h>
+#include <qdragobject.h>
+#include <qdatetime.h>
 #include <qdir.h>
+#include <qfileinfo.h>
 #include <qguardedptr.h>
 #include <qfile.h>
 #include <qmap.h>
@@ -31,6 +34,8 @@
 #include <qevent.h>
 
 #include <kglobal.h>
+#include <kmdcodec.h>
+#include <ksimpleconfig.h>
 #include <kio/passdlg.h>
 #include <klocale.h>
 #include <kmimetype.h>
@@ -555,6 +560,125 @@ static bool ensureMailWebKit()
     return true;
 }
 
+// ---------------------------------------------------------------------
+// app mode (an application around one web site, e.g. kwhatsapp)
+//
+// One WebKit context, network session and settings per data directory:
+// the application's own web processes, cookies, website data (its login
+// stays across restarts), separate from Konqueror's and KMail's.  The
+// notification permissions the user gave are kept there too (WebKit asks
+// for them when a web process starts).
+
+struct KWPEAppWebKit
+{
+    QString dataDir;
+    WebKitWebContext* context;
+    WebKitNetworkSession* session;
+    WebKitSettings* settings;
+    QStringList allowedNotifications;   // origins (scheme://host[:port])
+    QStringList deniedNotifications;
+};
+typedef QMap<QString, KWPEAppWebKit*> KWPEAppWebKits;
+static KWPEAppWebKits* s_apps = 0;   // data directory -> its WebKit
+
+static const char appPermissionsFile[] = "kwpepart-permissions";
+
+static void loadAppPermissions( KWPEAppWebKit* app )
+{
+    KSimpleConfig config( app->dataDir + appPermissionsFile, true );
+    config.setGroup( "Notifications" );
+    app->allowedNotifications = config.readListEntry( "Allowed" );
+    app->deniedNotifications = config.readListEntry( "Denied" );
+}
+
+static void saveAppPermissions( KWPEAppWebKit* app )
+{
+    KSimpleConfig config( app->dataDir + appPermissionsFile );
+    config.setGroup( "Notifications" );
+    config.writeEntry( "Allowed", app->allowedNotifications );
+    config.writeEntry( "Denied", app->deniedNotifications );
+    config.sync();
+}
+
+static GList* securityOrigins( const QStringList& origins )
+{
+    GList* list = 0;
+    for ( QStringList::ConstIterator it = origins.begin(); it != origins.end(); ++it )
+        list = g_list_prepend( list, webkit_security_origin_new_for_uri( ( *it ).utf8().data() ) );
+    return list;
+}
+
+// WebKit asks when it starts a web process: Notification.permission
+// is "granted" at once for the origins the user allowed before.
+static void onInitializeNotificationPermissions( WebKitWebContext* context, gpointer data )
+{
+    KWPEAppWebKit* app = static_cast<KWPEAppWebKit*>( data );
+    GList* allowed = securityOrigins( app->allowedNotifications );
+    GList* denied = securityOrigins( app->deniedNotifications );
+    webkit_web_context_initialize_notification_permissions( context, allowed, denied );
+    g_list_free_full( allowed, (GDestroyNotify)webkit_security_origin_unref );
+    g_list_free_full( denied, (GDestroyNotify)webkit_security_origin_unref );
+}
+
+static QString originOf( const char* uri )
+{
+    if ( !uri )
+        return QString::null;
+    WebKitSecurityOrigin* origin = webkit_security_origin_new_for_uri( uri );
+    char* text = webkit_security_origin_to_string( origin );
+    QString result = text ? QString::fromUtf8( text ) : QString::null;
+    g_free( text );
+    webkit_security_origin_unref( origin );
+    return result;
+}
+
+static KWPEAppWebKit* ensureAppWebKit( const KWPEAppOptions& options )
+{
+    if ( !ensureDisplay() || options.dataDir.isEmpty() )
+        return 0;
+    QString dataDir = options.dataDir.endsWith( "/" ) ? options.dataDir : options.dataDir + "/";
+    if ( !s_apps )
+        s_apps = new KWPEAppWebKits;
+    KWPEAppWebKits::ConstIterator it = s_apps->find( dataDir );
+    if ( it != s_apps->end() )
+        return it.data();
+    if ( !KStandardDirs::makeDir( dataDir, 0700 ) && !QFile::exists( dataDir ) )
+        return 0;
+    QString cacheDir = options.cacheDir.isEmpty() ? dataDir + "cache/" : options.cacheDir;
+
+    KWPEAppWebKit* app = new KWPEAppWebKit;
+    app->dataDir = dataDir;
+    loadAppPermissions( app );
+    app->session = webkit_network_session_new( QFile::encodeName( dataDir ).data(), QFile::encodeName( cacheDir ).data() );
+    webkit_cookie_manager_set_persistent_storage( webkit_network_session_get_cookie_manager( app->session ),
+                                                  QFile::encodeName( dataDir + "cookies.sqlite" ).data(),
+                                                  WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE );
+    // A site that works as an application keeps its cookies (the login).
+    webkit_cookie_manager_set_accept_policy( webkit_network_session_get_cookie_manager( app->session ),
+                                             WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY );
+    g_signal_connect( app->session, "download-started", G_CALLBACK( onDownloadStarted ), 0 );
+    webkit_network_session_set_tls_errors_policy( app->session, WEBKIT_TLS_ERRORS_POLICY_FAIL );
+
+    app->context = webkit_web_context_new();
+    // One application, no back/forward page cache to keep.
+    webkit_web_context_set_cache_model( app->context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER );
+    g_signal_connect( app->context, "initialize-notification-permissions",
+                      G_CALLBACK( onInitializeNotificationPermissions ), app );
+
+    app->settings = webkit_settings_new();
+    if ( !options.userAgent.isEmpty() )
+        webkit_settings_set_user_agent( app->settings, options.userAgent.utf8().data() );
+    webkit_settings_set_enable_developer_extras( app->settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
+    webkit_settings_set_allow_file_access_from_file_urls( app->settings, FALSE );
+    webkit_settings_set_allow_universal_access_from_file_urls( app->settings, FALSE );
+    webkit_settings_set_javascript_can_open_windows_automatically( app->settings, FALSE );
+    webkit_settings_set_javascript_can_access_clipboard( app->settings, FALSE );
+    webkit_settings_set_enable_2d_canvas_acceleration( app->settings, envFlag( "KWPE_CANVAS_ACCELERATION" ) );
+    s_apps->insert( dataDir, app );
+    KWPEWidget::applySettings();
+    return app;
+}
+
 // The heights of the message's frames (its HTML parts): their documents'
 // heights, kept up to date (images, fonts, a narrower window), so the
 // view scrolls as one page.  The document stays hidden (mailHideStyle)
@@ -651,7 +775,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
-          mailFilterAdded( false ), mailAtBottom( true ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationSerial( 0 ), menuEditable( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -679,6 +803,15 @@ public:
     static void onMailState( WebKitUserContentManager*, JSCValue* value, gpointer data );
     void forgetMailHosts( bool all );
     bool isMail() const { return mode == KWPEWidget::Mail; }
+    bool isApp() const { return mode == KWPEWidget::App; }
+    bool isBrowser() const { return mode == KWPEWidget::Browser; }
+    gboolean decideAppPolicy( WebKitPolicyDecision* decision, WebKitPolicyDecisionType type );
+    bool isAppSite( const QString& host ) const;
+    static gboolean onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data );
+    static void onNotificationClosed( WebKitNotification* notification, gpointer data );
+    void forgetNotifications();
+    static gboolean onQueryPermissionState( WebKitWebView*, WebKitPermissionStateQuery* query, gpointer data );
+    static void onDropDone( GObject* view, GAsyncResult* result, gpointer data );
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
@@ -714,6 +847,22 @@ public:
     bool mailAtBottom;         // reported by our script (atBottom())
     QString mailSelection;     // ... (selectedText())
     QStringList activatedLinks;   // for the host, outside WebKit's signal
+
+    // app mode
+    KWPEAppOptions appOptions;
+    KWPEAppWebKit* app;
+    struct PendingPermission
+    {
+        WebKitPermissionRequest* request;   // ref
+        QString kind;
+        QString origin;
+    };
+    QValueList<PendingPermission> pendingPermissions;   // for the host, outside WebKit's signal
+    QMap<int, WebKitNotification*> notifications;   // shown by the page, not closed yet (ref)
+    QValueList<int> notificationsToShow;   // for the host, outside WebKit's signal
+    int notificationSerial;
+    QStringList pendingDownloads;   // new windows of blob: and data: URLs
+    bool menuEditable;   // the context menu was asked for over a text field
     WebKitWebView* view;
     WPEView* wpeView;
     WPEToplevel* toplevel;
@@ -794,8 +943,13 @@ void KWPEWidgetPrivate::setCursorName( const char* name )
 
 void KWPEWidgetPrivate::create()
 {
-    if ( isMail() ? !ensureMailWebKit() : !ensureWebKit() )
+    if ( isApp() ) {
+        app = ensureAppWebKit( appOptions );
+        if ( !app )
+            return;
+    } else if ( isMail() ? !ensureMailWebKit() : !ensureWebKit() ) {
         return;
+    }
 
     // A content manager per view: the ad blocker's filters are attached
     // to it or not, depending on the site the view shows.  Mail: our
@@ -822,18 +976,27 @@ void KWPEWidgetPrivate::create()
             webkit_user_content_manager_add_filter( contentManager, s_mailFilter[viewExternal ? 1 : 0] );
     }
     WebKitNetworkSession* session = s_session;
-    if ( isMail() )
+    WebKitWebContext* context = s_context;
+    WebKitSettings* settings = s_settings;
+    if ( isMail() ) {
         session = mailExternalSession ? mailExternalSession : s_mailSession;
+        context = s_mailContext;
+        settings = s_mailSettings;
+    } else if ( isApp() ) {
+        session = app->session;
+        context = app->context;
+        settings = app->settings;
+    }
     view = WEBKIT_WEB_VIEW( g_object_new( WEBKIT_TYPE_WEB_VIEW,
                                           "display", s_display,
-                                          "web-context", isMail() ? s_mailContext : s_context,
+                                          "web-context", context,
                                           "network-session", session,
-                                          "settings", isMail() ? s_mailSettings : s_settings,
+                                          "settings", settings,
                                           "user-content-manager", contentManager,
                                           NULL ) );
-    if ( !isMail() ) {
+    if ( isBrowser() ) {
         KWPEAdBlock::self()->addView( contentManager );
-    } else {
+    } else if ( isMail() ) {
         // A frame without content yet (the first one, one of a new size)
         // is white like a message, not transparent (black on X).
         WebKitColor white = { 1.0, 1.0, 1.0, 1.0 };
@@ -868,6 +1031,10 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
     g_signal_connect( view, "run-file-chooser", G_CALLBACK( onRunFileChooser ), this );
     g_signal_connect( view, "script-dialog", G_CALLBACK( onScriptDialog ), this );
+    if ( isApp() ) {
+        g_signal_connect( view, "show-notification", G_CALLBACK( onShowNotification ), this );
+        g_signal_connect( view, "query-permission-state", G_CALLBACK( onQueryPermissionState ), this );
+    }
 
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
@@ -922,8 +1089,15 @@ void KWPEWidgetPrivate::destroy()
     frameCallback = 0;
     g_object_unref( view );
     g_object_unref( toplevel );
-    if ( !isMail() )
+    if ( isBrowser() )
         KWPEAdBlock::self()->removeView( contentManager );
+    forgetNotifications();
+    QValueList<PendingPermission> permissions = pendingPermissions;
+    pendingPermissions.clear();
+    for ( QValueList<PendingPermission>::Iterator it = permissions.begin(); it != permissions.end(); ++it ) {
+        webkit_permission_request_deny( ( *it ).request );
+        g_object_unref( ( *it ).request );
+    }
     g_signal_handlers_disconnect_by_data( contentManager, this );
     g_object_unref( contentManager );
     contentManager = 0;
@@ -1004,9 +1178,9 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         // response).  WebKit decides which elements to hide when it
         // requests the page: if the filters were switched later, the
         // page is loaded once more, with the right ones.
-        if ( !d->isMail() )
+        if ( d->isBrowser() )
             KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() );
-        else if ( KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() == d->mailHost )
+        else if ( d->isMail() && KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() == d->mailHost )
             d->forgetMailHosts( false );   // the previous message is gone from the view
         if ( d->reloadForFilters ) {
             d->reloadForFilters = false;
@@ -1162,6 +1336,8 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     if ( d->isMail() )
         return d->decideMailPolicy( decision, type );
+    if ( d->isApp() )
+        return d->decideAppPolicy( decision, type );
 
     if ( type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION ) {
         WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(
@@ -1311,6 +1487,135 @@ void KWPEWidgetPrivate::activateLink( const char* uri )
     QTimer::singleShot( 0, q, SLOT( emitExternalURL() ) );
 }
 
+// App mode: the application's own sites stay in the view; a link the
+// user follows to another site, a new window (target=_blank,
+// window.open() after a click), a scheme WebKit does not load (mailto:,
+// tel:, ...) go to the host (its browser, its mail program).  A new
+// window of a blob: or data: URL (a file the page made) is downloaded:
+// nothing outside the page can read it.  What the view cannot show is
+// downloaded (KDE's save dialog), PDF too: the application's page stays.
+gboolean KWPEWidgetPrivate::decideAppPolicy( WebKitPolicyDecision* decision, WebKitPolicyDecisionType type )
+{
+    if ( type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE ) {
+        WebKitResponsePolicyDecision* response = WEBKIT_RESPONSE_POLICY_DECISION( decision );
+        if ( !webkit_response_policy_decision_is_main_frame_main_resource( response ) )
+            return FALSE;
+        const char* mimeType = webkit_uri_response_get_mime_type( webkit_response_policy_decision_get_response( response ) );
+        if ( g_strcmp0( mimeType, "application/pdf" ) == 0 || !webkit_response_policy_decision_is_mime_type_supported( response ) ) {
+            webkit_policy_decision_download( decision );
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION( decision ) );
+    const char* uri = webkit_uri_request_get_uri( webkit_navigation_action_get_request( action ) );
+    WebKitNavigationType navigation = webkit_navigation_action_get_navigation_type( action );
+    bool byUser = navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED || webkit_navigation_action_is_user_gesture( action );
+    bool local = g_ascii_strncasecmp( uri, "blob:", 5 ) == 0 || g_ascii_strncasecmp( uri, "data:", 5 ) == 0;
+
+    if ( type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION
+         || ( navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED && webkit_navigation_action_get_mouse_button( action ) == 2 ) ) {
+        webkit_policy_decision_ignore( decision );
+        if ( local ) {
+            pendingDownloads.append( QString::fromUtf8( uri ) );
+            QTimer::singleShot( 0, q, SLOT( startDownloads() ) );
+        } else if ( g_ascii_strncasecmp( uri, "javascript:", 11 ) != 0 && g_ascii_strncasecmp( uri, "about:", 6 ) != 0 ) {
+            activateLink( uri );
+        }
+        return TRUE;
+    }
+
+    if ( !isWebKitScheme( uri ) ) {
+        webkit_policy_decision_ignore( decision );
+        if ( byUser )
+            activateLink( uri );
+        return TRUE;
+    }
+
+    KURL target( QString::fromUtf8( uri ) );
+    bool web = target.protocol() == "http" || target.protocol() == "https";
+    if ( web && byUser && navigation != WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED
+         && navigation != WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED && !isAppSite( target.host() ) ) {
+        webkit_policy_decision_ignore( decision );
+        activateLink( uri );
+        return TRUE;
+    }
+    return FALSE;
+}
+
+bool KWPEWidgetPrivate::isAppSite( const QString& host ) const
+{
+    return appOptions.sites.contains( host.lower() );
+}
+
+// The page's notification: for the host (KNotify), outside WebKit's
+// signal.  Kept (referenced) until it is closed, for its click.
+gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // A long-running page: the oldest go (their clicks do nothing then).
+    while ( d->notifications.count() >= 100 ) {
+        QMap<int, WebKitNotification*>::Iterator oldest = d->notifications.begin();
+        g_signal_handlers_disconnect_by_data( oldest.data(), d );
+        g_object_unref( oldest.data() );
+        d->notifications.remove( oldest );
+    }
+    int id = ++d->notificationSerial;
+    g_object_ref( notification );
+    d->notifications.insert( id, notification );
+    g_signal_connect( notification, "closed", G_CALLBACK( onNotificationClosed ), d );
+    d->notificationsToShow.append( id );
+    QTimer::singleShot( 0, d->q, SLOT( emitNotifications() ) );
+    return TRUE;
+}
+
+void KWPEWidgetPrivate::onNotificationClosed( WebKitNotification* notification, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    for ( QMap<int, WebKitNotification*>::Iterator it = d->notifications.begin(); it != d->notifications.end(); ++it ) {
+        if ( it.data() != notification )
+            continue;
+        int id = it.key();
+        g_signal_handlers_disconnect_by_data( notification, d );
+        d->notifications.remove( it );
+        g_object_unref( notification );
+        d->notificationsToShow.remove( id );
+        emit d->q->notificationClosed( id );
+        return;
+    }
+}
+
+void KWPEWidgetPrivate::forgetNotifications()
+{
+    for ( QMap<int, WebKitNotification*>::Iterator it = notifications.begin(); it != notifications.end(); ++it ) {
+        g_signal_handlers_disconnect_by_data( it.data(), this );
+        g_object_unref( it.data() );
+    }
+    notifications.clear();
+    notificationsToShow.clear();
+}
+
+// navigator.permissions.query(): what the user answered before, for
+// notifications; WebKit's default for the rest.
+gboolean KWPEWidgetPrivate::onQueryPermissionState( WebKitWebView*, WebKitPermissionStateQuery* query, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( g_strcmp0( webkit_permission_state_query_get_name( query ), "notifications" ) != 0 )
+        return FALSE;
+    char* text = webkit_security_origin_to_string( webkit_permission_state_query_get_security_origin( query ) );
+    QString origin = text ? QString::fromUtf8( text ) : QString::null;
+    g_free( text );
+    WebKitPermissionState state = WEBKIT_PERMISSION_STATE_PROMPT;
+    if ( d->app->allowedNotifications.contains( origin ) )
+        state = WEBKIT_PERMISSION_STATE_GRANTED;
+    else if ( d->app->deniedNotifications.contains( origin ) )
+        state = WEBKIT_PERMISSION_STATE_DENIED;
+    webkit_permission_state_query_finish( query, state );
+    return TRUE;
+}
+
 void KWPEWidgetPrivate::onMailState( WebKitUserContentManager*, JSCValue* value, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
@@ -1356,6 +1661,7 @@ gboolean KWPEWidgetPrivate::onContextMenu( WebKitWebView*, WebKitContextMenu*, W
     d->menuImage = webkit_hit_test_result_context_is_image( hit )
         ? QString::fromUtf8( webkit_hit_test_result_get_image_uri( hit ) ) : QString::null;
     d->menuSelection = webkit_hit_test_result_context_is_selection( hit );
+    d->menuEditable = webkit_hit_test_result_context_is_editable( hit );
     // Konqueror's popup menu runs an event loop: not inside WebKit's signal.
     QTimer::singleShot( 0, d->q, SLOT( showContextMenu() ) );
     return TRUE;   // WPE has no menu of its own
@@ -1620,11 +1926,45 @@ void KWPEWidgetPrivate::showPageDialog( QWidget* dialog )
     }
 }
 
-gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView*, WebKitPermissionRequest* request, gpointer )
+gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView* view, WebKitPermissionRequest* request, gpointer data )
 {
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     // Geolocation, camera, microphone, notifications, ...: no UI to ask
-    // the user yet, so no.
-    webkit_permission_request_deny( request );
+    // the user yet, so no.  App mode: the host decides.
+    if ( !d->isApp() ) {
+        webkit_permission_request_deny( request );
+        return TRUE;
+    }
+    PendingPermission pending;
+    pending.origin = originOf( webkit_web_view_get_uri( view ) );
+    if ( WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST( request ) ) {
+        pending.kind = QString::fromLatin1( "notifications" );
+        // Answered before (WebKit asks again in a new web process).
+        if ( d->app->allowedNotifications.contains( pending.origin ) ) {
+            webkit_permission_request_allow( request );
+            return TRUE;
+        }
+        if ( d->app->deniedNotifications.contains( pending.origin ) ) {
+            webkit_permission_request_deny( request );
+            return TRUE;
+        }
+    } else if ( WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST( request ) ) {
+        WebKitUserMediaPermissionRequest* media = WEBKIT_USER_MEDIA_PERMISSION_REQUEST( request );
+        if ( webkit_user_media_permission_is_for_display_device( media ) )
+            pending.kind = QString::fromLatin1( "screen" );
+        else if ( webkit_user_media_permission_is_for_video_device( media ) )
+            pending.kind = QString::fromLatin1( "camera" );
+        else
+            pending.kind = QString::fromLatin1( "microphone" );
+    } else if ( WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST( request ) ) {
+        pending.kind = QString::fromLatin1( "geolocation" );
+    } else {
+        pending.kind = QString::fromLatin1( "other" );
+    }
+    pending.request = WEBKIT_PERMISSION_REQUEST( g_object_ref( request ) );
+    d->pendingPermissions.append( pending );
+    // The host may ask the user (an event loop): not inside WebKit's signal.
+    QTimer::singleShot( 0, d->q, SLOT( askPermissions() ) );
     return TRUE;
 }
 
@@ -1653,6 +1993,22 @@ KWPEWidget::KWPEWidget( QWidget* parent, const char* name, Mode mode )
     d->create();
 }
 
+KWPEWidget::KWPEWidget( QWidget* parent, const char* name, const KWPEAppOptions& options )
+    : QWidget( parent, name, WRepaintNoErase | WResizeNoErase )
+{
+    d = new KWPEWidgetPrivate( this, App );
+    d->appOptions = options;
+    for ( QStringList::Iterator it = d->appOptions.sites.begin(); it != d->appOptions.sites.end(); ++it )
+        *it = ( *it ).lower();
+    setBackgroundMode( NoBackground );
+    setFocusPolicy( StrongFocus );
+    setMouseTracking( true );
+    // WPE has no drag and drop: local files dropped here go to the page
+    // as a drop of its own (dropEvent()).
+    setAcceptDrops( true );
+    d->create();
+}
+
 KWPEWidget::~KWPEWidget()
 {
     d->destroy();
@@ -1677,6 +2033,12 @@ void KWPEWidget::load( const QString& url )
         return;
     if ( d->isMail() ) {
         // The host gives files (loadMailFile()); nothing else is loaded.
+        return;
+    }
+    if ( d->isApp() ) {
+        if ( d->appOptions.sites.isEmpty() )
+            d->appOptions.sites.append( KURL( url ).host().lower() );
+        webkit_web_view_load_uri( d->view, url.utf8().data() );
         return;
     }
     // The filters for the site, before WebKit requests the page.
@@ -1942,6 +2304,213 @@ void KWPEWidget::copySelection()
                                              KWPEWidgetPrivate::onSelectionText, 0 );
 }
 
+void KWPEWidget::cut()
+{
+    if ( d->view )
+        webkit_web_view_execute_editing_command( d->view, WEBKIT_EDITING_COMMAND_CUT );
+}
+
+void KWPEWidget::paste()
+{
+    if ( !d->view )
+        return;
+    // The X CLIPBOARD for WebKit's paste (as for Ctrl+V).
+    KWPEClipboard::preparePaste( QClipboard::Clipboard );
+    webkit_web_view_execute_editing_command( d->view, WEBKIT_EDITING_COMMAND_PASTE );
+}
+
+bool KWPEWidget::contextMenuOnEditable() const
+{
+    return d->menuEditable;
+}
+
+void KWPEWidget::activateNotification( int id )
+{
+    QMap<int, WebKitNotification*>::ConstIterator it = d->notifications.find( id );
+    if ( it != d->notifications.end() )
+        webkit_notification_clicked( it.data() );
+}
+
+void KWPEWidget::emitNotifications()
+{
+    QGuardedPtr<KWPEWidget> self( this );
+    while ( self && !d->notificationsToShow.isEmpty() ) {
+        int id = d->notificationsToShow.first();
+        d->notificationsToShow.remove( d->notificationsToShow.begin() );
+        QMap<int, WebKitNotification*>::ConstIterator it = d->notifications.find( id );
+        if ( it == d->notifications.end() )
+            continue;   // closed meanwhile
+        emit notificationShown( id, QString::fromUtf8( webkit_notification_get_title( it.data() ) ),
+                                QString::fromUtf8( webkit_notification_get_body( it.data() ) ) );
+    }
+}
+
+void KWPEWidget::askPermissions()
+{
+    QGuardedPtr<KWPEWidget> self( this );
+    while ( self && !d->pendingPermissions.isEmpty() ) {
+        KWPEWidgetPrivate::PendingPermission pending = d->pendingPermissions.first();
+        d->pendingPermissions.remove( d->pendingPermissions.begin() );
+        bool allow = false;
+        emit permissionRequested( pending.kind, pending.origin, allow );
+        // Answered even if the widget went meanwhile (destroy() denied
+        // only those still in the list).
+        if ( allow )
+            webkit_permission_request_allow( pending.request );
+        else
+            webkit_permission_request_deny( pending.request );
+        g_object_unref( pending.request );
+        if ( self && pending.kind == "notifications" && !pending.origin.isEmpty() ) {
+            KWPEAppWebKit* app = d->app;
+            app->allowedNotifications.remove( pending.origin );
+            app->deniedNotifications.remove( pending.origin );
+            ( allow ? app->allowedNotifications : app->deniedNotifications ).append( pending.origin );
+            saveAppPermissions( app );
+        }
+    }
+}
+
+void KWPEWidget::startDownloads()
+{
+    QStringList urls = d->pendingDownloads;
+    d->pendingDownloads.clear();
+    for ( QStringList::ConstIterator it = urls.begin(); it != urls.end(); ++it )
+        downloadURL( *it );
+}
+
+// ---------------------------------------------------------------------
+// App mode: files dropped on the view.  WPE has no drag and drop of its
+// own; the page gets the files as a drop at that point: dragenter,
+// dragover and drop events with a DataTransfer of File objects, made in
+// our script world (the page's listeners see them as any drop).  The
+// files' bytes travel as base64 in the script's arguments: up to
+// maxDropBytes together (the page's own file chooser has no such limit).
+
+static const unsigned maxDropBytes = 64 * 1024 * 1024;
+
+static bool droppedFiles( QMimeSource* source, QStringList* files )
+{
+    QStringList list;
+    if ( !QUriDrag::canDecode( source ) || !QUriDrag::decodeLocalFiles( source, list ) || list.isEmpty() )
+        return false;
+    for ( QStringList::ConstIterator it = list.begin(); it != list.end(); ++it ) {
+        QFileInfo info( *it );
+        if ( !info.isFile() || !info.isReadable() )
+            return false;
+    }
+    if ( files )
+        *files = list;
+    return true;
+}
+
+void KWPEWidget::dragEnterEvent( QDragEnterEvent* e )
+{
+    e->accept( d->isApp() && d->view && droppedFiles( e, 0 ) );
+}
+
+void KWPEWidget::dragMoveEvent( QDragMoveEvent* e )
+{
+    e->accept( d->isApp() && d->view && droppedFiles( e, 0 ) );
+}
+
+void KWPEWidgetPrivate::onDropDone( GObject* view, GAsyncResult* result, gpointer data )
+{
+    GError* error = 0;
+    JSCValue* value = webkit_web_view_call_async_javascript_function_finish( WEBKIT_WEB_VIEW( view ), result, &error );
+    if ( !value ) {
+        // Cancelled: the widget is gone (data is too).
+        if ( !g_error_matches( error, G_IO_ERROR, G_IO_ERROR_CANCELLED ) ) {
+            fprintf( stderr, "kwpe: drop: %s\n", error ? error->message : "?" );
+            emit static_cast<KWPEWidgetPrivate*>( data )->q->statusMessage( i18n( "The files could not be dropped on the page." ) );
+        }
+        g_clear_error( &error );
+        return;
+    }
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( !jsc_value_to_boolean( value ) )
+        emit d->q->statusMessage( i18n( "The page did not take the dropped files." ) );
+    g_object_unref( value );
+}
+
+void KWPEWidget::dropEvent( QDropEvent* e )
+{
+    QStringList files;
+    if ( !d->isApp() || !d->view || !droppedFiles( e, &files ) ) {
+        e->ignore();
+        return;
+    }
+    e->accept();
+    static const char script[] =
+        "var dt = new DataTransfer(), keys = Object.keys(files).sort(function(a, b) { return a - b; });"
+        "for (var i = 0; i < keys.length; i++) {"
+        "  var f = files[keys[i]], bytes;"
+        "  if (Uint8Array.fromBase64) {"
+        "    bytes = Uint8Array.fromBase64(f.data);"
+        "  } else {"
+        "    var bin = atob(f.data);"
+        "    bytes = new Uint8Array(bin.length);"
+        "    for (var j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);"
+        "  }"
+        "  dt.items.add(new File([bytes], f.name, { type: f.type, lastModified: f.modified }));"
+        "}"
+        "var target = document.elementFromPoint(x, y) || document.body || document.documentElement;"
+        "function fire(type) {"
+        "  var e = new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y,"
+        "                               dataTransfer: dt });"
+        "  return target.dispatchEvent(e);"
+        "}"
+        "fire('dragenter');"
+        "fire('dragover');"
+        // Taken: the page called preventDefault() on the drop.
+        "return !fire('drop');";
+
+    GVariantBuilder list;
+    g_variant_builder_init( &list, G_VARIANT_TYPE( "a{sv}" ) );
+    Q_ULLONG total = 0;
+    int n = 0;
+    for ( QStringList::ConstIterator it = files.begin(); it != files.end(); ++it ) {
+        QFile file( *it );
+        QFileInfo info( *it );
+        total += info.size();
+        if ( total > maxDropBytes ) {
+            emit statusMessage( i18n( "Files of more than %1 MB cannot be dropped here; use the page's own button "
+                                      "to attach them." ).arg( maxDropBytes / 1024 / 1024 ) );
+            g_variant_builder_clear( &list );
+            return;
+        }
+        if ( !file.open( IO_ReadOnly ) ) {
+            emit statusMessage( i18n( "Cannot read %1" ).arg( *it ) );
+            g_variant_builder_clear( &list );
+            return;
+        }
+        QByteArray data = file.readAll();
+        QCString base64 = KCodecs::base64Encode( data, false );
+        QString mimeType = KMimeType::findByPath( *it, 0, false )->name();
+        if ( mimeType == KMimeType::defaultMimeType() )
+            mimeType = QString::null;
+        GVariantBuilder entry;
+        g_variant_builder_init( &entry, G_VARIANT_TYPE( "a{sv}" ) );
+        g_variant_builder_add( &entry, "{sv}", "name", g_variant_new_string( info.fileName().utf8().data() ) );
+        g_variant_builder_add( &entry, "{sv}", "type", g_variant_new_string( mimeType.utf8().data() ) );
+        g_variant_builder_add( &entry, "{sv}", "modified", g_variant_new_double( double( info.lastModified().toTime_t() ) * 1000.0 ) );
+        g_variant_builder_add( &entry, "{sv}", "data", g_variant_new_string( base64.isNull() ? "" : base64.data() ) );
+        g_variant_builder_add( &list, "{sv}", QString::number( n++ ).latin1(), g_variant_builder_end( &entry ) );
+    }
+    // CSS pixels of the page's viewport
+    double zoomLevel = webkit_web_view_get_zoom_level( d->view );
+    if ( zoomLevel <= 0 )
+        zoomLevel = 1.0;
+    GVariantBuilder arguments;
+    g_variant_builder_init( &arguments, G_VARIANT_TYPE( "a{sv}" ) );
+    g_variant_builder_add( &arguments, "{sv}", "files", g_variant_builder_end( &list ) );
+    g_variant_builder_add( &arguments, "{sv}", "x", g_variant_new_double( e->pos().x() / zoomLevel ) );
+    g_variant_builder_add( &arguments, "{sv}", "y", g_variant_new_double( e->pos().y() / zoomLevel ) );
+    webkit_web_view_call_async_javascript_function( d->view, script, -1, g_variant_builder_end( &arguments ), "kwpepart", 0,
+                                                    d->cancellable, KWPEWidgetPrivate::onDropDone, d );
+    setActiveWindow();
+    setFocus();
+}
+
 void KWPEWidget::requestSource()
 {
     WebKitWebResource* resource = d->view ? webkit_web_view_get_main_resource( d->view ) : 0;
@@ -2022,7 +2591,7 @@ void KWPEWidget::answerQuietDialogs()
 
 void KWPEWidget::emitExternalURL()
 {
-    if ( d->isMail() ) {
+    if ( d->isMail() || d->isApp() ) {
         // One link per click; the host may delete us while it handles it.
         QStringList links = d->activatedLinks;
         d->activatedLinks.clear();
@@ -2105,7 +2674,7 @@ KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString
     if ( it.data() == webkit_back_forward_list_get_current_item( list ) )
         return HistoryCurrent;
     d->ownBackForward = true;
-    if ( !d->isMail() )
+    if ( d->isBrowser() )
         KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
     webkit_web_view_go_to_back_forward_list_item( d->view, it.data() );
     return HistoryNavigating;
@@ -2113,7 +2682,7 @@ KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString
 
 void KWPEWidget::applySettings()
 {
-    if ( !s_settings && !s_mailSettings )
+    if ( !s_settings && !s_mailSettings && !s_apps )
         return;
     // Animated scrolling lags behind a fast wheel (every notch extends the
     // animation): off unless asked for.  "When efficient": with the GPU
@@ -2125,6 +2694,9 @@ void KWPEWidget::applySettings()
         webkit_settings_set_enable_smooth_scrolling( s_settings, on );
     if ( s_mailSettings )
         webkit_settings_set_enable_smooth_scrolling( s_mailSettings, on );
+    if ( s_apps )
+        for ( KWPEAppWebKits::ConstIterator it = s_apps->begin(); it != s_apps->end(); ++it )
+            webkit_settings_set_enable_smooth_scrolling( it.data()->settings, on );
 }
 
 QString KWPEWidget::bufferPathName()

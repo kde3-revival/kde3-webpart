@@ -22,6 +22,7 @@
 #include <kdebug.h>
 #include <kdemacros.h>
 #include <kfinddialog.h>
+#include <kiconloader.h>
 #include <knotifyclient.h>
 #include <klocale.h>
 #include <kmimetype.h>
@@ -63,6 +64,33 @@ extern "C" {
 KDE_EXPORT int __kde_do_not_unload = 1;
 }
 
+// The value of the creation argument "key=value" (null if none).
+static QString argument( const QStringList& args, const char* key )
+{
+    QString prefix = QString::fromLatin1( key ) + "=";
+    for ( QStringList::ConstIterator it = args.begin(); it != args.end(); ++it )
+        if ( ( *it ).startsWith( prefix ) )
+            return ( *it ).mid( prefix.length() );
+    return QString::null;
+}
+
+// App mode: the options of the creation arguments (see isAppMode()).
+static KWPEAppOptions appOptions( const QStringList& args )
+{
+    KWPEAppOptions options;
+    QString name = argument( args, "appName" );
+    name.replace( '/', '_' );
+    if ( name.isEmpty() || name.startsWith( "." ) )
+        name = QString::fromLatin1( "kwpeapp" );
+    options.dataDir = argument( args, "storage" );
+    if ( options.dataDir.isEmpty() )
+        options.dataDir = KGlobal::dirs()->saveLocation( "data", name + "/webkit/" );
+    options.cacheDir = KGlobal::dirs()->saveLocation( "cache", name + "-webkit/" );
+    options.userAgent = argument( args, "userAgent" );
+    options.sites = QStringList::split( ',', argument( args, "sites" ) );
+    return options;
+}
+
 // Konqueror's KonqMainWindow::PageSecurity
 enum { NotCrypted = 0, Encrypted = 1, Mixed = 2 };
 
@@ -86,12 +114,16 @@ private:
 
 KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
                     QObject* parent, const char* name, const QStringList& args )
-    : KParts::ReadOnlyPart( parent, name ), m_mail( args.contains( "mode=mail" ) ), m_mailLoadExternal( false ),
+    : KParts::ReadOnlyPart( parent, name ), m_mail( args.contains( "mode=mail" ) ), m_app( !m_mail && args.contains( "mode=app" ) ),
+      m_mailLoadExternal( false ),
       m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 ), m_adblockLabel( 0 )
 {
     setInstance( KWPEPartFactory::instance() );
 
-    m_view = new KWPEWidget( parentWidget, widgetName, m_mail ? KWPEWidget::Mail : KWPEWidget::Browser );
+    if ( m_app )
+        m_view = new KWPEWidget( parentWidget, widgetName, appOptions( args ) );
+    else
+        m_view = new KWPEWidget( parentWidget, widgetName, m_mail ? KWPEWidget::Mail : KWPEWidget::Browser );
     setWidget( m_view );
     if ( !m_view->isValid() )
         kdWarning() << "kwpepart: WPE WebKit could not be set up" << endl;
@@ -152,13 +184,25 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_configure = new KAction( i18n( "&Configure WPE WebKit..." ), "configure", 0, this, SLOT( slotConfigure() ),
                                actionCollection(), "configureWPE" );
     m_statusBar = new KParts::StatusBarExtension( this );
-    if ( !m_mail ) {
+    if ( !m_mail && !m_app ) {
         connect( KWPEAdBlock::self(), SIGNAL( changed() ), SLOT( updateAdBlockState() ) );
         updateAdBlockState();
     } else {
         m_adblockSite->setEnabled( false );
     }
 
+    if ( m_app ) {
+        connect( m_view, SIGNAL( notificationShown( int, const QString&, const QString& ) ),
+                 SIGNAL( notificationShown( int, const QString&, const QString& ) ) );
+        connect( m_view, SIGNAL( notificationClosed( int ) ), SIGNAL( notificationClosed( int ) ) );
+        connect( m_view, SIGNAL( permissionRequested( const QString&, const QString&, bool& ) ),
+                 SIGNAL( permissionRequested( const QString&, const QString&, bool& ) ) );
+        connect( m_view, SIGNAL( statusMessage( const QString& ) ), SIGNAL( statusMessage( const QString& ) ) );
+        KStdAction::redisplay( this, SLOT( reload() ), actionCollection(), "reload" )->setText( i18n( "&Reload" ) );
+        // Find, zoom and reload only (kwpeapppart.rc).
+        setXMLFile( "kwpeapppart.rc" );
+        return;
+    }
     setXMLFile( "kwpepart.rc" );
 }
 
@@ -185,6 +229,11 @@ bool KWPEPart::openURL( const KURL& url )
     if ( !m_view->isValid() ) {
         emit canceled( i18n( "WPE WebKit could not be set up." ) );
         return false;
+    }
+    if ( m_app ) {
+        m_url = url;
+        m_view->load( url.url() );
+        return true;
     }
     if ( m_mail ) {
         if ( !url.isLocalFile() ) {
@@ -226,7 +275,7 @@ bool KWPEPart::openFile()
 void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 {
     // ReadOnlyPart's shows the URL.
-    if ( !event->activated() || m_mail )
+    if ( !event->activated() || m_mail || m_app )
         return;
     emit setWindowCaption( m_view->title().isEmpty() ? m_url.prettyURL() : m_view->title() );
     // The status bar exists now (Konqueror sets it late); the extension
@@ -242,7 +291,7 @@ void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 
 void KWPEPart::updateAdBlockState()
 {
-    if ( m_mail )
+    if ( m_mail || m_app )
         return;
     KWPEAdBlock* adblock = KWPEAdBlock::self();
     QString host = m_url.host();
@@ -329,8 +378,10 @@ void KWPEPart::slotLoadStarted()
 void KWPEPart::slotUrlChanged( const QString& url, bool newItem )
 {
     // Mail: the host knows what it shows (m_url, the file it opened);
-    // no history.
-    if ( m_mail ) {
+    // no history.  App: no history either.
+    if ( m_app )
+        m_url = KURL( url );
+    if ( m_mail || m_app ) {
         if ( !m_view->isLoading() ) {
             emit started( 0 );
             emit completed();
@@ -391,6 +442,8 @@ void KWPEPart::slotLoadProgress( int percent )
 void KWPEPart::slotTitleChanged( const QString& title )
 {
     emit setWindowCaption( title.isEmpty() ? m_url.prettyURL() : title );
+    if ( m_app )
+        emit pageTitleChanged( title );
 }
 
 void KWPEPart::slotLinkHovered( const QString& url )
@@ -432,6 +485,16 @@ void KWPEPart::scrollBy( int dx, int dy )
 void KWPEPart::selectAll()
 {
     m_view->selectAll();
+}
+
+void KWPEPart::activateNotification( int id )
+{
+    m_view->activateNotification( id );
+}
+
+void KWPEPart::reload()
+{
+    m_view->reload();
 }
 
 void KWPEPart::slotUnsupportedContent( const QString& url, const QString& mimeType )
@@ -498,6 +561,10 @@ void KWPEPart::slotContextMenu( const QString& linkUrl, const QString& imageUrl,
         emit popupMenu( linkUrl, globalPos );
         return;
     }
+    if ( m_app ) {
+        showAppContextMenu( KURL( linkUrl ), KURL( imageUrl ), onSelection, globalPos );
+        return;
+    }
     KURL link( linkUrl );
     KURL popupURL = link.isEmpty() ? m_url : link;
     KParts::URLArgs args;
@@ -526,6 +593,82 @@ void KWPEPart::slotContextMenu( const QString& linkUrl, const QString& imageUrl,
     emit m_ext->popupMenu( client, globalPos, popupURL, args, flags, S_IFREG );
     if ( guard )
         delete client;
+}
+
+// App mode: no Konqueror to build the menu; the part's own.
+void KWPEPart::showAppContextMenu( const KURL& link, const KURL& image, bool onSelection, const QPoint& globalPos )
+{
+    enum { OpenLink = 1, CopyLink, SaveLink, SaveImage, CopyImage, Cut, Copy, Paste, SelectAll };
+    bool editable = m_view->contextMenuOnEditable();
+    KPopupMenu menu( widget() );
+    if ( !link.isEmpty() ) {
+        if ( link.protocol() == "mailto" ) {
+            menu.insertItem( SmallIconSet( "mail_new" ), i18n( "&Send Email..." ), OpenLink );
+            menu.insertItem( i18n( "Copy Email Address" ), CopyLink );
+        } else {
+            menu.insertItem( SmallIconSet( "fileopen" ), i18n( "&Open Link in Browser" ), OpenLink );
+            menu.insertItem( i18n( "Copy &Link Address" ), CopyLink );
+            if ( link.protocol() == "http" || link.protocol() == "https" || link.protocol() == "blob" )
+                menu.insertItem( SmallIconSet( "filesaveas" ), i18n( "&Save Link As..." ), SaveLink );
+        }
+    }
+    if ( !image.isEmpty() ) {
+        if ( menu.count() )
+            menu.insertSeparator();
+        menu.insertItem( SmallIconSet( "filesaveas" ), i18n( "Save Image As..." ), SaveImage );
+        if ( image.protocol() == "http" || image.protocol() == "https" )
+            menu.insertItem( i18n( "Copy Image Location" ), CopyImage );
+    }
+    if ( menu.count() )
+        menu.insertSeparator();
+    if ( editable )
+        menu.insertItem( SmallIconSet( "editcut" ), i18n( "Cu&t" ), Cut );
+    if ( editable || onSelection )
+        menu.insertItem( SmallIconSet( "editcopy" ), i18n( "&Copy" ), Copy );
+    if ( editable )
+        menu.insertItem( SmallIconSet( "editpaste" ), i18n( "&Paste" ), Paste );
+    menu.insertItem( i18n( "Select &All" ), SelectAll );
+
+    // The host may delete the part while the menu is open.
+    QGuardedPtr<KWPEPart> self( this );
+    int id = menu.exec( globalPos );
+    if ( !self )
+        return;
+    switch ( id ) {
+    case OpenLink:
+        emit m_ext->openURLRequest( link );
+        break;
+    case CopyLink: {
+        QString text = link.protocol() == "mailto" ? link.path() : link.url();
+        QApplication::clipboard()->setText( text, QClipboard::Clipboard );
+        QApplication::clipboard()->setText( text, QClipboard::Selection );
+        break;
+    }
+    case SaveLink:
+        m_view->downloadURL( link.url() );
+        break;
+    case SaveImage:
+        m_view->downloadURL( image.url() );
+        break;
+    case CopyImage:
+        QApplication::clipboard()->setText( image.url(), QClipboard::Clipboard );
+        QApplication::clipboard()->setText( image.url(), QClipboard::Selection );
+        break;
+    case Cut:
+        m_view->cut();
+        break;
+    case Copy:
+        m_view->copySelection();
+        break;
+    case Paste:
+        m_view->paste();
+        break;
+    case SelectAll:
+        m_view->selectAll();
+        break;
+    default:
+        break;
+    }
 }
 
 void KWPEPart::slotFind()
@@ -600,8 +743,11 @@ void KWPEPart::updatePageSecurity()
 
 void KWPEPart::slotWebProcessFailed( bool crashed )
 {
-    emit setStatusBarText( crashed ? i18n( "The page crashed again. Reload to try once more." )
-                                   : i18n( "The page used too much memory and was stopped. Reload to show it again." ) );
+    QString text = crashed ? i18n( "The page crashed again. Reload to try once more." )
+                           : i18n( "The page used too much memory and was stopped. Reload to show it again." );
+    emit setStatusBarText( text );
+    if ( m_app )
+        emit statusMessage( text );
 }
 
 void KWPEPart::slotIconURL( const QString& url )

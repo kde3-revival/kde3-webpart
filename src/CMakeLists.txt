@@ -34,7 +34,7 @@ kde3_add_module(libkwpepart
 target_include_directories(libkwpepart PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 install(FILES kwpepart.desktop DESTINATION ${KDE3_SERVICES_INSTALL_DIR})
-install(FILES kwpepart.rc DESTINATION ${KDE3_DATA_INSTALL_DIR}/kwpepart)
+install(FILES kwpepart.rc kwpeapppart.rc DESTINATION ${KDE3_DATA_INSTALL_DIR}/kwpepart)
 
 # kwpeview URL: the part in a window of its own, for debugging
 kde3_add_executable(kwpeview
