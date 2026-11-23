@@ -2,6 +2,12 @@
 # inner.sh BUILD OUT: the render-only test inside its container (root of a
 # user namespace, own network namespace).  See README; run.sh starts it.
 #
+# Configurations (CONFIGS): all; no-<layer> (one layer off); only-<layer>
+# (one layer on); external (both showings with external references);
+# transitions (render only, external, render only in one reader);
+# two-readers (one render only, one external at the same time); no-layers
+# (the measurement must see the tricks).  See check.py for the verdicts.
+#
 # Network: the container's namespace gets 10.77.0.1 (a logging DNS server,
 # the only resolver, answering every name with 10.77.0.1, and a logging
 # HTTP server) and a default route, so that any connection attempt sends a
@@ -11,21 +17,26 @@ set -u
 T=$(cd "$(dirname "$0")" && pwd)
 B=$1; O=$2
 KDE3_PREFIX=${KDE3_PREFIX:-/opt/kde3}
-WAIT=${WAIT:-6000}
-# every message is shown twice, the second time AFTER ms later (the first
-# time with host names *.first.blocked.test): a new network process drops
-# DNS prefetches until it knows the system's proxy settings, a long-lived
-# one (KMail's) does not
+# Showings AFTER ms apart (see driver.h): a new network process drops DNS
+# prefetches until it knows the system's proxy settings, a long-lived one
+# (KMail's) does not, so every message is shown at least twice.
 AFTER=${AFTER:-2500}
-CONFIGS=${CONFIGS:-"all no-sanitizer no-settings no-csp no-filter no-proxy external no-layers"}
-DRIVER=$B/src/kwpe-render-only
-# KLibLoader finds modules by name in $KDEDIRS/lib/kde3: the build's part
-# first, the installed one is never used.
+LAYERS="sanitizer settings csp filter proxy"
+ALL_CONFIGS="all $(for l in $LAYERS; do printf 'no-%s ' $l; done)$(for l in $LAYERS; do printf 'only-%s ' $l; done)external transitions two-readers no-layers"
+CONFIGS=${CONFIGS:-$ALL_CONFIGS}
+DRIVER=$B/tests/render-only/kwpe-render-only
+# KLibLoader finds modules by name in $KDEDIRS/lib/kde3: the test's build
+# of the part (libkwpepart_test, which may switch layers off), never an
+# installed one.
 mkdir -p /tmp/kwpe-kdedir/lib/kde3
-ln -sf $B/src/libkwpepart.so /tmp/kwpe-kdedir/lib/kde3/libkwpepart.so
-PART=libkwpepart
+ln -sf $B/tests/render-only/libkwpepart_test.so /tmp/kwpe-kdedir/lib/kde3/libkwpepart_test.so
+PART=libkwpepart_test
 mkdir -p $O; : > $O/summary.txt
 log(){ echo "$*" | tee -a $O/summary.txt; }
+# generated messages: nesting deeper than any parser should go
+mkdir -p $O/generated
+python3 -I -c 'import sys; sys.stdout.write("<!DOCTYPE html><html><body>" + "<div>" * 100000 + "x" + "</div>" * 100000 + "</body></html>")' > $O/generated/deep-nesting.html
+python3 -I -c 'import sys; sys.stdout.write("<!DOCTYPE html><html><body>" + "<div>" * 4900 + "x" + "</div>" * 4900 + "<div style=\"width:320px;height:120px;background:#ff0000\"></div></body></html>")' > $O/generated/deep-flattened.html
 
 # --- network namespace
 ip link set lo up
@@ -70,24 +81,34 @@ DETECTED_DNS=0; DETECTED_SYN=0
 run_one(){ # CONFIG MESSAGE
   local c=$1 m=$2 n; n=$(basename $m .html)
   local d=$O/$c/$n; mkdir -p $d/home $d/rt $d/kdetmp $d/kdevartmp; chmod 700 $d/rt $d/kdetmp $d/kdevartmp
-  local layers= ext=
+  local layers= gate=strict pa=r,r pb= l
   case $c in
-    no-layers) layers=sanitizer,settings,csp,filter,proxy ;;
-    no-*) layers=${c#no-} ;;
-    external) ext=--external ;;
+    all) ;;
+    no-layers) layers=$(echo $LAYERS | tr ' ' ,); gate=info ;;
+    no-*) layers=${c#no-}; gate=reduced ;;
+    only-*) layers=$(for l in $LAYERS; do [ $l = ${c#only-} ] || printf '%s,' $l; done)
+            # a layer that has to hold everything alone: the sanitizer (a
+            # white list) and the content filter (every load); CSP, the
+            # settings and the proxy are partial by design (they are
+            # reported: what each one stops alone)
+            case $c in only-sanitizer|only-filter) gate=strict ;; *) gate=info ;; esac ;;
+    external) pa=e,e ;;
+    transitions) pa=r,e,r ;;
+    two-readers) pb=e,e ;;
   esac
+  local k; k=$(echo $pa | tr ',' '\n' | wc -l)
+  local wait=$(( (k - 1) * AFTER + 3500 ))
   : > $O/dns.log; : > $O/http.log
   nft reset counters table inet kwpe > /dev/null
   tcpdump -i any -nn -U -w $d/traffic.pcap > /dev/null 2> $d/tcpdump.err & local tp=$!
   sleep 0.5
   env -i HOME=$d/home XDG_RUNTIME_DIR=$d/rt TMPDIR=$d PATH=$KDE3_PREFIX/bin:/usr/bin LANG=C.UTF-8 DISPLAY=:77 \
-    KDEHOME=$d/home/.kde KDETMP=$d/kdetmp KDEVARTMP=$d/kdevartmp KDEDIRS=/tmp/kwpe-kdedir:$KDE3_PREFIX KWPE_PART=$PART KWPE_MAIL_TEST_DISABLE_LAYERS=$layers \
-    WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$d/none \
-    timeout 90 $DRIVER $ext --wait $WAIT --twice --after $AFTER $m > $d/out 2> $d/err & local dp=$!
+    KDEHOME=$d/home/.kde KDETMP=$d/kdetmp KDEVARTMP=$d/kdevartmp KDEDIRS=/tmp/kwpe-kdedir:$KDE3_PREFIX KWPE_PART=$PART \
+    KWPE_MAIL_TEST_DISABLE_LAYERS=$layers WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$d/none \
+    timeout 120 $DRIVER --phases $pa ${pb:+--reader2 $pb} --after $AFTER --wait $wait $m > $d/out 2> $d/err & local dp=$!
   if [ $n = ping-click ]; then
-    # a real click (XTest) into the red link, 60 px below the view's top,
-    # after the second showing
-    sleep 4.5; local wx wy; read wx wy < <(awk '/^WIDGET/ { print $2, $3 }' $d/out)
+    # a real click (XTest) into the red link of the last showing
+    sleep $(( (k - 1) * AFTER / 1000 + 2 )); local wx wy; read wx wy < <(awk '$1 == "a" && $2 == "WIDGET" { print $3, $4 }' $d/out | tail -1)
     DISPLAY=:77 xdotool mousemove $(( ${wx:-0} + 100 )) $(( ${wy:-0} + 90 )) sleep 0.3 click 1
   fi
   wait $dp; local rc=$?
@@ -97,50 +118,39 @@ run_one(){ # CONFIG MESSAGE
   pkill -9 -f "WPEWebProcess|WPENetworkProcess|kdeinit|dcopserver|klauncher|kded|knotify" 2>/dev/null
   kill -INT $tp; wait $tp 2>/dev/null
   cp $O/dns.log $d/dns.log; cp $O/http.log $d/http.log
-  local dns syn loopsyn udp offlo pkts blocked rendered link q h
+  local dns syn loopsyn udp offlo pkts blocked rendered link q h completed
   dns=$(count dns); syn=$(count syn); loopsyn=$(count loopsyn); udp=$(count udp); offlo=$(count offlo)
   pkts=$(tcpdump -r $d/traffic.pcap -nn 2>/dev/null | wc -l)
   blocked=$(grep -c "BLOCKED a network connection" $d/err)
   rendered=$(awk '/^RENDERED/ { print $2 }' $d/out); rendered=${rendered:-none}
-  link=$(awk '/^LINK/ { print $2 }' $d/out | head -1)
+  link=$(awk '$1 == "a" && $2 == "LINK" { print $3 }' $d/out | head -1)
+  completed=$(grep -c "^a COMPLETED" $d/out)
   q=$(wc -l < $d/dns.log); h=$(wc -l < $d/http.log)
-  local verdict=ok why=
+  local verdict why
+  read verdict why < <(python3 -I $T/check.py $c $gate "$pa" "$pb" $d dns=$dns syn=$syn loopsyn=$loopsyn udp=$udp \
+                       offlo=$offlo pcap=$pkts blocked=$blocked http=$h rc=$rc)
   if [ $c = no-layers ]; then
-    # the measurement itself: without any layer the tricks must be seen
     DETECTED_DNS=$((DETECTED_DNS + q)); DETECTED_SYN=$((DETECTED_SYN + syn))
-    verdict=info
-  elif [ $c = external ]; then
-    # only images, style sheets and fonts, only names of hosts they came from
-    local bad; bad=$(awk '$1 !~ /^(image|style|font)\??$/' $d/http.log)
-    [ -n "$bad" ] && { verdict=FAIL; why="$why disallowed-requests:[$(echo $bad | tr '\n' ';')]"; }
-    local hosts; hosts=$(awk '{ sub(/:.*/, "", $2); print $2 }' $d/http.log | sort -u)
-    for qn in $(awk '$1 == 1 { print $2 }' $d/dns.log | sort -u); do
-      echo "$hosts" | grep -qx "$qn" || { verdict=FAIL; why="$why lookup-without-allowed-load:$qn"; }
-    done
-    [ $offlo = 0 ] || { verdict=FAIL; why="$why packets-off-loopback:$offlo"; }
-  else
-    [ $dns = 0 ] && [ $q = 0 ] || { verdict=FAIL; why="$why dns:$dns/$q[$(awk '{print $2}' $d/dns.log | sort -u | tr '\n' ' ')]"; }
-    [ $syn = 0 ] || { verdict=FAIL; why="$why tcp-connects:$syn"; }
-    [ $udp = 0 ] || { verdict=FAIL; why="$why udp:$udp"; }
-    [ $offlo = 0 ] || { verdict=FAIL; why="$why packets-off-loopback:$offlo"; }
-    [ $h = 0 ] || { verdict=FAIL; why="$why http:$h"; }
-    if [ $c = all ]; then
-      # every layer in place: not even the closed proxy sees anything
-      [ $loopsyn = 0 ] && [ $blocked = 0 ] && [ $pkts = 0 ] || { verdict=FAIL; why="$why loopback-connects:$loopsyn proxy-blocked:$blocked packets:$pkts"; }
+  fi
+  if [ $verdict != info ]; then
+    if [ $n = 00-control ] || [ $n = deep-flattened ]; then
+      { [ "$rendered" = none ] || [ "$rendered" -lt 30000 ]; } && { verdict=FAIL; why="$why not-rendered:$rendered"; }
+    fi
+    if [ $n = deep-nesting ] || [ $n = deep-flattened ]; then
+      [ $completed -ge $k ] || { verdict=FAIL; why="$why completed:$completed/$k"; }
+    fi
+    if [ $n = ping-click ] && ! echo "$link" | grep -q "^http://link\.ping\.a$k\.blocked\.test/$"; then
+      verdict=FAIL; why="$why click-not-handed-to-host:${link:-none}"
     fi
   fi
-  [ $rc = 0 ] || { verdict=FAIL; why="$why driver-exit:$rc"; }
-  [ $verdict = info ] && [ $rc = 0 ] && { log "$(printf 'info %-13s %-20s dns=%s/%s syn=%s udp=%s offlo=%s http=%s' $c $n $dns $q $syn $udp $offlo $h)"; return; }
-  if [ $n = 00-control ] && { [ "$rendered" = none ] || [ "$rendered" -lt 30000 ]; }; then verdict=FAIL; why="$why not-rendered:$rendered"; fi
-  if [ $n = ping-click ] && [ "$link" != "http://link.ping.blocked.test/" ]; then verdict=FAIL; why="$why click-not-handed-to-host:${link:-none}"; fi
-  [ $verdict = ok ] || FAILED=1
-  log "$(printf '%-4s %-13s %-20s dns=%s/%s syn=%s loopsyn=%s udp=%s offlo=%s pcap=%s proxy-blocked=%s http=%s rendered=%s%s%s' \
-    $verdict $c $n $dns $q $syn $loopsyn $udp $offlo $pkts $blocked $h $rendered "${link:+ link=$link}" "${why:+ ->$why}")"
+  [ $verdict = FAIL ] && FAILED=1
+  log "$(printf '%-4s %-14s %-18s dns=%s/%s syn=%s loopsyn=%s udp=%s offlo=%s pcap=%s proxy-blocked=%s http=%s rendered=%s%s%s' \
+    $verdict $c $n $dns $q $syn $loopsyn $udp $offlo $pkts $blocked $h $rendered "${link:+ link=$link}" "${why:+ -> $why}")"
 }
 
-log "render-only test $(date -u +%FT%TZ) part=$B/src/libkwpepart.so wait=${WAIT}ms selftest=$(cat $O/selftest.txt)"
+log "render-only test $(date -u +%FT%TZ) part=$B/tests/render-only/libkwpepart_test.so after=${AFTER}ms selftest=$(cat $O/selftest.txt)"
 for c in $CONFIGS; do
-  for m in ${MESSAGES:-$T/messages/*.html}; do
+  for m in ${MESSAGES:-$T/messages/*.html $O/generated/*.html}; do
     run_one $c $m
   done
 done

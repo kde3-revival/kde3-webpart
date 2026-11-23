@@ -9,7 +9,7 @@
     (at your option) any later version.
 */
 
-// kwpe-render-only [--external] [--wait MS] [--twice [--after MS]] [--shot FILE] MESSAGE.html
+// kwpe-render-only [--phases r,e,..] [--reader2 r,e,..] [--after MS] [--wait MS] [--shot FILE] MESSAGE.html
 //
 // The part (KWPE_PART: a library name or path, default libkwpepart) in
 // mail mode shows MESSAGE.html as a message's HTML part: a host document
@@ -39,45 +39,51 @@
 
 #include "driver.h"
 
-Driver::Driver( KParts::ReadOnlyPart* part, int waitMs, const QString& shot )
-    : QObject( 0, "driver" ), m_part( part ), m_waitMs( waitMs ), m_shot( shot )
+Reader::Reader( char tag, KParts::ReadOnlyPart* part, const QStringList& modes, const QStringList& dirs, int afterMs )
+    : QObject( 0, "reader" ), m_tag( tag ), m_part( part ), m_modes( modes ), m_dirs( dirs ), m_afterMs( afterMs ),
+      m_phase( 0 )
 {
     connect( part, SIGNAL( completed() ), SLOT( slotCompleted() ) );
     KParts::BrowserExtension* ext = KParts::BrowserExtension::childObject( part );
     if ( ext )
         connect( ext, SIGNAL( openURLRequest( const KURL&, const KParts::URLArgs& ) ),
                  SLOT( slotLink( const KURL&, const KParts::URLArgs& ) ) );
+    slotNextPhase();
+}
+
+void Reader::slotNextPhase()
+{
+    if ( m_phase >= m_dirs.count() )
+        return;
+    bool external = m_modes[m_phase] == "e";
+    printf( "%c PHASE %u %s\n", m_tag, m_phase + 1, external ? "e" : "r" );
+    fflush( stdout );
+    m_part->setProperty( "mailLoadExternal", QVariant( external, 0 ) );
+    m_part->openURL( KURL::fromPathOrURL( m_dirs[m_phase] + "/index.html" ) );
+    if ( ++m_phase < m_dirs.count() )
+        QTimer::singleShot( m_afterMs, this, SLOT( slotNextPhase() ) );
+}
+
+void Reader::slotCompleted()
+{
+    QPoint origin = m_part->widget()->mapToGlobal( QPoint( 0, 0 ) );
+    printf( "%c WIDGET %d %d\n%c COMPLETED\n", m_tag, origin.x(), origin.y(), m_tag );
+    fflush( stdout );
+}
+
+void Reader::slotLink( const KURL& url, const KParts::URLArgs& )
+{
+    printf( "%c LINK %s\n", m_tag, url.url().latin1() );
+    fflush( stdout );
+}
+
+Finisher::Finisher( KParts::ReadOnlyPart* part, int waitMs, const QString& shot )
+    : QObject( 0, "finisher" ), m_part( part ), m_shot( shot )
+{
     QTimer::singleShot( waitMs, this, SLOT( slotFinish() ) );
 }
 
-void Driver::slotCompleted()
-{
-    QPoint origin = m_part->widget()->mapToGlobal( QPoint( 0, 0 ) );
-    printf( "WIDGET %d %d\n", origin.x(), origin.y() );
-    printf( "COMPLETED\n" );
-    fflush( stdout );
-}
-
-void Driver::slotLink( const KURL& url, const KParts::URLArgs& )
-{
-    printf( "LINK %s\n", url.url().latin1() );
-    fflush( stdout );
-}
-
-void Driver::again( int ms, const KURL& url )
-{
-    m_again = url;
-    QTimer::singleShot( ms, this, SLOT( slotAgain() ) );
-}
-
-void Driver::slotAgain()
-{
-    printf( "NEXT\n" );
-    fflush( stdout );
-    m_part->openURL( m_again );
-}
-
-void Driver::slotFinish()
+void Finisher::slotFinish()
 {
     QWidget* w = m_part->widget();
     QImage image = QPixmap::grabWindow( w->winId() ).convertToImage();
@@ -103,7 +109,7 @@ static bool writeFile( const QString& path, const QByteArray& data )
 
 // The message's directory, as KMail's writer makes it (0700): KMail's
 // document (headers, then the HTML part in a frame) and the HTML part.
-static QString writeMessage( const QString& file, bool first )
+static QString writeMessage( const QString& file, const QString& tag )
 {
     QFile message( file );
     if ( !message.open( IO_ReadOnly ) ) {
@@ -111,11 +117,12 @@ static QString writeMessage( const QString& file, bool first )
         return QString::null;
     }
     QByteArray body = message.readAll();
-    if ( first ) {
-        // the first showing (--twice) with host names of its own: a web
-        // process asks for a name only once
+    if ( !tag.isEmpty() ) {
+        // host names of the reader and phase: a web process asks for a
+        // name only once, and the logs tell the showings apart
         QCString text( body.data(), body.size() + 1 );
-        text.replace( QRegExp( "\\.blocked\\.test" ), ".first.blocked.test" );
+        text.replace( QRegExp( "\\.blocked\\.test" ), QCString( "." ) + tag.latin1() + ".blocked.test" );
+        text.replace( QRegExp( "\\.allowed\\.test" ), QCString( "." ) + tag.latin1() + ".allowed.test" );
         body.duplicate( text.data(), text.length() );
     }
     QCString dir = QFile::encodeName( QString( getenv( "TMPDIR" ) ? getenv( "TMPDIR" ) : "/tmp" ) + "/kwpe-ro-XXXXXX" );
@@ -142,14 +149,36 @@ static QString writeMessage( const QString& file, bool first )
 }
 
 static const KCmdLineOptions options[] = {
-    { "external", "Load external references (images, style sheets, fonts)", 0 },
-    { "wait <ms>", "Time the message gets before the screenshot", "5000" },
-    { "twice", "Show the message twice, first with host names of its own (WebKit drops the DNS prefetches of a new network process until it knows the system's proxy settings)", 0 },
-    { "after <ms>", "When the second showing follows the first", "2500" },
-    { "shot <file>", "Save the screenshot (PNG, or PPM if named .ppm)", 0 },
+    { "phases <list>", "The first reader's showings, r (render only) or e (external references), e.g. r,e,r", "r" },
+    { "reader2 <list>", "A second reader at the same time, its showings", 0 },
+    { "after <ms>", "Time between showings", "2500" },
+    { "wait <ms>", "Time before the screenshot and the end", "5000" },
+    { "shot <file>", "Save the first reader's screenshot (PNG, or PPM if named .ppm)", 0 },
     { "+message", "The message's HTML", 0 },
     KCmdLineLastOption
 };
+
+static Reader* makeReader( char tag, const QString& message, const QStringList& modes, int after, QWidget* top,
+                           const QCString& library )
+{
+    QStringList dirs;
+    for ( unsigned i = 0; i < modes.count(); ++i ) {
+        QString d = writeMessage( message, QString( "%1%2" ).arg( QChar( tag ) ).arg( i + 1 ) );
+        if ( d.isEmpty() )
+            return 0;
+        dirs.append( d );
+    }
+    int error = 0;
+    KParts::ReadOnlyPart* part = KParts::ComponentFactory::createPartInstanceFromLibrary<KParts::ReadOnlyPart>(
+        library.data(), top, "view", top, "part", QStringList( "mode=mail" ), &error );
+    if ( !part || !part->property( "mailLoadExternal" ).isValid() ) {
+        fprintf( stderr, "no part with a mail mode in %s (error %d)\n", library.data(), error );
+        return 0;
+    }
+    part->widget()->resize( top->size() );
+    top->show();
+    return new Reader( tag, part, modes, dirs, after );
+}
 
 int main( int argc, char** argv )
 {
@@ -161,44 +190,30 @@ int main( int argc, char** argv )
     KCmdLineArgs* args = KCmdLineArgs::parsedArgs();
     if ( args->count() != 1 )
         KCmdLineArgs::usage();
-
-    // --first: another message shown before this one (a network process
-    // that is not new any more).
-    QStringList dirs;
-    for ( int i = args->isSet( "twice" ) ? 0 : 1; i < 2; ++i ) {
-        QString d = writeMessage( QFile::decodeName( args->arg( 0 ) ), i == 0 );
-        if ( d.isEmpty() )
-            return 2;
-        dirs.append( d );
-    }
+    QString message = QFile::decodeName( args->arg( 0 ) );
+    int after = QString( args->getOption( "after" ) ).toInt();
+    QCString library = getenv( "KWPE_PART" ) ? getenv( "KWPE_PART" ) : "libkwpepart";
 
     QWidget top;
     top.resize( 800, 600 );
-    QCString library = getenv( "KWPE_PART" ) ? getenv( "KWPE_PART" ) : "libkwpepart";
-    int error = 0;
-    KParts::ReadOnlyPart* part = KParts::ComponentFactory::createPartInstanceFromLibrary<KParts::ReadOnlyPart>(
-        library.data(), &top, "view", &top, "part", QStringList( "mode=mail" ), &error );
-    if ( !part || !part->property( "mailLoadExternal" ).isValid() ) {
-        fprintf( stderr, "no part with a mail mode in %s (error %d)\n", library.data(), error );
+    Reader* a = makeReader( 'a', message, QStringList::split( ',', args->getOption( "phases" ) ), after, &top, library );
+    if ( !a )
         return 2;
+    QWidget top2;
+    Reader* b = 0;
+    if ( args->isSet( "reader2" ) ) {
+        top2.setGeometry( 0, 620, 800, 140 );
+        b = makeReader( 'b', message, QStringList::split( ',', args->getOption( "reader2" ) ), after, &top2, library );
+        if ( !b )
+            return 2;
     }
-    part->widget()->resize( 800, 600 );
-    top.show();
-    part->setProperty( "mailLoadExternal", QVariant( args->isSet( "external" ), 0 ) );
-
-    Driver driver( part, QString( args->getOption( "wait" ) ).toInt(),
-                   args->isSet( "shot" ) ? QFile::decodeName( args->getOption( "shot" ) ) : QString::null );
-    part->openURL( KURL::fromPathOrURL( dirs.first() + "/index.html" ) );
-    if ( dirs.count() > 1 )
-        driver.again( QString( args->getOption( "after" ) ).toInt(), KURL::fromPathOrURL( dirs.last() + "/index.html" ) );
+    Finisher finisher( a->part(), QString( args->getOption( "wait" ) ).toInt(),
+                       args->isSet( "shot" ) ? QFile::decodeName( args->getOption( "shot" ) ) : QString::null );
     int rc = app.exec();
-
-    delete part;
-    for ( unsigned i = 0; i < dirs.count(); ++i ) {
-        unlink( QFile::encodeName( dirs[i] + "/index.html" ).data() );
-        unlink( QFile::encodeName( dirs[i] + "/body-0.html" ).data() );
-        rmdir( QFile::encodeName( dirs[i] ).data() );
-    }
+    delete a->part();
+    if ( b )
+        delete b->part();
+    // (the message directories stay in $TMPDIR: the runner's)
     return rc;
 }
 

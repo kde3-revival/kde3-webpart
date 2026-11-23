@@ -14,33 +14,53 @@
 
 #include <qobject.h>
 #include <qstring.h>
+#include <qstringlist.h>
+#include <qvaluelist.h>
 #include <kurl.h>
 
-namespace KParts { class ReadOnlyPart; }
-namespace KParts { struct URLArgs; }
+namespace KParts { class ReadOnlyPart; struct URLArgs; }
 
-// Loads the part in mail mode (as KMail does), shows one message and
-// reports on stdout: WIDGET <x> <y>, COMPLETED, LINK <url> (what a click
-// handed to the host), RENDERED <red pixels> (layout and paint happened: the messages
-// carry a red marker box).
-class Driver : public QObject
+// One reader (a part in mail mode, as KMail creates it) showing a message
+// in phases: one showing per phase, render only ("r") or with external
+// references ("e"), AFTER ms apart; the message's host names carry the
+// reader and phase (*.a1.blocked.test, *.a2.blocked.test, ...).  Reports
+// on stdout, each line starting with the reader's letter: PHASE <n> <r|e>,
+// WIDGET <x> <y>, COMPLETED, LINK <url> (what a click handed to the host).
+class Reader : public QObject
 {
     Q_OBJECT
 public:
-    Driver( KParts::ReadOnlyPart* part, int waitMs, const QString& shot );
-    void again( int ms, const KURL& url );
+    Reader( char tag, KParts::ReadOnlyPart* part, const QStringList& modes, const QStringList& dirs, int afterMs );
+    KParts::ReadOnlyPart* part() const { return m_part; }
 
 public slots:
     void slotCompleted();
     void slotLink( const KURL& url, const KParts::URLArgs& );
-    void slotAgain();
+    void slotNextPhase();
+
+private:
+    char m_tag;
+    KParts::ReadOnlyPart* m_part;
+    QStringList m_modes;
+    QStringList m_dirs;
+    int m_afterMs;
+    unsigned m_phase;
+};
+
+// The end: a screenshot of the first reader, RENDERED <red pixels> (the
+// messages carry a red marker box: layout and paint happened).
+class Finisher : public QObject
+{
+    Q_OBJECT
+public:
+    Finisher( KParts::ReadOnlyPart* part, int waitMs, const QString& shot );
+
+public slots:
     void slotFinish();
 
 private:
     KParts::ReadOnlyPart* m_part;
-    int m_waitMs;
     QString m_shot;
-    KURL m_again;
 };
 
 #endif

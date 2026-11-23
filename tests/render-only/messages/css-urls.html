@@ -1,23 +1,36 @@
 <!DOCTYPE html><html><head>
+<!-- One URL candidate per element (and per rule), so that each one is
+     used and can be seen on its own in the logs (no-layers, external). -->
 <style>
 @import url(http://url.import.blocked.test/a.css);
 @import "http://string.import.blocked.test/b.css";
 @import url("data:text/css,@import url(http://data.import.blocked.test/c.css);");
-@font-face { font-family: remote; src: url(http://font-face.blocked.test/f.woff2) format("woff2"), local(Nothing); }
-body { background: url(http://background.css.blocked.test/a.png) no-repeat; font-family: remote, sans-serif; }
-.a { background-image: u\72l(http://escaped.css.blocked.test/a.png); }
-.b { background-image: image-set("http://image-set.css.blocked.test/a.png" 1x, url(http://image-set2.css.blocked.test/b.png) 2x); }
-.c { background-image: -webkit-image-set("http://webkit-image-set.css.blocked.test/a.png" 1x); }
-.d { --u: "http://var.css.blocked.test/a.png"; background-image: image-set(var(--u) 1x); }
-.e { list-style-image: url(http://list-style.css.blocked.test/a.png); cursor: url(http://cursor.css.blocked.test/c.cur), auto; }
-.f { border-image: url(http://border-image.css.blocked.test/a.png) 30 round; -webkit-mask-image: url(http://mask.css.blocked.test/m.png); }
-.g::before { content: url(http://content.css.blocked.test/a.png); }
-.h { filter: url(http://filter.css.blocked.test/f.svg#x); clip-path: url(http://clip.css.blocked.test/c.svg#c); }
-.i { background: url( 'http://quoted.css.blocked.test/a.png' ); shape-outside: url(http://shape.css.blocked.test/s.png); }
-.j { background: cross-fade(url(http://cross-fade.css.blocked.test/a.png), url(http://cross-fade2.css.blocked.test/b.png), 50%); }
+@font-face { font-family: remote; src: url(http://font-face.blocked.test/f.woff2) format("woff2"); }
+.ff { font-family: remote, sans-serif; }
+.p { display: block; width: 40px; height: 20px; }
+.a { background-image: url(http://background.css.blocked.test/a.png); }
+.b { background-image: u\72l(http://escaped.css.blocked.test/a.png); }
+.c { background-image: image-set("http://image-set.css.blocked.test/a.png" 1x); }
+.d { background-image: image-set(url(http://image-set-url.css.blocked.test/b.png) 1x); }
+.e { background-image: -webkit-image-set("http://webkit-image-set.css.blocked.test/a.png" 1x); }
+.f { --u: "http://var.css.blocked.test/a.png"; background-image: image-set(var(--u) 1x); }
+.g { list-style-image: url(http://list-style.css.blocked.test/a.png); }
+.h { cursor: url(http://cursor.css.blocked.test/c.png), auto; }
+.i { border: 10px solid; border-image: url(http://border-image.css.blocked.test/a.png) 30 round; }
+.j { -webkit-mask-image: url(http://mask.css.blocked.test/m.png); }
+.k::before { content: url(http://content.css.blocked.test/a.png); }
+.l { filter: url(http://filter.css.blocked.test/f.svg#x); }
+.m { clip-path: url(http://clip.css.blocked.test/c.svg#c); }
+.n { background-image: url( 'http://quoted.css.blocked.test/a.png' ); }
+.o { float: left; shape-outside: url(http://shape.css.blocked.test/s.png); }
+.q { background-image: cross-fade(url(http://cross-fade.css.blocked.test/a.png), url(data:image/png;base64,iVBORw0KGgo=), 50%); }
+.r { background-image: -webkit-cross-fade(url(http://webkit-cross-fade.css.blocked.test/a.png), url(data:image/png;base64,iVBORw0KGgo=), 50%); }
 </style></head><body>
-<div class="a b c d e f g h i j" style="background: url(http://style-attribute.css.blocked.test/a.png); height: 20px">styled</div>
-<ul class="e"><li>item</li></ul>
-<p style="--x: url(http://custom-property.css.blocked.test/a.png); background-image: var(--x)">custom property</p>
-<svg width="10" height="10"><style>rect { fill: url(http://svg-style.css.blocked.test/p.svg#p) }</style><rect width="10" height="10"/></svg>
+<p class="ff">text in a remote font</p>
+<div class="p a"></div><div class="p b"></div><div class="p c"></div><div class="p d"></div><div class="p e"></div>
+<div class="p f"></div><ul class="g"><li>item</li></ul><div class="p h"></div><div class="p i"></div><div class="p j"></div>
+<div class="p k"></div><div class="p l"></div><div class="p m"></div><div class="p n"></div><div class="p o"></div>
+<div class="p q"></div><div class="p r"></div>
+<div class="p" style="background-image: url(http://style-attribute.css.blocked.test/a.png)"></div>
+<div class="p" style="--x: url(http://custom-property.css.blocked.test/a.png); background-image: var(--x)"></div>
 <div style="width:320px;height:120px;background:#ff0000"></div></body></html>
