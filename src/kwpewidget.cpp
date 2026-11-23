@@ -637,6 +637,19 @@ static QString originOf( const char* uri )
     return result;
 }
 
+// Origins as WebKit writes them (scheme://host[:port]), each once; http
+// and https only, anything else (a hand-edited file) dropped.
+static QStringList canonicalOrigins( const QStringList& origins )
+{
+    QStringList result;
+    for ( QStringList::ConstIterator it = origins.begin(); it != origins.end(); ++it ) {
+        QString origin = originOf( ( *it ).stripWhiteSpace().utf8().data() );
+        if ( ( origin.startsWith( "http://" ) || origin.startsWith( "https://" ) ) && !result.contains( origin ) )
+            result.append( origin );
+    }
+    return result;
+}
+
 static KWPEAppWebKit* ensureAppWebKit( const KWPEAppOptions& options )
 {
     if ( !ensureDisplay() || options.dataDir.isEmpty() )
@@ -654,6 +667,15 @@ static KWPEAppWebKit* ensureAppWebKit( const KWPEAppOptions& options )
     KWPEAppWebKit* app = new KWPEAppWebKit;
     app->dataDir = dataDir;
     loadAppPermissions( app );
+    // One rule everywhere, WebKit's: an origin both allowed and denied is
+    // denied.
+    app->deniedNotifications = canonicalOrigins( app->deniedNotifications );
+    app->allowedNotifications = canonicalOrigins( app->allowedNotifications );
+    for ( QStringList::ConstIterator it = app->deniedNotifications.begin(); it != app->deniedNotifications.end(); ++it )
+        app->allowedNotifications.remove( *it );
+    if ( getenv( "KWPE_DEBUG" ) )
+        fprintf( stderr, "kwpe: app: notifications allowed for [%s], denied for [%s]\n",
+                 app->allowedNotifications.join( " " ).utf8().data(), app->deniedNotifications.join( " " ).utf8().data() );
     app->session = webkit_network_session_new( QFile::encodeName( dataDir ).data(), QFile::encodeName( cacheDir ).data() );
     webkit_cookie_manager_set_persistent_storage( webkit_network_session_get_cookie_manager( app->session ),
                                                   QFile::encodeName( dataDir + "cookies.sqlite" ).data(),
@@ -1643,10 +1665,10 @@ gboolean KWPEWidgetPrivate::onQueryPermissionState( WebKitWebView*, WebKitPermis
     QString origin = text ? QString::fromUtf8( text ) : QString::null;
     g_free( text );
     WebKitPermissionState state = WEBKIT_PERMISSION_STATE_PROMPT;
-    if ( d->app->allowedNotifications.contains( origin ) )
-        state = WEBKIT_PERMISSION_STATE_GRANTED;
-    else if ( d->app->deniedNotifications.contains( origin ) )
+    if ( d->app->deniedNotifications.contains( origin ) )
         state = WEBKIT_PERMISSION_STATE_DENIED;
+    else if ( d->app->allowedNotifications.contains( origin ) )
+        state = WEBKIT_PERMISSION_STATE_GRANTED;
     webkit_permission_state_query_finish( query, state );
     return TRUE;
 }
@@ -1981,12 +2003,12 @@ gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView* view, WebKitPerm
     if ( WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST( request ) ) {
         pending.kind = QString::fromLatin1( "notifications" );
         // Answered before (WebKit asks again in a new web process).
-        if ( d->app->allowedNotifications.contains( pending.origin ) ) {
-            webkit_permission_request_allow( request );
-            return TRUE;
-        }
         if ( d->app->deniedNotifications.contains( pending.origin ) ) {
             webkit_permission_request_deny( request );
+            return TRUE;
+        }
+        if ( d->app->allowedNotifications.contains( pending.origin ) ) {
+            webkit_permission_request_allow( request );
             return TRUE;
         }
     } else if ( WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST( request ) ) {

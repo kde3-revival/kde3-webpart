@@ -439,7 +439,9 @@ of its own:
   notifications is kept in `DIR/kwpepart-permissions` and given to every
   new web process (`initialize-notification-permissions`, also for
   `navigator.permissions.query()`): `Notification.permission` is
-  `"granted"` at once after a restart.
+  `"granted"` at once after a restart.  The file's origins are canonicalized
+  (http/https only, each once); one listed as both allowed and denied is
+  denied, as WebKit does.
 * **Dropped files:** WPE has no drag and drop.  Local files dropped on the
   view reach the page as a drop: `dragenter`, `dragover` and `drop`
   events at that point with a `DataTransfer` of `File` objects, made in
