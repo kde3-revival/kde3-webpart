@@ -80,13 +80,13 @@ private:
 };
 
 KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
-                    QObject* parent, const char* name, const QStringList& )
-    : KParts::ReadOnlyPart( parent, name ), m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 ),
-      m_adblockLabel( 0 )
+                    QObject* parent, const char* name, const QStringList& args )
+    : KParts::ReadOnlyPart( parent, name ), m_mail( args.contains( "mode=mail" ) ), m_mailLoadExternal( false ),
+      m_ownNavigation( false ), m_historyToken( 0 ), m_findOptions( 0 ), m_adblockLabel( 0 )
 {
     setInstance( KWPEPartFactory::instance() );
 
-    m_view = new KWPEWidget( parentWidget, widgetName );
+    m_view = new KWPEWidget( parentWidget, widgetName, m_mail ? KWPEWidget::Mail : KWPEWidget::Browser );
     setWidget( m_view );
     if ( !m_view->isValid() )
         kdWarning() << "kwpepart: WPE WebKit could not be set up" << endl;
@@ -106,6 +106,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
              SLOT( slotUnsupportedContent( const QString&, const QString& ) ) );
     connect( m_view, SIGNAL( historyNavigationRequested( int ) ), SLOT( slotHistoryNavigationRequested( int ) ) );
     connect( m_view, SIGNAL( externalURLRequested( const QString& ) ), SLOT( slotExternalURL( const QString& ) ) );
+    connect( m_view, SIGNAL( linkActivated( const QString& ) ), SLOT( slotLinkActivated( const QString& ) ) );
     connect( m_view, SIGNAL( contextMenuRequested( const QString&, const QString&, bool, const QPoint& ) ),
              SLOT( slotContextMenu( const QString&, const QString&, bool, const QPoint& ) ) );
     // Always: WPE does not report selection changes (WebKitEditorState
@@ -146,8 +147,12 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     m_configure = new KAction( i18n( "&Configure WPE WebKit..." ), "configure", 0, this, SLOT( slotConfigure() ),
                                actionCollection(), "configureWPE" );
     m_statusBar = new KParts::StatusBarExtension( this );
-    connect( KWPEAdBlock::self(), SIGNAL( changed() ), SLOT( updateAdBlockState() ) );
-    updateAdBlockState();
+    if ( !m_mail ) {
+        connect( KWPEAdBlock::self(), SIGNAL( changed() ), SLOT( updateAdBlockState() ) );
+        updateAdBlockState();
+    } else {
+        m_adblockSite->setEnabled( false );
+    }
 
     setXMLFile( "kwpepart.rc" );
 }
@@ -175,6 +180,15 @@ bool KWPEPart::openURL( const KURL& url )
     if ( !m_view->isValid() ) {
         emit canceled( i18n( "WPE WebKit could not be set up." ) );
         return false;
+    }
+    if ( m_mail ) {
+        if ( !url.isLocalFile() ) {
+            emit canceled( i18n( "Only local files can be shown." ) );
+            return false;
+        }
+        m_url = url;
+        m_view->loadMailFile( url.path(), m_mailLoadExternal );
+        return true;
     }
     KParts::URLArgs args = m_ext->urlArgs();
     m_url = url;
@@ -207,7 +221,7 @@ bool KWPEPart::openFile()
 void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 {
     // ReadOnlyPart's shows the URL.
-    if ( !event->activated() )
+    if ( !event->activated() || m_mail )
         return;
     emit setWindowCaption( m_view->title().isEmpty() ? m_url.prettyURL() : m_view->title() );
     // The status bar exists now (Konqueror sets it late); the extension
@@ -223,6 +237,8 @@ void KWPEPart::guiActivateEvent( KParts::GUIActivateEvent* event )
 
 void KWPEPart::updateAdBlockState()
 {
+    if ( m_mail )
+        return;
     KWPEAdBlock* adblock = KWPEAdBlock::self();
     QString host = m_url.host();
     bool web = m_url.protocol() == "http" || m_url.protocol() == "https";
@@ -307,6 +323,15 @@ void KWPEPart::slotLoadStarted()
 
 void KWPEPart::slotUrlChanged( const QString& url, bool newItem )
 {
+    // Mail: the host knows what it shows (m_url, the file it opened);
+    // no history.
+    if ( m_mail ) {
+        if ( !m_view->isLoading() ) {
+            emit started( 0 );
+            emit completed();
+        }
+        return;
+    }
     KURL u( url );
     m_lastUnsupported = QString::null;
     if ( m_ownNavigation )
@@ -365,12 +390,33 @@ void KWPEPart::slotTitleChanged( const QString& title )
 
 void KWPEPart::slotLinkHovered( const QString& url )
 {
+    if ( m_mail ) {
+        emit onURL( url );
+        return;
+    }
     emit setStatusBarText( url );
 }
 
 void KWPEPart::slotNewWindowRequested( const QString& url )
 {
     emit m_ext->createNewWindow( KURL( url ) );
+}
+
+void KWPEPart::slotLinkActivated( const QString& url )
+{
+    // The host decides (KMail: its own URLs, attachments, mailto:, a
+    // browser for the rest).
+    emit m_ext->openURLRequest( KURL( url ) );
+}
+
+void KWPEPart::scrollBy( int dx, int dy )
+{
+    m_view->scrollBy( dx, dy );
+}
+
+void KWPEPart::selectAll()
+{
+    m_view->selectAll();
 }
 
 void KWPEPart::slotUnsupportedContent( const QString& url, const QString& mimeType )
@@ -433,6 +479,10 @@ void KWPEPart::slotHistoryNavigationRequested( int steps )
 
 void KWPEPart::slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos )
 {
+    if ( m_mail ) {
+        emit popupMenu( linkUrl, globalPos );
+        return;
+    }
     KURL link( linkUrl );
     KURL popupURL = link.isEmpty() ? m_url : link;
     KParts::URLArgs args;

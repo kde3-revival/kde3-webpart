@@ -30,13 +30,39 @@ class KWPEWidget : public QWidget
     Q_OBJECT
 
 public:
-    KWPEWidget( QWidget* parent = 0, const char* name = 0 );
+    /**
+     * Browser: Konqueror's web browser.  Mail: a message viewer (KMail):
+     * a WebKit context, network session and settings of its own, no page
+     * scripts, no remote content unless allowed, every navigation handed
+     * to the host (see loadMailFile()).
+     */
+    enum Mode { Browser, Mail };
+
+    KWPEWidget( QWidget* parent = 0, const char* name = 0, Mode mode = Browser );
     virtual ~KWPEWidget();
 
     /** False if WebKit could not be set up (no X11, no WPE platform). */
     bool isValid() const;
 
     void load( const QString& url );
+
+    Mode mode() const;
+    /**
+     * Mail mode: show the HTML file @p path (written by the host into a
+     * private directory).  WebKit sees it under a URL of its own
+     * (kwpemail://m<n>/...): a new origin for every message.  Only files
+     * in its directory (and KDE's icons and data) are served; @p path
+     * is the host's document (the headers), every other HTML file is
+     * message content: no scripts, no forms, no plugins, no frames of its
+     * own, remote images, styles and fonts only if @p loadExternal.
+     * Before every message the session forgets what the previous one
+     * stored (cookies, caches) if that one could load remote content.
+     */
+    void loadMailFile( const QString& path, bool loadExternal );
+    /** Mail mode: scroll the page by @p dx, @p dy pixels. */
+    void scrollBy( int dx, int dy );
+    /** Select the whole page. */
+    void selectAll();
     void reload( bool bypassCache = false );
     void stop();
     /**
@@ -128,6 +154,11 @@ signals:
      * (mailto:, ftp:, smb:, ...): for Konqueror (KIO, an application).
      */
     void externalURLRequested( const QString& url );
+    /**
+     * Mail mode: a link was clicked (or another navigation the user
+     * started): WebKit does not follow it, the host does.
+     */
+    void linkActivated( const QString& url );
     /** A script went back/forward (history.back()), @p steps from here. */
     void historyNavigationRequested( int steps );
     /**
@@ -183,6 +214,7 @@ private slots:
     void adBlockChanged();
     void reloadForFilters();
     void loadDeferred();
+    void loadPendingMail();
 
 private:
     friend class KWPEWidgetPrivate;

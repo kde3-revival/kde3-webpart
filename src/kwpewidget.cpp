@@ -14,6 +14,7 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include <qapplication.h>
 #include <qclipboard.h>
 #include <qcursor.h>
+#include <qdir.h>
 #include <qguardedptr.h>
 #include <qfile.h>
 #include <qmap.h>
@@ -31,6 +33,7 @@
 #include <kglobal.h>
 #include <kio/passdlg.h>
 #include <klocale.h>
+#include <kmimetype.h>
 #include <kurl.h>
 #include <kstandarddirs.h>
 
@@ -82,11 +85,12 @@ static bool envFlag( const char* name )
     return value && *value && strcmp( value, "0" ) != 0;
 }
 
-// Once per process.  The module is never unloaded (__kde_do_not_unload
-// in the part: GObject types and the X event filter cannot go away).
-static bool ensureWebKit()
+// The X11 WPE display, once per process.  The module is never unloaded
+// (__kde_do_not_unload in the part: GObject types and the X event filter
+// cannot go away).
+static bool ensureDisplay()
 {
-    if ( s_context )
+    if ( s_display )
         return true;
 
     // The display first: WebKit uses the WPEPlatform API as soon as the
@@ -99,6 +103,16 @@ static bool ensureWebKit()
     // The clipboard now, not at WebKit's first paste: KWPEClipboard tells
     // it what the X selections offer before that.
     wpe_display_get_clipboard( s_display );
+    return true;
+}
+
+// Konqueror's WebKit, once per process.
+static bool ensureWebKit()
+{
+    if ( s_context )
+        return true;
+    if ( !ensureDisplay() )
+        return false;
 
     if ( envFlag( "KWPE_EPHEMERAL" ) ) {
         s_session = webkit_network_session_new_ephemeral();
@@ -141,13 +155,257 @@ static bool ensureWebKit()
 }
 
 // ---------------------------------------------------------------------
+// mail mode (KMail's message viewer)
+//
+// Its own context (own web processes, no memory cache for documents no
+// longer shown, no page cache), its own ephemeral network session (no
+// cookies, caches, storage of Konqueror's; nothing on disk; gone with the
+// process) and its own settings (no page scripts).  The host writes a
+// message as files into a private directory; WebKit reads them through
+// the kwpemail: scheme, one host name per message (kwpemail://m<n>/path):
+// a new origin for each.  The opened file is the host's document (the
+// headers); every other HTML file is message content, which the host
+// shows in a sandboxed <iframe>.  The Content-Security-Policy of the
+// responses is what keeps remote content out (and scripts, forms,
+// frames, plugins), whatever the HTML says.
+
+static WebKitWebContext* s_mailContext = 0;
+static WebKitNetworkSession* s_mailSession = 0;
+static WebKitSettings* s_mailSettings = 0;
+static const char mailScheme[] = "kwpemail";
+static const char mailWorld[] = "kwpemail";
+
+struct KWPEMailDocument
+{
+    QString dir;        // the message's directory (no trailing slash)
+    QString mainFile;   // the host's document in it
+    bool external;      // remote images, styles, fonts allowed
+};
+typedef QMap<QString, KWPEMailDocument> KWPEMailDocuments;
+static KWPEMailDocuments* s_mailDocuments = 0;   // host name -> message
+static QStringList* s_mailHosts = 0;             // oldest first
+static unsigned s_mailSerial = 0;
+// A message could load remote content: what the session keeps (cookies,
+// caches, HSTS, ...) is dropped before the next one is shown.
+static bool s_mailSessionDirty = false;
+
+static QString realFilePath( const QString& path )
+{
+    char* real = realpath( QFile::encodeName( path ).data(), 0 );
+    if ( !real )
+        return QString::null;
+    QString result = QFile::decodeName( real );
+    free( real );
+    return result;
+}
+
+// Images of KDE's icon themes and of KMail's own pictures, which the
+// host's document uses (absolute paths).  Not $KDEHOME/share/apps in
+// general: KMail keeps its mail there.
+static bool isAllowedResource( const QString& file )
+{
+    static QStringList* dirs = 0;
+    if ( !dirs ) {
+        dirs = new QStringList;
+        QStringList candidates = KGlobal::dirs()->resourceDirs( "icon" );
+        candidates += KGlobal::dirs()->findDirs( "data", "kmail/pics/" );
+        candidates += KGlobal::dirs()->findDirs( "data", "libkdepim/pics/" );
+        for ( QStringList::ConstIterator it = candidates.begin(); it != candidates.end(); ++it ) {
+            QString real = realFilePath( *it );
+            if ( !real.isEmpty() )
+                dirs->append( real + "/" );
+        }
+    }
+    static const char* const extensions[] = { ".png", ".jpg", ".jpeg", ".gif", ".svg", ".svgz", ".xpm" };
+    bool image = false;
+    for ( unsigned i = 0; i < sizeof( extensions ) / sizeof( extensions[0] ) && !image; ++i )
+        image = file.endsWith( extensions[i] );
+    if ( !image )
+        return false;
+    for ( QStringList::ConstIterator it = dirs->begin(); it != dirs->end(); ++it )
+        if ( file.startsWith( *it ) )
+            return true;
+    return false;
+}
+
+static QCString mailPolicy( bool hostDocument, bool external )
+{
+    if ( hostDocument )
+        // KMail's headers, attachment list, text parts; the HTML parts in
+        // frames of the same message.
+        return "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
+               // The frames' own navigations (a link clicked in a message)
+               // must get as far as WebKit's policy decision, which hands
+               // them to the host: frame-src of this document applies.
+               "frame-src 'self' http: https: mailto: ftp: news: kmail:; script-src 'none'; object-src 'none'; "
+               "form-action 'none'; base-uri 'none'";
+    // Message content.  The sandbox also holds if the host forgot the
+    // iframe's: no scripts, forms, plugins, automatic features; links may
+    // open windows and the top frame on a click (WebKit asks us first).
+    // (<a ping>, DNS prefetching, the application cache: WebKit 2.54 has
+    // no settings for them any more; pings are connections: default-src.)
+    QCString remote = external ? QCString( " http: https:" ) : QCString();
+    return "default-src 'none'; img-src data:" + remote + "; style-src 'unsafe-inline'" + remote
+           + "; font-src data:" + remote + "; script-src 'none'; object-src 'none'; frame-src 'none'; "
+             "child-src 'none'; worker-src 'none'; form-action 'none'; base-uri 'self'" + remote
+           + "; sandbox allow-same-origin allow-popups allow-popups-to-escape-sandbox "
+             "allow-top-navigation-by-user-activation";
+}
+
+static void finishMailRequest( WebKitURISchemeRequest* request, const char* message )
+{
+    GError* error = g_error_new_literal( G_IO_ERROR, G_IO_ERROR_NOT_FOUND, message );
+    webkit_uri_scheme_request_finish_error( request, error );
+    g_error_free( error );
+}
+
+static void onMailRequest( WebKitURISchemeRequest* request, gpointer )
+{
+    KURL url( QString::fromUtf8( webkit_uri_scheme_request_get_uri( request ) ) );
+    KWPEMailDocuments::ConstIterator it = s_mailDocuments ? s_mailDocuments->find( url.host() ) : KWPEMailDocuments::ConstIterator();
+    if ( !s_mailDocuments || it == s_mailDocuments->end() ) {
+        finishMailRequest( request, "no such message" );
+        return;
+    }
+    const KWPEMailDocument& doc = it.data();
+    QString file = realFilePath( QDir::cleanDirPath( url.path() ) );
+    bool inMessage = !file.isEmpty() && file.startsWith( doc.dir + "/" ) && file.find( '/', doc.dir.length() + 1 ) < 0;
+    if ( !inMessage && ( file.isEmpty() || !isAllowedResource( file ) ) ) {
+        if ( getenv( "KWPE_DEBUG" ) )
+            fprintf( stderr, "kwpe: mail: refused %s\n", url.url().utf8().data() );
+        finishMailRequest( request, "not part of the message" );
+        return;
+    }
+    QFile f( file );
+    if ( !f.open( IO_ReadOnly ) || f.size() > 256 * 1024 * 1024 ) {
+        finishMailRequest( request, "cannot read" );
+        return;
+    }
+    QByteArray data = f.readAll();
+    bool html = file.endsWith( ".html" );
+    QCString type = html ? QCString( "text/html; charset=utf-8" ) : QCString( KMimeType::findByPath( file, 0, true )->name().latin1() );
+
+    GBytes* bytes = g_bytes_new( data.data(), data.size() );
+    GInputStream* stream = g_memory_input_stream_new_from_bytes( bytes );
+    g_bytes_unref( bytes );
+    WebKitURISchemeResponse* response = webkit_uri_scheme_response_new( stream, data.size() );
+    g_object_unref( stream );
+    webkit_uri_scheme_response_set_content_type( response, type.data() );
+    SoupMessageHeaders* headers = soup_message_headers_new( SOUP_MESSAGE_HEADERS_RESPONSE );
+    soup_message_headers_append( headers, "Content-Type", type.data() );
+    soup_message_headers_append( headers, "Content-Security-Policy", mailPolicy( file == doc.mainFile, doc.external ).data() );
+    soup_message_headers_append( headers, "Referrer-Policy", "no-referrer" );
+    soup_message_headers_append( headers, "X-Content-Type-Options", "nosniff" );
+    soup_message_headers_append( headers, "X-DNS-Prefetch-Control", "off" );
+    webkit_uri_scheme_response_set_http_headers( response, headers );   // takes them
+    webkit_uri_scheme_request_finish_with_response( request, response );
+    g_object_unref( response );
+}
+
+// WebKit must not save anything a message links to by itself.
+static void onMailDownloadStarted( WebKitNetworkSession*, WebKitDownload* download, gpointer )
+{
+    webkit_download_cancel( download );
+}
+
+static bool ensureMailWebKit()
+{
+    if ( s_mailContext )
+        return true;
+    if ( !ensureDisplay() )
+        return false;
+
+    s_mailDocuments = new KWPEMailDocuments;
+    s_mailHosts = new QStringList;
+    s_mailSession = webkit_network_session_new_ephemeral();
+    g_signal_connect( s_mailSession, "download-started", G_CALLBACK( onMailDownloadStarted ), 0 );
+    webkit_network_session_set_tls_errors_policy( s_mailSession, WEBKIT_TLS_ERRORS_POLICY_FAIL );
+
+    s_mailContext = webkit_web_context_new();
+    // No memory cache of resources a shown document no longer uses, no
+    // page cache: a remote image of one message is not served from memory
+    // to the next (see also s_mailSessionDirty).
+    webkit_web_context_set_cache_model( s_mailContext, WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER );
+    webkit_web_context_register_uri_scheme( s_mailContext, mailScheme, onMailRequest, 0, 0 );
+
+    s_mailSettings = webkit_settings_new();
+    // Our own script world runs (frame heights, copy, scrolling); the
+    // page's scripts, event handler attributes and javascript: URLs not.
+    webkit_settings_set_enable_javascript( s_mailSettings, TRUE );
+    webkit_settings_set_enable_javascript_markup( s_mailSettings, FALSE );
+    webkit_settings_set_javascript_can_open_windows_automatically( s_mailSettings, FALSE );
+    webkit_settings_set_javascript_can_access_clipboard( s_mailSettings, FALSE );
+    webkit_settings_set_allow_file_access_from_file_urls( s_mailSettings, FALSE );
+    webkit_settings_set_allow_universal_access_from_file_urls( s_mailSettings, FALSE );
+    webkit_settings_set_allow_top_navigation_to_data_urls( s_mailSettings, FALSE );
+    webkit_settings_set_enable_html5_local_storage( s_mailSettings, FALSE );
+    webkit_settings_set_enable_html5_database( s_mailSettings, FALSE );
+    webkit_settings_set_enable_page_cache( s_mailSettings, FALSE );
+    webkit_settings_set_enable_media( s_mailSettings, FALSE );
+    webkit_settings_set_enable_mediasource( s_mailSettings, FALSE );
+    webkit_settings_set_enable_media_stream( s_mailSettings, FALSE );
+    webkit_settings_set_enable_encrypted_media( s_mailSettings, FALSE );
+    webkit_settings_set_enable_webrtc( s_mailSettings, FALSE );
+    webkit_settings_set_enable_webaudio( s_mailSettings, FALSE );
+    webkit_settings_set_enable_webgl( s_mailSettings, FALSE );
+    webkit_settings_set_enable_fullscreen( s_mailSettings, FALSE );
+    webkit_settings_set_allow_modal_dialogs( s_mailSettings, FALSE );
+    webkit_settings_set_enable_2d_canvas_acceleration( s_mailSettings, FALSE );
+    webkit_settings_set_enable_developer_extras( s_mailSettings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
+    KWPEWidget::applySettings();
+    return true;
+}
+
+// The heights of the message's frames (its HTML parts): their documents'
+// heights, kept up to date (images, fonts, a narrower window), so the
+// view scrolls as one page.  The document stays hidden (mailHideStyle)
+// until its frames have their heights: WebKit keeps showing the previous
+// message meanwhile (it shows a new page once it is visually non-empty
+// or loaded), instead of the headers alone first.  In our script world:
+// the page has none.
+static const char mailFrameScript[] =
+    "(function() {"
+    "  var frames = document.querySelectorAll('iframe'), pending = frames.length;"
+    "  function reveal() { document.documentElement.setAttribute('data-kwpe-ready', ''); }"
+    "  function fit(f) {"
+    "    try {"
+    "      var d = f.contentDocument;"
+    "      if (!d || !d.documentElement) return;"
+    "      var h = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);"
+    "      if (Math.abs(f.getBoundingClientRect().height - h) > 1) f.style.height = h + 'px';"
+    "    } catch (e) {}"
+    "  }"
+    "  function watch(f) {"
+    "    if (f.kwpeWatched) return false;"
+    "    var d = f.contentDocument;"
+    "    if (!d || !d.documentElement || d.readyState != 'complete' || d.URL == 'about:blank') return false;"
+    "    f.kwpeWatched = true;"
+    "    fit(f);"
+    "    try { new ResizeObserver(function() { fit(f); }).observe(d.documentElement); } catch (e) {}"
+    "    d.addEventListener('load', function() { fit(f); }, true);"
+    "    if (--pending == 0) reveal();"
+    "    return true;"
+    "  }"
+    "  for (var i = 0; i < frames.length; i++) {"
+    "    (function(f) {"
+    "      f.addEventListener('load', function() { watch(f); fit(f); });"
+    "      watch(f);"
+    "    })(frames[i]);"
+    "  }"
+    "  if (pending <= 0) reveal();"
+    "  window.addEventListener('load', function() { for (var i = 0; i < frames.length; i++) fit(frames[i]); reveal(); });"
+    "  setTimeout(reveal, 1500);"
+    "})();";
+static const char mailHideStyle[] = "html:not([data-kwpe-ready]) { visibility: hidden !important; }";
+
+// ---------------------------------------------------------------------
 // KWPEWidgetPrivate
 
 class KWPEWidgetPrivate : public KWPE::ViewHost
 {
 public:
-    KWPEWidgetPrivate( KWPEWidget* widget )
-        : q( widget ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+    KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
+        : q( widget ), mode( m ), pendingMailExternal( false ), mailClearing( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -170,6 +428,10 @@ public:
     static void onProgressChanged( GObject*, GParamSpec*, gpointer data );
     static void onMouseTargetChanged( WebKitWebView*, WebKitHitTestResult* hit, guint modifiers, gpointer data );
     static gboolean onDecidePolicy( WebKitWebView*, WebKitPolicyDecision* decision, WebKitPolicyDecisionType type, gpointer data );
+    gboolean decideMailPolicy( WebKitPolicyDecision* decision, WebKitPolicyDecisionType type );
+    void activateLink( const char* uri );
+    static void onMailDataCleared( GObject* manager, GAsyncResult* result, gpointer data );
+    bool isMail() const { return mode == KWPEWidget::Mail; }
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
@@ -191,6 +453,13 @@ public:
     static void onFailedToFindText( WebKitFindController*, gpointer data );
 
     KWPEWidget* q;
+    KWPEWidget::Mode mode;
+    QString mailHost;          // mail mode: the message shown (kwpemail://<host>/)
+    QString mailMainURL;       // ... and the host's document
+    QString pendingMailPath;   // waits for the session to forget the previous message
+    bool pendingMailExternal;
+    bool mailClearing;
+    QStringList activatedLinks;   // for the host, outside WebKit's signal
     WebKitWebView* view;
     WPEView* wpeView;
     WPEToplevel* toplevel;
@@ -271,20 +540,39 @@ void KWPEWidgetPrivate::setCursorName( const char* name )
 
 void KWPEWidgetPrivate::create()
 {
-    if ( !ensureWebKit() )
+    if ( isMail() ? !ensureMailWebKit() : !ensureWebKit() )
         return;
 
     // A content manager per view: the ad blocker's filters are attached
-    // to it or not, depending on the site the view shows.
+    // to it or not, depending on the site the view shows.  Mail: our
+    // script for the message's frames, no ad blocker (nothing remote
+    // unless the user wants it for a message).
     contentManager = webkit_user_content_manager_new();
+    if ( isMail() ) {
+        WebKitUserScript* script = webkit_user_script_new_for_world( mailFrameScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                                                     WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, mailWorld, 0, 0 );
+        webkit_user_content_manager_add_script( contentManager, script );
+        webkit_user_script_unref( script );
+        WebKitUserStyleSheet* style = webkit_user_style_sheet_new( mailHideStyle, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                                                   WEBKIT_USER_STYLE_LEVEL_USER, 0, 0 );
+        webkit_user_content_manager_add_style_sheet( contentManager, style );
+        webkit_user_style_sheet_unref( style );
+    }
     view = WEBKIT_WEB_VIEW( g_object_new( WEBKIT_TYPE_WEB_VIEW,
                                           "display", s_display,
-                                          "web-context", s_context,
-                                          "network-session", s_session,
-                                          "settings", s_settings,
+                                          "web-context", isMail() ? s_mailContext : s_context,
+                                          "network-session", isMail() ? s_mailSession : s_session,
+                                          "settings", isMail() ? s_mailSettings : s_settings,
                                           "user-content-manager", contentManager,
                                           NULL ) );
-    KWPEAdBlock::self()->addView( contentManager );
+    if ( !isMail() ) {
+        KWPEAdBlock::self()->addView( contentManager );
+    } else {
+        // A frame without content yet (the first one, one of a new size)
+        // is white like a message, not transparent (black on X).
+        WebKitColor white = { 1.0, 1.0, 1.0, 1.0 };
+        webkit_web_view_set_background_color( view, &white );
+    }
     wpeView = webkit_web_view_get_wpe_view( view );
     g_object_set_data( G_OBJECT( view ), widgetKey, q );
 
@@ -355,7 +643,8 @@ void KWPEWidgetPrivate::destroy()
     frameCallback = 0;
     g_object_unref( view );
     g_object_unref( toplevel );
-    KWPEAdBlock::self()->removeView( contentManager );
+    if ( !isMail() )
+        KWPEAdBlock::self()->removeView( contentManager );
     g_object_unref( contentManager );
     contentManager = 0;
     view = 0;
@@ -435,7 +724,8 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         // response).  WebKit decides which elements to hide when it
         // requests the page: if the filters were switched later, the
         // page is loaded once more, with the right ones.
-        KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() );
+        if ( !d->isMail() )
+            KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( QString::fromUtf8( webkit_web_view_get_uri( view ) ) ).host() );
         if ( d->reloadForFilters ) {
             d->reloadForFilters = false;
             QTimer::singleShot( 0, d->q, SLOT( reloadForFilters() ) );
@@ -533,6 +823,9 @@ void KWPEWidgetPrivate::onMouseTargetChanged( WebKitWebView*, WebKitHitTestResul
     QString link;
     if ( webkit_hit_test_result_context_is_link( hit ) )
         link = QString::fromUtf8( webkit_hit_test_result_get_link_uri( hit ) );
+    // Mail: an anchor of the host's document as the host wrote it.
+    if ( d->isMail() && link.startsWith( d->mailMainURL + "#" ) )
+        link = link.mid( d->mailMainURL.length() );
     emit d->q->linkHovered( link );
 }
 
@@ -585,6 +878,8 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
                                             WebKitPolicyDecisionType type, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( d->isMail() )
+        return d->decideMailPolicy( decision, type );
 
     if ( type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION ) {
         WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(
@@ -687,6 +982,69 @@ gboolean KWPEWidgetPrivate::onDecidePolicy( WebKitWebView* view, WebKitPolicyDec
     return FALSE;
 }
 
+// Mail mode: WebKit loads the message's own documents (the host's one,
+// the frames of its HTML parts, anchors in them) and nothing else.  What
+// the user starts (a click, also on target=_blank and with the middle
+// button) goes to the host; what the message would start by itself
+// (refresh, redirects, forms) is dropped.
+gboolean KWPEWidgetPrivate::decideMailPolicy( WebKitPolicyDecision* decision, WebKitPolicyDecisionType type )
+{
+    if ( type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE )
+        return FALSE;   // only our own documents get this far
+
+    WebKitNavigationAction* action = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION( decision ) );
+    const char* uri = webkit_uri_request_get_uri( webkit_navigation_action_get_request( action ) );
+    WebKitNavigationType navigation = webkit_navigation_action_get_navigation_type( action );
+    bool byUser = navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED || webkit_navigation_action_is_user_gesture( action );
+
+    if ( type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && !mailHost.isEmpty() ) {
+        KURL target( QString::fromUtf8( uri ) );
+        if ( target.protocol() == mailScheme && target.host() == mailHost ) {
+            QString file = target.path();
+            bool own = file.endsWith( ".html" );
+            // An anchor (the attachment list, a message's table of contents).
+            if ( own && target.hasRef() && navigation == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED )
+                return FALSE;
+            // Our load of the host's document, the frames it has.
+            if ( own && !byUser && !target.hasRef()
+                 && ( navigation == WEBKIT_NAVIGATION_TYPE_OTHER || navigation == WEBKIT_NAVIGATION_TYPE_RELOAD ) )
+                return FALSE;
+        }
+    }
+    webkit_policy_decision_ignore( decision );
+    if ( byUser && navigation != WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED
+         && navigation != WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED && g_ascii_strncasecmp( uri, "kwpemail:", 9 ) != 0 )
+        activateLink( uri );
+    else if ( getenv( "KWPE_DEBUG" ) )
+        fprintf( stderr, "kwpe: mail: navigation to %s dropped (type %d)\n", uri, int( navigation ) );
+    return TRUE;
+}
+
+void KWPEWidgetPrivate::activateLink( const char* uri )
+{
+    // The host may run an event loop (a dialog) or delete us: not inside
+    // WebKit's signal.
+    activatedLinks.append( QString::fromUtf8( uri ) );
+    QTimer::singleShot( 0, q, SLOT( emitExternalURL() ) );
+}
+
+void KWPEWidgetPrivate::onMailDataCleared( GObject* manager, GAsyncResult* result, gpointer data )
+{
+    GError* error = 0;
+    webkit_website_data_manager_clear_finish( WEBKIT_WEBSITE_DATA_MANAGER( manager ), result, &error );
+    if ( error ) {
+        bool cancelled = g_error_matches( error, G_IO_ERROR, G_IO_ERROR_CANCELLED );
+        fprintf( stderr, "kwpe: mail: clearing the session failed: %s\n", error->message );
+        g_error_free( error );
+        if ( cancelled )
+            return;   // the widget is gone
+    }
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    d->mailClearing = false;
+    d->q->loadPendingMail();
+}
+
 void KWPEWidgetPrivate::onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data )
 {
     if ( removed )
@@ -760,7 +1118,7 @@ void KWPEWidgetPrivate::findIcon()
         "})()";
     // KDE's favicon cache is on disk and fetched by kded: not for a
     // session that keeps nothing.
-    if ( view && !envFlag( "KWPE_EPHEMERAL" ) )
+    if ( view && !envFlag( "KWPE_EPHEMERAL" ) && !isMail() )
         webkit_web_view_evaluate_javascript( view, script, -1, "kwpepart", 0, cancellable, onIconURL, this );
 }
 
@@ -851,6 +1209,12 @@ void KWPEWidgetPrivate::onInsecureContent( WebKitWebView*, WebKitInsecureContent
 gboolean KWPEWidgetPrivate::onAuthenticate( WebKitWebView*, WebKitAuthenticationRequest* request, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // A message must not ask for passwords (a remote image behind HTTP
+    // authentication, a phishing attempt).
+    if ( d->isMail() ) {
+        webkit_authentication_request_cancel( request );
+        return TRUE;
+    }
     switch ( webkit_authentication_request_get_scheme( request ) ) {
     case WEBKIT_AUTHENTICATION_SCHEME_CLIENT_CERTIFICATE_REQUESTED:
     case WEBKIT_AUTHENTICATION_SCHEME_SERVER_TRUST_EVALUATION_REQUESTED:
@@ -898,7 +1262,7 @@ gboolean KWPEWidgetPrivate::onScriptDialog( WebKitWebView* view, WebKitScriptDia
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     // The user said no more; or a file chooser is open (one dialog at a
     // time): answered without asking.
-    if ( d->suppressDialogs || d->pageDialog ) {
+    if ( d->suppressDialogs || d->pageDialog || d->isMail() ) {
         d->quietDialogs.append( webkit_script_dialog_ref( dialog ) );
         QTimer::singleShot( 0, d->q, SLOT( answerQuietDialogs() ) );
         return TRUE;
@@ -940,8 +1304,8 @@ void KWPEWidgetPrivate::answerQuietDialogs()
 gboolean KWPEWidgetPrivate::onRunFileChooser( WebKitWebView*, WebKitFileChooserRequest* request, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
-    if ( d->pageDialog )
-        webkit_file_chooser_request_cancel( request );   // one at a time
+    if ( d->pageDialog || d->isMail() )
+        webkit_file_chooser_request_cancel( request );   // one at a time; none for a message
     else
         d->showPageDialog( new KWPEFileChooser( request, d->q ) );
     return TRUE;
@@ -980,10 +1344,10 @@ void KWPEWidgetPrivate::onFrameDisplayed( WebKitWebView*, gpointer data )
 // ---------------------------------------------------------------------
 // KWPEWidget
 
-KWPEWidget::KWPEWidget( QWidget* parent, const char* name )
+KWPEWidget::KWPEWidget( QWidget* parent, const char* name, Mode mode )
     : QWidget( parent, name, WRepaintNoErase | WResizeNoErase )
 {
-    d = new KWPEWidgetPrivate( this );
+    d = new KWPEWidgetPrivate( this, mode );
     // WebKit paints everything; the X server must not clear the window.
     setBackgroundMode( NoBackground );
     setFocusPolicy( StrongFocus );
@@ -1009,6 +1373,10 @@ void KWPEWidget::load( const QString& url )
     d->unsupportedUrl = QString::null;
     if ( !d->view )
         return;
+    if ( d->isMail() ) {
+        // The host gives files (loadMailFile()); nothing else is loaded.
+        return;
+    }
     // The filters for the site, before WebKit requests the page.
     KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
     // A process just started: the filters are read from their store in
@@ -1024,6 +1392,88 @@ void KWPEWidget::load( const QString& url )
     }
     d->deferredURL = QString::null;
     webkit_web_view_load_uri( d->view, url.utf8().data() );
+}
+
+KWPEWidget::Mode KWPEWidget::mode() const
+{
+    return d->mode;
+}
+
+void KWPEWidget::loadMailFile( const QString& path, bool loadExternal )
+{
+    if ( !d->view || !d->isMail() )
+        return;
+    d->pendingMailPath = path;
+    d->pendingMailExternal = loadExternal;
+    if ( d->mailClearing )
+        return;   // loadPendingMail() follows
+    if ( s_mailSessionDirty ) {
+        // The previous message could load remote content: cookies, caches,
+        // HSTS, ... of the session go before the next one is shown (a
+        // tracker must not learn which messages were read).
+        s_mailSessionDirty = false;
+        d->mailClearing = true;
+        webkit_website_data_manager_clear( webkit_network_session_get_website_data_manager( s_mailSession ),
+                                           WEBKIT_WEBSITE_DATA_ALL, 0, d->cancellable,
+                                           KWPEWidgetPrivate::onMailDataCleared, d );
+        return;
+    }
+    loadPendingMail();
+}
+
+void KWPEWidget::loadPendingMail()
+{
+    QString path = d->pendingMailPath;
+    d->pendingMailPath = QString::null;
+    if ( path.isEmpty() || !d->view )
+        return;
+    QString file = realFilePath( path );
+    if ( file.isEmpty() ) {
+        emit loadFailed( i18n( "Cannot read %1" ).arg( path ) );
+        return;
+    }
+    KWPEMailDocument doc;
+    doc.dir = file.left( file.findRev( '/' ) );
+    doc.mainFile = file;
+    doc.external = d->pendingMailExternal;
+    if ( doc.dir.isEmpty() )
+        return;
+    // A new origin for every message; the last few stay valid for loads
+    // still under way (another reader window may show one of them).
+    QString host = QString::fromLatin1( "m%1" ).arg( ++s_mailSerial );
+    s_mailDocuments->insert( host, doc );
+    s_mailHosts->append( host );
+    while ( s_mailHosts->count() > 8 ) {
+        s_mailDocuments->remove( s_mailHosts->first() );
+        s_mailHosts->remove( s_mailHosts->begin() );
+    }
+    if ( doc.external )
+        s_mailSessionDirty = true;
+    KURL url;
+    url.setProtocol( mailScheme );
+    url.setHost( host );
+    url.setPath( file );
+    d->mailHost = host;
+    d->mailMainURL = url.url();
+    if ( d->statsEnabled )
+        fprintf( stderr, "kwpe: mail: loading %s\n", d->mailMainURL.utf8().data() );
+    webkit_web_view_load_uri( d->view, d->mailMainURL.utf8().data() );
+}
+
+void KWPEWidget::scrollBy( int dx, int dy )
+{
+    if ( !d->view )
+        return;
+    QCString script;
+    script.sprintf( "window.scrollBy(%d, %d)", dx, dy );
+    webkit_web_view_evaluate_javascript( d->view, script.data(), -1, d->isMail() ? mailWorld : "kwpepart", 0,
+                                         d->cancellable, 0, 0 );
+}
+
+void KWPEWidget::selectAll()
+{
+    if ( d->view )
+        webkit_web_view_execute_editing_command( d->view, WEBKIT_EDITING_COMMAND_SELECT_ALL );
 }
 
 void KWPEWidget::adBlockChanged()
@@ -1142,8 +1592,23 @@ void KWPEWidget::copySelection()
         "  }"
         "  return window.getSelection().toString();"
         "})()";
+    // Mail: the selection may be in a frame of the message (an HTML part).
+    static const char mailScript[] =
+        "(function() {"
+        "  function selected(w) {"
+        "    var t = w.getSelection().toString();"
+        "    if (t) return t;"
+        "    var frames = w.document.querySelectorAll('iframe');"
+        "    for (var i = 0; i < frames.length; i++) {"
+        "      try { t = selected(frames[i].contentWindow); if (t) return t; } catch (e) {}"
+        "    }"
+        "    return '';"
+        "  }"
+        "  return selected(window);"
+        "})()";
     if ( d->view )
-        webkit_web_view_evaluate_javascript( d->view, script, -1, "kwpepart", 0, d->cancellable,
+        webkit_web_view_evaluate_javascript( d->view, d->isMail() ? mailScript : script, -1,
+                                             d->isMail() ? mailWorld : "kwpepart", 0, d->cancellable,
                                              KWPEWidgetPrivate::onSelectionText, 0 );
 }
 
@@ -1227,6 +1692,14 @@ void KWPEWidget::answerQuietDialogs()
 
 void KWPEWidget::emitExternalURL()
 {
+    if ( d->isMail() ) {
+        // One link per click; the host may delete us while it handles it.
+        QStringList links = d->activatedLinks;
+        d->activatedLinks.clear();
+        if ( !links.isEmpty() )
+            emit linkActivated( links.first() );
+        return;
+    }
     QString url = d->externalUrl;
     d->externalUrl = QString::null;
     if ( !url.isEmpty() )
@@ -1302,14 +1775,15 @@ KWPEWidget::HistoryResult KWPEWidget::goToHistoryToken( int token, const QString
     if ( it.data() == webkit_back_forward_list_get_current_item( list ) )
         return HistoryCurrent;
     d->ownBackForward = true;
-    KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
+    if ( !d->isMail() )
+        KWPEAdBlock::self()->setViewHost( d->contentManager, KURL( url ).host() );
     webkit_web_view_go_to_back_forward_list_item( d->view, it.data() );
     return HistoryNavigating;
 }
 
 void KWPEWidget::applySettings()
 {
-    if ( !s_settings )
+    if ( !s_settings && !s_mailSettings )
         return;
     // Animated scrolling lags behind a fast wheel (every notch extends the
     // animation): off unless asked for.  "When efficient": with the GPU
@@ -1317,7 +1791,10 @@ void KWPEWidget::applySettings()
     KWPESettings::SmoothScrolling smooth = KWPESettings::smoothScrolling();
     bool on = smooth == KWPESettings::SmoothAlways
               || ( smooth == KWPESettings::SmoothWhenEfficient && KWPE::bufferPath() == KWPE::PathDMABuf );
-    webkit_settings_set_enable_smooth_scrolling( s_settings, on );
+    if ( s_settings )
+        webkit_settings_set_enable_smooth_scrolling( s_settings, on );
+    if ( s_mailSettings )
+        webkit_settings_set_enable_smooth_scrolling( s_mailSettings, on );
 }
 
 QString KWPEWidget::bufferPathName()
@@ -1354,7 +1831,9 @@ bool KWPEWidget::event( QEvent* e )
         int key = k->key();
         bool modified = k->state() & ( ControlButton | AltButton | MetaButton );
         bool functionKey = ( key >= Key_F1 && key <= Key_F35 ) || key == Key_Escape;
-        if ( !modified && !functionKey ) {
+        // Mail: a message has no fields to type into; KMail's single-key
+        // shortcuts (next message, delete, scrolling) stay KMail's.
+        if ( !modified && !functionKey && !d->isMail() ) {
             k->accept();
             return true;
         }

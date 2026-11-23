@@ -45,6 +45,11 @@ class KWPEBrowserExtension;
 class KWPEPart : public KParts::ReadOnlyPart
 {
     Q_OBJECT
+    /**
+     * Mail mode: remote images, styles and fonts of the messages opened
+     * from now on (KMail's "load external references").
+     */
+    Q_PROPERTY( bool mailLoadExternal READ mailLoadExternal WRITE setMailLoadExternal )
 
 public:
     KWPEPart( QWidget* parentWidget, const char* widgetName,
@@ -56,6 +61,30 @@ public:
 
     virtual bool openURL( const KURL& url );
     virtual bool closeURL();
+
+    /**
+     * Mail mode (argument "mode=mail" at creation, for a mail program):
+     * openURL() takes a local HTML file the host wrote into a private
+     * directory, see KWPEWidget::loadMailFile().  Links are not followed:
+     * the browser extension's openURLRequest() hands them to the host;
+     * hovering emits onURL(), a right click popupMenu() (as KHTMLPart).
+     * No history, no ad blocker, no downloads, no dialogs of the page.
+     */
+    bool isMailMode() const { return m_mail; }
+    bool mailLoadExternal() const { return m_mailLoadExternal; }
+    void setMailLoadExternal( bool load ) { m_mailLoadExternal = load; }
+
+public slots:
+    /** Scroll the page by @p dx, @p dy pixels (the host's scroll keys). */
+    void scrollBy( int dx, int dy );
+    /** Select the whole page. */
+    void selectAll();
+
+signals:
+    /** Mail mode: the pointer is over a link to @p url (empty: none). */
+    void onURL( const QString& url );
+    /** Mail mode: a right click at @p point, on a link to @p url or not. */
+    void popupMenu( const QString& url, const QPoint& point );
 
 protected:
     virtual bool openFile();
@@ -75,6 +104,7 @@ private slots:
     void slotUnsupportedContent( const QString& url, const QString& mimeType );
     void slotHistoryNavigationRequested( int steps );
     void slotExternalURL( const QString& url );
+    void slotLinkActivated( const QString& url );
     void slotContextMenu( const QString& linkUrl, const QString& imageUrl, bool onSelection, const QPoint& globalPos );
     void slotFind();
     void slotFindDialogOk();
@@ -103,6 +133,8 @@ private:
 
     KWPEWidget* m_view;
     KWPEBrowserExtension* m_ext;
+    bool m_mail;
+    bool m_mailLoadExternal;
     bool m_ownNavigation;   // openURL()/restore() started what commits next
     int m_historyToken;     // WebKit's back/forward item of m_url
     QString m_lastUnsupported;
