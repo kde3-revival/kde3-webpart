@@ -9,7 +9,7 @@
     (at your option) any later version.
 */
 
-// kwpe-render-only [--external] [--wait MS] [--shot FILE.png] MESSAGE.html
+// kwpe-render-only [--external] [--wait MS] [--twice [--after MS]] [--shot FILE] MESSAGE.html
 //
 // The part (KWPE_PART: a library name or path, default libkwpepart) in
 // mail mode shows MESSAGE.html as a message's HTML part: a host document
@@ -25,6 +25,7 @@
 #include <qfile.h>
 #include <qimage.h>
 #include <qpixmap.h>
+#include <qregexp.h>
 #include <qtimer.h>
 #include <qvariant.h>
 #include <qwidget.h>
@@ -63,6 +64,19 @@ void Driver::slotLink( const KURL& url, const KParts::URLArgs& )
     fflush( stdout );
 }
 
+void Driver::again( int ms, const KURL& url )
+{
+    m_again = url;
+    QTimer::singleShot( ms, this, SLOT( slotAgain() ) );
+}
+
+void Driver::slotAgain()
+{
+    printf( "NEXT\n" );
+    fflush( stdout );
+    m_part->openURL( m_again );
+}
+
 void Driver::slotFinish()
 {
     QWidget* w = m_part->widget();
@@ -87,9 +101,51 @@ static bool writeFile( const QString& path, const QByteArray& data )
     return f.open( IO_WriteOnly ) && f.writeBlock( data ) == (int)data.size();
 }
 
+// The message's directory, as KMail's writer makes it (0700): KMail's
+// document (headers, then the HTML part in a frame) and the HTML part.
+static QString writeMessage( const QString& file, bool first )
+{
+    QFile message( file );
+    if ( !message.open( IO_ReadOnly ) ) {
+        fprintf( stderr, "cannot read %s\n", QFile::encodeName( file ).data() );
+        return QString::null;
+    }
+    QByteArray body = message.readAll();
+    if ( first ) {
+        // the first showing (--twice) with host names of its own: a web
+        // process asks for a name only once
+        QCString text( body.data(), body.size() + 1 );
+        text.replace( QRegExp( "\\.blocked\\.test" ), ".first.blocked.test" );
+        body.duplicate( text.data(), text.length() );
+    }
+    QCString dir = QFile::encodeName( QString( getenv( "TMPDIR" ) ? getenv( "TMPDIR" ) : "/tmp" ) + "/kwpe-ro-XXXXXX" );
+    if ( !mkdtemp( dir.data() ) ) {
+        fprintf( stderr, "mkdtemp: %s\n", strerror( errno ) );
+        return QString::null;
+    }
+    QString d = QFile::decodeName( dir );
+    QCString host =
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n"
+        "<html><head><style>body { margin: 0; font-family: sans-serif; }</style></head><body>"
+        "<div style=\"background: #ddd; padding: 4px\">From: test &lt;test@example.invalid&gt;</div>"
+        "<iframe class=\"kmail-htmlpart\" src=\"body-0.html\" sandbox=\"allow-same-origin allow-popups "
+        "allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation\" "
+        "style=\"display: block; width: 100%; height: 1px; border: 0; margin: 0;\"></iframe>"
+        "</body></html>\n";
+    QByteArray hostData;
+    hostData.duplicate( host.data(), host.length() );
+    if ( !writeFile( d + "/index.html", hostData ) || !writeFile( d + "/body-0.html", body ) ) {
+        fprintf( stderr, "cannot write %s\n", dir.data() );
+        return QString::null;
+    }
+    return d;
+}
+
 static const KCmdLineOptions options[] = {
     { "external", "Load external references (images, style sheets, fonts)", 0 },
     { "wait <ms>", "Time the message gets before the screenshot", "5000" },
+    { "twice", "Show the message twice, first with host names of its own (WebKit drops the DNS prefetches of a new network process until it knows the system's proxy settings)", 0 },
+    { "after <ms>", "When the second showing follows the first", "2500" },
     { "shot <file>", "Save the screenshot (PNG, or PPM if named .ppm)", 0 },
     { "+message", "The message's HTML", 0 },
     KCmdLineLastOption
@@ -106,34 +162,14 @@ int main( int argc, char** argv )
     if ( args->count() != 1 )
         KCmdLineArgs::usage();
 
-    QFile message( QFile::decodeName( args->arg( 0 ) ) );
-    if ( !message.open( IO_ReadOnly ) ) {
-        fprintf( stderr, "cannot read %s\n", args->arg( 0 ) );
-        return 2;
-    }
-    QByteArray body = message.readAll();
-
-    // The message's directory, as KMail's writer makes it (0700).
-    QCString dir = QFile::encodeName( QString( getenv( "TMPDIR" ) ? getenv( "TMPDIR" ) : "/tmp" ) + "/kwpe-ro-XXXXXX" );
-    if ( !mkdtemp( dir.data() ) ) {
-        fprintf( stderr, "mkdtemp: %s\n", strerror( errno ) );
-        return 2;
-    }
-    QString d = QFile::decodeName( dir );
-    // KMail's document: headers, then the HTML part in a frame.
-    QCString host =
-        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n"
-        "<html><head><style>body { margin: 0; font-family: sans-serif; }</style></head><body>"
-        "<div style=\"background: #ddd; padding: 4px\">From: test &lt;test@example.invalid&gt;</div>"
-        "<iframe class=\"kmail-htmlpart\" src=\"body-0.html\" sandbox=\"allow-same-origin allow-popups "
-        "allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation\" "
-        "style=\"display: block; width: 100%; height: 1px; border: 0; margin: 0;\"></iframe>"
-        "</body></html>\n";
-    QByteArray hostData;
-    hostData.duplicate( host.data(), host.length() );
-    if ( !writeFile( d + "/index.html", hostData ) || !writeFile( d + "/body-0.html", body ) ) {
-        fprintf( stderr, "cannot write %s\n", dir.data() );
-        return 2;
+    // --first: another message shown before this one (a network process
+    // that is not new any more).
+    QStringList dirs;
+    for ( int i = args->isSet( "twice" ) ? 0 : 1; i < 2; ++i ) {
+        QString d = writeMessage( QFile::decodeName( args->arg( 0 ) ), i == 0 );
+        if ( d.isEmpty() )
+            return 2;
+        dirs.append( d );
     }
 
     QWidget top;
@@ -152,13 +188,17 @@ int main( int argc, char** argv )
 
     Driver driver( part, QString( args->getOption( "wait" ) ).toInt(),
                    args->isSet( "shot" ) ? QFile::decodeName( args->getOption( "shot" ) ) : QString::null );
-    part->openURL( KURL::fromPathOrURL( d + "/index.html" ) );
+    part->openURL( KURL::fromPathOrURL( dirs.first() + "/index.html" ) );
+    if ( dirs.count() > 1 )
+        driver.again( QString( args->getOption( "after" ) ).toInt(), KURL::fromPathOrURL( dirs.last() + "/index.html" ) );
     int rc = app.exec();
 
     delete part;
-    unlink( QFile::encodeName( d + "/index.html" ).data() );
-    unlink( QFile::encodeName( d + "/body-0.html" ).data() );
-    rmdir( dir.data() );
+    for ( unsigned i = 0; i < dirs.count(); ++i ) {
+        unlink( QFile::encodeName( dirs[i] + "/index.html" ).data() );
+        unlink( QFile::encodeName( dirs[i] + "/body-0.html" ).data() );
+        rmdir( QFile::encodeName( dirs[i] ).data() );
+    }
     return rc;
 }
 

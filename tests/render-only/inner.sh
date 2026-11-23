@@ -11,7 +11,12 @@ set -u
 T=$(cd "$(dirname "$0")" && pwd)
 B=$1; O=$2
 KDE3_PREFIX=${KDE3_PREFIX:-/opt/kde3}
-WAIT=${WAIT:-5000}
+WAIT=${WAIT:-6000}
+# every message is shown twice, the second time AFTER ms later (the first
+# time with host names *.first.blocked.test): a new network process drops
+# DNS prefetches until it knows the system's proxy settings, a long-lived
+# one (KMail's) does not
+AFTER=${AFTER:-2500}
 CONFIGS=${CONFIGS:-"all no-sanitizer no-settings no-csp no-filter no-proxy external no-layers"}
 DRIVER=$B/src/kwpe-render-only
 # KLibLoader finds modules by name in $KDEDIRS/lib/kde3: the build's part
@@ -78,10 +83,11 @@ run_one(){ # CONFIG MESSAGE
   env -i HOME=$d/home XDG_RUNTIME_DIR=$d/rt TMPDIR=$d PATH=$KDE3_PREFIX/bin:/usr/bin LANG=C.UTF-8 DISPLAY=:77 \
     KDEHOME=$d/home/.kde KDETMP=$d/kdetmp KDEVARTMP=$d/kdevartmp KDEDIRS=/tmp/kwpe-kdedir:$KDE3_PREFIX KWPE_PART=$PART KWPE_MAIL_TEST_DISABLE_LAYERS=$layers \
     WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$d/none \
-    timeout 90 $DRIVER $ext --wait $WAIT $m > $d/out 2> $d/err & local dp=$!
+    timeout 90 $DRIVER $ext --wait $WAIT --twice --after $AFTER $m > $d/out 2> $d/err & local dp=$!
   if [ $n = ping-click ]; then
-    # a real click (XTest) into the red link, 60 px below the view's top
-    sleep 3; local wx wy; read wx wy < <(awk '/^WIDGET/ { print $2, $3 }' $d/out)
+    # a real click (XTest) into the red link, 60 px below the view's top,
+    # after the second showing
+    sleep 4.5; local wx wy; read wx wy < <(awk '/^WIDGET/ { print $2, $3 }' $d/out)
     DISPLAY=:77 xdotool mousemove $(( ${wx:-0} + 100 )) $(( ${wy:-0} + 90 )) sleep 0.3 click 1
   fi
   wait $dp; local rc=$?

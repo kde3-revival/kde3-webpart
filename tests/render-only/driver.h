@@ -14,9 +14,9 @@
 
 #include <qobject.h>
 #include <qstring.h>
+#include <kurl.h>
 
 namespace KParts { class ReadOnlyPart; }
-class KURL;
 namespace KParts { struct URLArgs; }
 
 // Loads the part in mail mode (as KMail does), shows one message and
@@ -28,16 +28,19 @@ class Driver : public QObject
     Q_OBJECT
 public:
     Driver( KParts::ReadOnlyPart* part, int waitMs, const QString& shot );
+    void again( int ms, const KURL& url );
 
 public slots:
     void slotCompleted();
     void slotLink( const KURL& url, const KParts::URLArgs& );
+    void slotAgain();
     void slotFinish();
 
 private:
     KParts::ReadOnlyPart* m_part;
     int m_waitMs;
     QString m_shot;
+    KURL m_again;
 };
 
 #endif

@@ -11,7 +11,7 @@ manifests, scripts of every kind, media, others); 00-control.html is plain
 HTML that must render.  Every message carries a red box: the driver counts
 red pixels of a screenshot (layout and paint happened).
 
-  kwpe-render-only [--external] [--wait MS] MESSAGE.html
+  kwpe-render-only [--external] [--wait MS] [--twice [--after MS]] [--shot FILE] MESSAGE.html
       the driver (built with the part, not installed): the part from
       KWPE_PART (library name or path) with "mode=mail", as KMail creates
       it; MESSAGE.html as an HTML part in a frame of a host document, in a
@@ -45,7 +45,11 @@ red pixels of a screenshot (layout and paint happened).
       Parameters (environment): IMAGE (default localhost/kwpe-render-only,
       see Containerfile), KDE3_PREFIX, QT3_PREFIX (mounted read-only,
       default /opt/kde3, /opt/kde3-qt), WAIT (ms per message, default
-      5000), CONFIGS, MESSAGES (paths inside the container: /test/messages/..).
+      6000), AFTER (every message is shown twice, the second time
+      AFTER ms later, default 2500, the first time with host names
+      *.first.blocked.test: a new WebKit network process drops DNS
+      prefetches until it knows the system's proxy settings, KMail's
+      long-lived one does not), CONFIGS, MESSAGES (paths inside the container: /test/messages/..).
 
 On t590 (through the harness, reserved: ice-harness -H t590 reserve
 --reason "..." --max 90m; release afterwards), in a work directory there
