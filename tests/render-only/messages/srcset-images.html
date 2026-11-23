@@ -1,0 +1,11 @@
+<!DOCTYPE html><html><body>
+<img src="http://src.img.blocked.test/a.png" alt="src">
+<img src="data:image/png;base64,iVBORw0KGgo=" srcset="http://srcset.img.blocked.test/a.png 1x, http://srcset2.img.blocked.test/b.png 2x" alt="srcset">
+<picture><source srcset="http://source.picture.blocked.test/a.webp" type="image/webp"><img src="http://img.picture.blocked.test/a.png" alt="picture"></picture>
+<img src="//protocol-relative.img.blocked.test/a.png" alt="//">
+<img src="file:///etc/passwd" alt="file">
+<img lowsrc="http://lowsrc.img.blocked.test/a.png" dynsrc="http://dynsrc.img.blocked.test/a.avi" alt="old attributes">
+<input type="image" src="http://input.img.blocked.test/a.png">
+<table background="http://table-background.blocked.test/a.png"><tr><td background="http://td-background.blocked.test/a.png">cell</td></tr></table>
+<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cimage href='http://svg-in-data.img.blocked.test/a.png'/%3E%3C/svg%3E" alt="svg data">
+<div style="width:320px;height:120px;background:#ff0000"></div></body></html>

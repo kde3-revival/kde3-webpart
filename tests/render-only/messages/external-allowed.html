@@ -1,0 +1,14 @@
+<!DOCTYPE html><html><head>
+<link rel="stylesheet" href="http://css.allowed.test/s.css">
+<style>@font-face { font-family: Remote; src: url(http://font.allowed.test/f.woff); } p.r { font-family: Remote, sans-serif }
+body { background-image: url(http://bgimage.allowed.test/b.png) }</style>
+<link rel="dns-prefetch" href="//dns-prefetch.blocked.test"><link rel="preconnect" href="http://preconnect.blocked.test">
+<script src="http://script.blocked.test/s.js"></script>
+</head><body>
+<img src="http://img.allowed.test/i.png" alt="remote image">
+<p class="r">text in a remote font</p>
+<iframe src="http://iframe.blocked.test/"></iframe><object data="http://object.blocked.test/o"></object>
+<video src="http://video.blocked.test/v.mp4" autoplay></video>
+<a href="http://link.blocked.test/" ping="http://ping.blocked.test/">link</a>
+<img srcset="http://srcset.blocked.test/a.png 1x" alt="srcset">
+<div style="width:320px;height:120px;background:#ff0000"></div></body></html>

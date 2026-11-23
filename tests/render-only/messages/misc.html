@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><body background="http://body-background.blocked.test/a.png">
+<a href="http://download.blocked.test/f.zip" download="f.zip">download</a>
+<a href="http://target.blocked.test/" target="_blank" rel="opener">target</a>
+<area href="http://area.blocked.test/" shape="rect" coords="0,0,1,1">
+<img src="cid:not-resolved@example.invalid" alt="cid">
+<div itemscope itemtype="http://itemtype.blocked.test/x"></div>
+<blockquote cite="http://cite.blocked.test/">quote</blockquote>
+<a href="data:text/html,&lt;img src='http://data-link.blocked.test/a.png'&gt;">data link</a>
+<dialog open>dialog <form method="dialog"><button>x</button></form></dialog>
+<details open><summary>s</summary><img src="http://details.blocked.test/a.png"></details>
+<marquee>marquee</marquee>
+<x-custom src="http://custom-element.blocked.test/x"><img src="http://in-custom.blocked.test/a.png"></x-custom>
+<div style="width:320px;height:120px;background:#ff0000"></div></body></html>

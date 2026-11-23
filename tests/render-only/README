@@ -1,0 +1,63 @@
+Render-only test of the mail mode (KMail's message viewer)
+
+A message shown by the part in mail mode may only be laid out and painted:
+nothing it contains may make the part (or WebKit) look up a name or open a
+connection.  Each file in messages/ is one family of tricks (DNS
+prefetching, preconnect, prefetch/preload/prerender/modulepreload,
+speculation rules, <a ping> with a real click, srcset/imagesrcset, CSS
+url()/@import/image-set()/@font-face, meta refresh, <base>, forms, frames,
+object/embed/applet/portal, remote style sheets and fonts, favicons and
+manifests, scripts of every kind, media, others); 00-control.html is plain
+HTML that must render.  Every message carries a red box: the driver counts
+red pixels of a screenshot (layout and paint happened).
+
+  kwpe-render-only [--external] [--wait MS] MESSAGE.html
+      the driver (built with the part, not installed): the part from
+      KWPE_PART (library name or path) with "mode=mail", as KMail creates
+      it; MESSAGE.html as an HTML part in a frame of a host document, in a
+      private directory.  Prints COMPLETED, LINK <url> (a click handed to
+      the host), RENDERED <red pixels>.
+  kwpe-sanitize [html|css] [content|host] [render-only|external]
+      the first layer alone: what WebKit gets of a document (stdin).
+  run.sh BUILD_DIR [OUT_DIR]
+      everything in a podman container with its own network namespace:
+      inner.sh gives it 10.77.0.1 with a logging DNS server (dnslog.py,
+      the only resolver; it answers every name with 10.77.0.1) and a
+      logging HTTP server (httplog.py), a default route (every connection
+      attempt sends a packet), nftables counters of DNS queries, TCP SYNs
+      and other UDP packets, tcpdump on every interface.  Every message
+      runs in a fresh driver process and HOME in these configurations:
+        all            every layer: 0 DNS queries, 0 connection attempts,
+                       0 packets at all (not even to the closed proxy)
+        no-<layer>     one layer switched off (KWPE_MAIL_TEST_DISABLE_LAYERS:
+                       sanitizer, settings, csp, filter, proxy): still 0
+                       DNS queries, 0 connections other than to the part's
+                       closed proxy on 127.0.0.1, 0 HTTP requests
+        no-layers      every layer off: the measurement must see lookups
+                       and connections (it is not blind)
+        external       "load external references": only image, style and
+                       font requests (Sec-Fetch-Dest), only lookups of
+                       hosts they went to; external-allowed.html must load
+                       all three kinds
+      It exits 0 only if every run passed; summary.txt names each run
+      (FAIL lines say why), every run's directory keeps the driver's
+      output, the DNS and HTTP logs and the pcap.
+      Parameters (environment): IMAGE (default localhost/kwpe-render-only,
+      see Containerfile), KDE3_PREFIX, QT3_PREFIX (mounted read-only,
+      default /opt/kde3, /opt/kde3-qt), WAIT (ms per message, default
+      5000), CONFIGS, MESSAGES (paths inside the container: /test/messages/..).
+
+On t590 (through the harness, reserved: ice-harness -H t590 reserve
+--reason "..." --max 90m; release afterwards), in a work directory there
+with the source tree in src/ and the WebKit RPMs in ctx/rpms/:
+
+  podman build -t localhost/kwpe-render-only -f src/tests/render-only/Containerfile ctx
+  podman run --rm --network=none --security-opt label=disable -v $PWD:/work -v /opt/kde3:/opt/kde3:ro \
+      -v /opt/kde3-qt:/opt/kde3-qt:ro localhost/kwpe-render-only sh -c \
+      'cmake -G Ninja -S /work/src -B /work/build -DCMAKE_PREFIX_PATH=/opt/kde3 && ninja -C /work/build'
+  src/tests/render-only/run.sh build out; echo $?
+
+Nothing is installed: the part is the one in the build directory.  The
+container needs CAP_NET_ADMIN and CAP_NET_RAW in its own (rootless)
+network namespace for nftables and tcpdump; nothing reaches the host's
+network (--network=none).

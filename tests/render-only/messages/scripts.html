@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head>
+<script src="http://src.script.blocked.test/s.js"></script>
+<script>fetch('http://fetch.script.blocked.test/'); new Image().src = 'http://image.script.blocked.test/a.png';
+navigator.sendBeacon && navigator.sendBeacon('http://beacon.script.blocked.test/'); new WebSocket('ws://websocket.script.blocked.test/');
+document.write('<img src="http://write.script.blocked.test/a.png">');</script>
+<script type="module">import 'http://module.script.blocked.test/m.js';</script>
+<noscript><img src="http://noscript.blocked.test/a.png"></noscript>
+</head><body onload="new Image().src='http://onload.script.blocked.test/a.png'">
+<img src="x:" onerror="new Image().src='http://onerror.script.blocked.test/a.png'">
+<a href="javascript:new Image().src='http://javascript-url.script.blocked.test/a.png'">js link</a>
+<svg><script href="http://svg.script.blocked.test/s.js"></script><image href="http://svg-image.blocked.test/a.png" width="10" height="10"/>
+<use href="http://svg-use.blocked.test/u.svg#u"/><a href="http://svg-link.blocked.test/"><text y="10">svg</text></a></svg>
+<math><mi xlink:href="http://math.blocked.test/">x</mi></math>
+<div style="width:1px;height:1px" onmouseover="new Image().src='http://onmouseover.script.blocked.test/a.png'"></div>
+<template><img src="http://template.blocked.test/a.png"></template>
+<div style="width:320px;height:120px;background:#ff0000"></div></body></html>

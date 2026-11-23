@@ -212,6 +212,20 @@ static const char mailFilterExternal[] =
     "{\"trigger\":{\"url-filter\":\"^https?:\",\"resource-type\":[\"image\",\"style-sheet\",\"font\"]},"
     "\"action\":{\"type\":\"ignore-previous-rules\"}}]";
 
+// Tests only (tests/render-only): KWPE_MAIL_TEST_DISABLE_LAYERS=sanitizer,
+// settings,csp,filter,proxy switches layers off, to show that the others
+// hold without them.  Loud, never silent.
+static bool mailLayerDisabled( const char* layer )
+{
+    static QStringList* disabled = 0;
+    if ( !disabled ) {
+        disabled = new QStringList( QStringList::split( ',', QString::fromLatin1( getenv( "KWPE_MAIL_TEST_DISABLE_LAYERS" ) ) ) );
+        if ( !disabled->isEmpty() )
+            fprintf( stderr, "kwpe: mail: TESTING: layers switched off: %s\n", disabled->join( "," ).latin1() );
+    }
+    return disabled->contains( QString::fromLatin1( layer ) );
+}
+
 static QString realFilePath( const QString& path )
 {
     char* real = realpath( QFile::encodeName( path ).data(), 0 );
@@ -325,7 +339,7 @@ static void onMailRequest( WebKitURISchemeRequest* request, gpointer )
         type = "application/octet-stream";   // never a document by another name
 
     GBytes* bytes;
-    if ( html ) {
+    if ( html && !mailLayerDisabled( "sanitizer" ) ) {
         // First layer: the document rebuilt from a white list.
         std::string clean = KWPEMailSanitizer::sanitizeHtml( std::string( data.data(), data.size() ),
                                                              hostDocument ? KWPEMailSanitizer::Host : KWPEMailSanitizer::Content,
@@ -342,7 +356,8 @@ static void onMailRequest( WebKitURISchemeRequest* request, gpointer )
     webkit_uri_scheme_response_set_content_type( response, type.data() );
     SoupMessageHeaders* headers = soup_message_headers_new( SOUP_MESSAGE_HEADERS_RESPONSE );
     soup_message_headers_append( headers, "Content-Type", type.data() );
-    soup_message_headers_append( headers, "Content-Security-Policy", mailPolicy( hostDocument, doc.external ).data() );
+    if ( !mailLayerDisabled( "csp" ) )
+        soup_message_headers_append( headers, "Content-Security-Policy", mailPolicy( hostDocument, doc.external ).data() );
     soup_message_headers_append( headers, "Referrer-Policy", "no-referrer" );
     soup_message_headers_append( headers, "X-Content-Type-Options", "nosniff" );
     soup_message_headers_append( headers, "X-DNS-Prefetch-Control", "off" );
@@ -467,12 +482,14 @@ static bool ensureMailWebKit()
     s_mailSession = webkit_network_session_new_ephemeral();
     g_signal_connect( s_mailSession, "download-started", G_CALLBACK( onMailDownloadStarted ), 0 );
     webkit_network_session_set_tls_errors_policy( s_mailSession, WEBKIT_TLS_ERRORS_POLICY_FAIL );
-    guint16 port = startMailProxy();
-    QCString proxy;
-    proxy.sprintf( "http://127.0.0.1:%u", port ? unsigned( port ) : 9u );
-    WebKitNetworkProxySettings* proxySettings = webkit_network_proxy_settings_new( proxy.data(), 0 );
-    webkit_network_session_set_proxy_settings( s_mailSession, WEBKIT_NETWORK_PROXY_MODE_CUSTOM, proxySettings );
-    webkit_network_proxy_settings_free( proxySettings );
+    if ( !mailLayerDisabled( "proxy" ) ) {
+        guint16 port = startMailProxy();
+        QCString proxy;
+        proxy.sprintf( "http://127.0.0.1:%u", port ? unsigned( port ) : 9u );
+        WebKitNetworkProxySettings* proxySettings = webkit_network_proxy_settings_new( proxy.data(), 0 );
+        webkit_network_session_set_proxy_settings( s_mailSession, WEBKIT_NETWORK_PROXY_MODE_CUSTOM, proxySettings );
+        webkit_network_proxy_settings_free( proxySettings );
+    }
 
     s_mailContext = webkit_web_context_new();
     // No memory cache of resources a shown document no longer uses, no
@@ -486,7 +503,7 @@ static bool ensureMailWebKit()
     // page's scripts, event handler attributes and javascript: URLs not
     // (the parser drops them, Document::allowsContentJavaScript()).
     webkit_settings_set_enable_javascript( s_mailSettings, TRUE );
-    webkit_settings_set_enable_javascript_markup( s_mailSettings, FALSE );
+    webkit_settings_set_enable_javascript_markup( s_mailSettings, mailLayerDisabled( "settings" ) );
     webkit_settings_set_javascript_can_open_windows_automatically( s_mailSettings, FALSE );
     webkit_settings_set_javascript_can_access_clipboard( s_mailSettings, FALSE );
     webkit_settings_set_allow_file_access_from_file_urls( s_mailSettings, FALSE );
@@ -521,7 +538,7 @@ static bool ensureMailWebKit()
         "PushAPIEnabled", "GeolocationAPIEnabled", "GamepadsEnabled", "AsyncClipboardAPIEnabled",
         "BroadcastChannelEnabled", "WebXREnabled", 0
     };
-    for ( const char* const* f = offFeatures; *f; ++f )
+    for ( const char* const* f = offFeatures; *f && !mailLayerDisabled( "settings" ); ++f )
         setFeature( s_mailSettings, *f, false );
     KWPEWidget::applySettings();
     return true;
@@ -788,7 +805,9 @@ void KWPEWidgetPrivate::create()
         webkit_user_content_manager_register_script_message_handler( contentManager, mailStateHandler, mailWorld );
         // Before anything is loaded (see loadPendingMail()).
         mailFilterAdded = s_mailFilterState == MailFiltersReady;
-        if ( mailFilterAdded )
+        if ( mailLayerDisabled( "filter" ) )
+            mailFilterAdded = true;   // tests: none
+        else if ( mailFilterAdded )
             webkit_user_content_manager_add_filter( contentManager, s_mailFilter[viewExternal ? 1 : 0] );
     }
     WebKitNetworkSession* session = s_session;

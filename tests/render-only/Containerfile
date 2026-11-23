@@ -1,0 +1,18 @@
+# The render-only test's image: Fedora 44, WPE WebKit (the RPMs of
+# kde3-packaging, runtime and devel, in the build context's rpms/), the
+# build dependencies of kde3-wpepart and the test's tools.  KDE 3 and Qt 3
+# come from the host (/opt/kde3, /opt/kde3-qt, mounted read-only).
+#   mkdir ctx ctx/rpms; cp wpewebkit-2.54.3-*.rpm wpewebkit-devel-2.54.3-*.rpm ctx/rpms/
+#   podman build -t localhost/kwpe-render-only -f Containerfile ctx
+FROM registry.fedoraproject.org/fedora:44
+COPY rpms/ /tmp/rpms/
+RUN dnf -y --setopt=install_weak_deps=False install /tmp/rpms/*.rpm \
+      cmake ninja-build gcc-c++ pkgconfig glib2-devel libsoup3-devel gumbo-parser gumbo-parser-devel \
+      libdrm-devel libX11-devel libxcb-devel libXext-devel libXfixes-devel libXpresent-devel libXrandr-devel \
+      fontconfig-devel freetype-devel libICE-devel libpng-devel libSM-devel libXft-devel libXi-devel \
+      libXinerama-devel libXmu-devel libXrender-devel libXcursor-devel mesa-libGL-devel mesa-libGLU-devel \
+      libjpeg-turbo-devel openssl-devel zlib-devel bzip2-devel libacl-devel libidn librsvg2 libutempter \
+      perl-interpreter \
+      xorg-x11-server-Xvfb iceauth xdotool nftables iproute tcpdump python3 procps-ng \
+      dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
+    && dnf clean all && rm -rf /tmp/rpms
