@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# check.py CONFIG GATE PHASES_A PHASES_B RUNDIR COUNTERS...: one run's verdict.
+# check.py CONFIG GATE PHASES_A PHASES_B RUNDIR MESSAGE COUNTERS...: one run's verdict.
 #   GATE   strict  every layer the config has must hold everything:
 #                  0 lookups, 0 connections, 0 packets (not even to the
 #                  closed proxy) in render-only showings
@@ -11,8 +11,8 @@
 # Prints "<verdict> <reasons>"; verdict ok, FAIL or info.
 import re, sys
 
-config, gate, pa, pb, d = sys.argv[1:6]
-c = dict(kv.split('=') for kv in sys.argv[6:])
+config, gate, pa, pb, d, message = sys.argv[1:7]
+c = dict(kv.split('=') for kv in sys.argv[7:])
 modes = {}
 for tag, phases in (('a', pa), ('b', pb)):
     for i, m in enumerate(p for p in phases.split(',') if p):
@@ -45,6 +45,25 @@ for q in sorted(set(lookups)):
         why.append('lookup-in-render-only:%s' % q)
     elif q not in allowed_hosts:
         why.append('lookup-without-allowed-load:%s' % q)
+
+# positive: every showing of every reader was loaded (an empty trace of a
+# reader that showed nothing must not pass), and in external showings of
+# external-allowed.html all three allowed kinds came
+out = open(d + '/out').read().split('\n')
+for tag, phases in (('a', pa), ('b', pb)):
+    k = len([p for p in phases.split(',') if p])
+    shown = sum(1 for l in out if l.startswith(tag + ' PHASE '))
+    done = sum(1 for l in out if l == tag + ' COMPLETED')
+    if shown != k or done < k:
+        why.append('reader-%s:%d/%d-shown,%d-completed' % (tag, shown, k, done))
+if message == 'external-allowed':
+    for t, m in sorted(modes.items()):
+        if m != 'e':
+            continue
+        kinds = set(re.sub(r'\?$', '', dest) for dest, h, _ in requests if tagre.search(h) and tagre.search(h).group(1) == t)
+        for kind in ('image', 'style', 'font'):
+            if kind not in kinds:
+                why.append('no-%s-in-%s' % (kind, t))
 
 n = lambda k: int(c.get(k, '0') or 0)
 if not external:

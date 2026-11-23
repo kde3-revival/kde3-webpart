@@ -36,7 +36,10 @@ log(){ echo "$*" | tee -a $O/summary.txt; }
 # generated messages: nesting deeper than any parser should go
 mkdir -p $O/generated
 python3 -I -c 'import sys; sys.stdout.write("<!DOCTYPE html><html><body>" + "<div>" * 100000 + "x" + "</div>" * 100000 + "</body></html>")' > $O/generated/deep-nesting.html
-python3 -I -c 'import sys; sys.stdout.write("<!DOCTYPE html><html><body>" + "<div>" * 4900 + "x" + "</div>" * 4900 + "<div style=\"width:320px;height:120px;background:#ff0000\"></div></body></html>")' > $O/generated/deep-flattened.html
+# 1500 nested (parsed, flattened below 400 levels): the red is the deepest
+# text's (its colour from the outermost element), so it shows only if the
+# deep content survived
+python3 -I -c 'import sys; sys.stdout.write("<!DOCTYPE html><html><body><div style=\"color:#ff0000;font-size:120px;line-height:1\">" + "<div>" * 1500 + "&#9608;" * 6 + "</div>" * 1500 + "</div></body></html>")' > $O/generated/deep-flattened.html
 
 # --- network namespace
 ip link set lo up
@@ -126,28 +129,31 @@ run_one(){ # CONFIG MESSAGE
   link=$(awk '$1 == "a" && $2 == "LINK" { print $3 }' $d/out | head -1)
   completed=$(grep -c "^a COMPLETED" $d/out)
   q=$(wc -l < $d/dns.log); h=$(wc -l < $d/http.log)
-  local verdict why
-  read verdict why < <(python3 -I $T/check.py $c $gate "$pa" "$pb" $d dns=$dns syn=$syn loopsyn=$loopsyn udp=$udp \
-                       offlo=$offlo pcap=$pkts blocked=$blocked http=$h rc=$rc)
+  local verdict why result crc
+  result=$(python3 -I $T/check.py $c $gate "$pa" "$pb" $d $n dns=$dns syn=$syn loopsyn=$loopsyn udp=$udp \
+           offlo=$offlo pcap=$pkts blocked=$blocked http=$h rc=$rc); crc=$?
+  verdict=${result%% *}; why=
+  [ "$verdict" != "$result" ] && why=${result#* }
+  # a checker that fails or says nothing known fails the run
+  if [ $crc != 0 ] || ! echo "$verdict" | grep -qx "ok\|FAIL\|info"; then
+    why="checker-failed:exit=$crc,output=[$result]"; verdict=FAIL
+  fi
   if [ $c = no-layers ]; then
     DETECTED_DNS=$((DETECTED_DNS + q)); DETECTED_SYN=$((DETECTED_SYN + syn))
   fi
-  if [ $verdict != info ]; then
-    if [ $n = 00-control ] || [ $n = deep-flattened ]; then
+  if [ "$verdict" != info ]; then
+    if [ "$n" = 00-control ] || [ "$n" = deep-flattened ]; then
       { [ "$rendered" = none ] || [ "$rendered" -lt 30000 ]; } && { verdict=FAIL; why="$why not-rendered:$rendered"; }
     fi
     # every switch of the settings layer exists in this WebKit
     if grep -q "WebKit has no feature" $d/err; then
       verdict=FAIL; why="$why $(grep -o 'no feature [A-Za-z]*' $d/err | sort -u | tr ' ' _ | tr '\n' ' ')"
     fi
-    if [ $n = deep-nesting ] || [ $n = deep-flattened ]; then
-      [ $completed -ge $k ] || { verdict=FAIL; why="$why completed:$completed/$k"; }
-    fi
-    if [ $n = ping-click ] && ! echo "$link" | grep -q "^http://link\.ping\.a$k\.blocked\.test/$"; then
+    if [ "$n" = ping-click ] && ! echo "$link" | grep -q "^http://link\.ping\.a$k\.blocked\.test/$"; then
       verdict=FAIL; why="$why click-not-handed-to-host:${link:-none}"
     fi
   fi
-  [ $verdict = FAIL ] && FAILED=1
+  [ "$verdict" = ok ] || [ "$verdict" = info ] || FAILED=1
   log "$(printf '%-4s %-14s %-18s dns=%s/%s syn=%s loopsyn=%s udp=%s offlo=%s pcap=%s proxy-blocked=%s http=%s rendered=%s%s%s' \
     $verdict $c $n $dns $q $syn $loopsyn $udp $offlo $pkts $blocked $h $rendered "${link:+ link=$link}" "${why:+ -> $why}")"
 }

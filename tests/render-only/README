@@ -36,9 +36,13 @@ Built with -DKWPE_RENDER_ONLY_TEST=ON (nothing of it is installed):
       10.77.0.1) and a logging HTTP server (httplog.py), a default route
       (every connection attempt sends a packet), nftables counters of DNS
       queries, TCP SYNs and other UDP packets, tcpdump on every interface.
-      Every message (messages/ and two generated ones: 100000 nested
-      <div>, which the sanitizer shows as source text, and 4900 nested,
-      flattened, which must render) runs in a fresh driver process and HOME
+      First sanitize-timing.py: hostile documents (deep nesting, closing
+      tags the parser ignores, tags in quoted attributes, unclosed raw
+      text, formatting-element reconstruction, ...) must each be
+      sanitized within LIMIT_MS (default 100), parsed or shown as source
+      text.  Then every message (messages/ and two generated ones: 100000
+      nested <div>, which the sanitizer shows as source text, and 1500
+      nested, flattened, whose deepest text must render) runs in a fresh driver process and HOME
       in these configurations (check.py gives the verdicts):
         all            every layer: no lookup, no connection, no packet
                        at all (not even to the closed proxy)

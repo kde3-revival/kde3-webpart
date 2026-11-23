@@ -15,6 +15,7 @@
 #   JOBS       containers in parallel (default 3), the configurations
 #              shared out among them
 #   AFTER, CONFIGS, MESSAGES  passed on (see inner.sh)
+#   LIMIT_MS   sanitize-timing.py's bound per hostile document (default 100)
 set -u
 T=$(cd "$(dirname "$0")" && pwd)
 B=$(cd "$1" && pwd); O=${2:-$(mktemp -d)}; mkdir -p "$O"; O=$(cd "$O" && pwd)
@@ -23,6 +24,11 @@ JOBS=${JOBS:-3}
 LAYERS="sanitizer settings csp filter proxy"
 CONFIGS=${CONFIGS:-"all $(for l in $LAYERS; do printf 'no-%s ' $l; done)$(for l in $LAYERS; do printf 'only-%s ' $l; done)external transitions two-readers no-layers"}
 echo "results in $O"
+# the sanitizer alone on hostile documents: each within LIMIT_MS
+podman run --rm --network=none --security-opt label=disable -v "$T":/test:ro -v "$B":/build:ro \
+  "${IMAGE:-localhost/kwpe-render-only}" python3 -I /test/sanitize-timing.py /build/tests/render-only/kwpe-sanitize \
+  "${LIMIT_MS:-100}" > "$O/sanitize-timing.txt" 2>&1
+timing=$?
 set -- $CONFIGS
 i=0; declare -a part
 for c in "$@"; do part[$((i % JOBS))]="${part[$((i % JOBS))]:-} $c"; i=$((i + 1)); done
@@ -38,7 +44,8 @@ for j in $(seq 0 $((JOBS - 1))); do
 done
 rc=0
 for p in $pids; do wait $p || rc=1; done
-cat "$O"/job*/summary.txt > "$O/summary.txt" 2>/dev/null
+cat "$O/sanitize-timing.txt" "$O"/job*/summary.txt > "$O/summary.txt" 2>/dev/null
+[ $timing = 0 ] || rc=1
 grep -v '^ok ' "$O/summary.txt"
 [ $rc = 0 ] && echo PASS || echo FAILED
 exit $rc
