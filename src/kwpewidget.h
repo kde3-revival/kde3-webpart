@@ -286,6 +286,7 @@ private slots:
     void emitNotifications();
     void startDownloads();
     void reportBlocked();
+    void returnToApp();
 
 private:
     friend class KWPEWidgetPrivate;

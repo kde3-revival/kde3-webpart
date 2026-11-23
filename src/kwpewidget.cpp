@@ -802,7 +802,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
-          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationSerial( 0 ), menuEditable( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -892,6 +892,9 @@ public:
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
     bool menuEditable;   // the context menu was asked for over a text field
     QString blockedURL;  // app mode: a document of another site, not shown
+    QString appHome;     // app mode: the last page of its sites the host loaded
+    gint64 lastReturnToApp;   // returnToApp(): not in a loop
+    bool ownBlank;            // ... its empty page is committing
     WebKitWebView* view;
     WPEView* wpeView;
     WPEToplevel* toplevel;
@@ -1203,6 +1206,25 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         break;
     case WEBKIT_LOAD_COMMITTED: {
         bool isNew = false;
+        // App mode, the second line of the boundary (the first: the final
+        // response, decideAppPolicy()): whatever the main frame committed
+        // without a response of an app site (about:blank a frame of
+        // another site sent the top to, a page from the back/forward
+        // list, ...) is not the application's: the application's page
+        // is loaded again, nothing reaches the page meanwhile (drops and
+        // permission requests check the URL too).
+        if ( d->isApp() && d->ownBlank ) {
+            d->ownBlank = false;
+        } else if ( d->isApp() && !d->isAppDocument( webkit_web_view_get_uri( view ) ) ) {
+            const char* uri = webkit_web_view_get_uri( view );
+            fprintf( stderr, "kwpe: app: the main frame committed %s, not one of the application's sites: "
+                     "back to the application\n", uri ? uri : "(none)" );
+            d->blockedURL = QString::fromUtf8( uri );
+            webkit_web_view_stop_loading( view );
+            QTimer::singleShot( 0, d->q, SLOT( reportBlocked() ) );
+            QTimer::singleShot( 0, d->q, SLOT( returnToApp() ) );
+            break;
+        }
         // Usually set already (a page from the back/forward cache has no
         // response).  WebKit decides which elements to hide when it
         // requests the page: if the filters were switched later, the
@@ -1592,14 +1614,13 @@ bool KWPEWidgetPrivate::isAppSite( const QString& host ) const
 }
 
 // A document the main frame may show in app mode: http(s) of the
-// application's sites, a blob: of theirs; about:blank.  No data:, file:,
-// other blob: or other schemes.
+// application's sites, a blob: of theirs (its URL carries its origin).
+// No about:blank (its URL does not say whose it is: another site can
+// make one), data:, file:, other blob: or other schemes.
 bool KWPEWidgetPrivate::isAppDocument( const char* uri ) const
 {
     if ( !uri )
         return false;
-    if ( g_ascii_strcasecmp( uri, "about:blank" ) == 0 )
-        return true;
     QString text = QString::fromUtf8( uri );
     if ( text.startsWith( "blob:", false ) )
         text = text.mid( 5 );
@@ -2101,6 +2122,8 @@ void KWPEWidget::load( const QString& url )
     if ( d->isApp() ) {
         if ( d->appOptions.sites.isEmpty() )
             d->appOptions.sites.append( KURL( url ).host().lower() );
+        if ( d->isAppDocument( url.utf8().data() ) )
+            d->appHome = url;
         webkit_web_view_load_uri( d->view, url.utf8().data() );
         return;
     }
@@ -2440,6 +2463,23 @@ void KWPEWidget::reportBlocked()
     if ( !url.isEmpty() )
         emit statusMessage( i18n( "%1 is not part of this application and was not opened." )
                             .arg( KStringHandler::csqueeze( url, 80 ) ) );
+}
+
+void KWPEWidget::returnToApp()
+{
+    if ( !d->view || d->appHome.isEmpty() )
+        return;
+    // Once every 5 seconds at most (a home page that leaves again).
+    gint64 now = g_get_monotonic_time();
+    if ( now - d->lastReturnToApp < 5 * G_USEC_PER_SEC ) {
+        // An empty page of our own instead (no app privileges either).
+        d->ownBlank = true;
+        webkit_web_view_load_html( d->view, "", 0 );
+        emit statusMessage( i18n( "The application's page keeps leaving its site; reload it to try again." ) );
+        return;
+    }
+    d->lastReturnToApp = now;
+    webkit_web_view_load_uri( d->view, d->appHome.utf8().data() );
 }
 
 void KWPEWidget::startDownloads()

@@ -425,8 +425,10 @@ of its own:
   mail program).  Whatever else leads elsewhere (a script, a form, a
   refresh, a redirect) is stopped at the main frame's final response:
   the main frame shows only http(s) documents of these sites (their
-  `blob:` too, and `about:blank`), never `data:`, `file:` or another
-  site; only these sites can ask for permissions or get dropped files.
+  `blob:` too), never `data:`, `file:` or another site.  What the main
+  frame commits without such a response (an `about:blank` a frame of
+  another site sent it to, a page from the back/forward list) is not
+  trusted: the application's page is loaded again; only these sites can ask for permissions or get dropped files.
   A new window of a `blob:` or `data:` URL is downloaded,
   so is what the view cannot show (PDF too).  Downloads, uploads, the
   page's dialogs and HTTP authentication work as in Konqueror.
