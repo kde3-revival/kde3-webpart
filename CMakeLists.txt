@@ -23,3 +23,11 @@ pkg_check_modules(KWPEX11 REQUIRED IMPORTED_TARGET
   x11 x11-xcb xext xfixes xpresent xrandr xcb xcb-dri3 libdrm)
 
 add_subdirectory(src)
+
+# tests/render-only: its driver, the sanitizer alone and a build of the
+# part (libkwpepart_test) whose mail mode layers can be switched off
+# (KWPE_MAIL_TEST_DISABLE_LAYERS); nothing of it is installed.
+option(KWPE_RENDER_ONLY_TEST "Build the render-only test (driver, test module; not installed)" OFF)
+if(KWPE_RENDER_ONLY_TEST)
+  add_subdirectory(tests/render-only)
+endif()

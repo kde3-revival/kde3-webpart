@@ -212,9 +212,11 @@ static const char mailFilterExternal[] =
     "{\"trigger\":{\"url-filter\":\"^https?:\",\"resource-type\":[\"image\",\"style-sheet\",\"font\"]},"
     "\"action\":{\"type\":\"ignore-previous-rules\"}}]";
 
-// Tests only (tests/render-only): KWPE_MAIL_TEST_DISABLE_LAYERS=sanitizer,
-// settings,csp,filter,proxy switches layers off, to show that the others
-// hold without them.  Loud, never silent.
+// tests/render-only only (its own build of the module, never installed:
+// KWPE_MAIL_TESTING): KWPE_MAIL_TEST_DISABLE_LAYERS=sanitizer,settings,
+// csp,filter,proxy switches layers off, to show what the others hold
+// without them.  The installed module has no such switch.
+#ifdef KWPE_MAIL_TESTING
 static bool mailLayerDisabled( const char* layer )
 {
     static QStringList* disabled = 0;
@@ -225,6 +227,12 @@ static bool mailLayerDisabled( const char* layer )
     }
     return disabled->contains( QString::fromLatin1( layer ) );
 }
+#else
+static inline bool mailLayerDisabled( const char* )
+{
+    return false;
+}
+#endif
 
 static QString realFilePath( const QString& path )
 {
@@ -376,10 +384,11 @@ static void onMailDownloadStarted( WebKitNetworkSession*, WebKitDownload* downlo
 // interface that takes connections and closes them at once.  Nothing
 // gets there unless every other layer failed: each connection is
 // reported (a tripwire), none goes anywhere.
-static void onMailProxyConnection( GSocketService*, GSocketConnection* connection, GObject*, gpointer )
+static gboolean onMailProxyConnection( GSocketService*, GSocketConnection* connection, GObject*, gpointer )
 {
     fprintf( stderr, "kwpe: mail: BLOCKED a network connection of a render-only message (closed proxy)\n" );
     g_io_stream_close( G_IO_STREAM( connection ), 0, 0 );
+    return TRUE;   // handled
 }
 
 static guint16 startMailProxy()

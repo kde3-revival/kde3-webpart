@@ -50,7 +50,12 @@
 #include "kwpewidget.h"
 
 typedef KParts::GenericFactory<KWPEPart> KWPEPartFactory;
+#ifdef KWPE_MAIL_TESTING
+// tests/render-only's build of the module (not installed)
+K_EXPORT_COMPONENT_FACTORY( libkwpepart_test, KWPEPartFactory )
+#else
 K_EXPORT_COMPONENT_FACTORY( libkwpepart, KWPEPartFactory )
+#endif
 
 // KLibLoader must never unload this module: it registers GObject types
 // (GLib cannot unregister them) and an X event filter in Qt.

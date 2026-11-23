@@ -65,26 +65,3 @@ kde3_add_executable(abptest
 )
 target_include_directories(abptest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# kwpe-render-only: the mail mode's render-only test driver
-# (tests/render-only; not installed)
-kde3_add_executable(kwpe-render-only
-  SOURCES
-    ../tests/render-only/driver.cpp
-  MOC
-    ../tests/render-only/driver.h
-  LINK
-    KDE3::kparts
-  NO_INSTALL
-)
-
-# kwpe-sanitize: the mail mode's sanitizer on stdin (tests/render-only)
-kde3_add_executable(kwpe-sanitize
-  SOURCES
-    kwpemailsanitizer.cpp
-    ../tests/render-only/sanitize.cpp
-  LINK
-    PkgConfig::GUMBO
-  EXCEPTIONS
-  NO_INSTALL
-)
-target_include_directories(kwpe-sanitize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
