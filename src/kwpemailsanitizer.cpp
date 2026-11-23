@@ -1019,7 +1019,7 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     Allocations arena;
     arena.allocated = 0;
     // The corpus's newsletters: 5-6 times their size (0.2 MB for 40 KB).
-    arena.budget = 8 * 1024 * 1024 + 32 * html.size();
+    arena.budget = 4 * 1024 * 1024 + 16 * html.size();
     options.allocator = allocate;
     options.deallocator = deallocate;
     options.userdata = &arena;
