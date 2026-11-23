@@ -2552,8 +2552,11 @@ void KWPEWidget::dropEvent( QDropEvent* e )
     g_variant_builder_add( &arguments, "{sv}", "files", g_variant_builder_end( &list ) );
     g_variant_builder_add( &arguments, "{sv}", "x", g_variant_new_double( e->pos().x() / zoomLevel ) );
     g_variant_builder_add( &arguments, "{sv}", "y", g_variant_new_double( e->pos().y() / zoomLevel ) );
-    webkit_web_view_call_async_javascript_function( d->view, script, -1, g_variant_builder_end( &arguments ), "kwpepart", 0,
+    // WebKit reads the arguments and does not take them: ours to free.
+    GVariant* args = g_variant_ref_sink( g_variant_builder_end( &arguments ) );
+    webkit_web_view_call_async_javascript_function( d->view, script, -1, args, "kwpepart", 0,
                                                     d->cancellable, KWPEWidgetPrivate::onDropDone, d );
+    g_variant_unref( args );
     setActiveWindow();
     setFocus();
 }
