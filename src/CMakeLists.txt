@@ -9,6 +9,7 @@ kde3_add_module(libkwpepart
   SOURCES
     wpex11platform.cpp
     kwpewidget.cpp
+    kwpemailsanitizer.cpp
     kwpeclipboard.cpp
     kwpedialogs.cpp
     kwpedownload.cpp
@@ -27,6 +28,7 @@ kde3_add_module(libkwpepart
     KDE3::kparts
     KDE3::kutils
     PkgConfig::WPEWEBKIT
+    PkgConfig::GUMBO
     PkgConfig::KWPEX11
 )
 target_include_directories(libkwpepart PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

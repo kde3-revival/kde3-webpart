@@ -409,6 +409,16 @@ void KWPEPart::slotLinkActivated( const QString& url )
     emit m_ext->openURLRequest( KURL( url ) );
 }
 
+bool KWPEPart::mailAtBottom() const
+{
+    return m_view->mailAtBottom();
+}
+
+QString KWPEPart::mailSelectedText() const
+{
+    return m_view->mailSelectedText();
+}
+
 void KWPEPart::scrollBy( int dx, int dy )
 {
     m_view->scrollBy( dx, dy );

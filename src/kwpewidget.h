@@ -50,15 +50,20 @@ public:
     /**
      * Mail mode: show the HTML file @p path (written by the host into a
      * private directory).  WebKit sees it under a URL of its own
-     * (kwpemail://m<n>/...): a new origin for every message.  Only files
-     * in its directory (and KDE's icons and data) are served; @p path
-     * is the host's document (the headers), every other HTML file is
-     * message content: no scripts, no forms, no plugins, no frames of its
-     * own, remote images, styles and fonts only if @p loadExternal.
-     * Before every message the session forgets what the previous one
-     * stored (cookies, caches) if that one could load remote content.
+     * (kwpemail://m<n>/...): a new origin for every message, which only
+     * this widget's view can read.  Only files in its directory (and
+     * KDE's icons) are served; @p path is the host's document (the
+     * headers), every other HTML file is message content.  Render only:
+     * every HTML file is rebuilt from a white list first; no scripts, no
+     * forms, no plugins, no frames of its own, no network at all (content
+     * filter, a closed proxy).  @p loadExternal: remote images, styles
+     * and fonts of this message, in a view and network session of its own.
      */
     void loadMailFile( const QString& path, bool loadExternal );
+    /** Mail mode: the message is scrolled to its end (as last reported). */
+    bool mailAtBottom() const;
+    /** Mail mode: the selected text (as last reported), frames included. */
+    QString mailSelectedText() const;
     /** Mail mode: scroll the page by @p dx, @p dy pixels. */
     void scrollBy( int dx, int dy );
     /** Select the whole page. */

@@ -16,6 +16,8 @@ find_package(PkgConfig REQUIRED)
 # WebKit with the WPEPlatform API (WebKitWebView "display" property);
 # 2.54 is what this was written against, older 2.4x lack parts of it.
 pkg_check_modules(WPEWEBKIT REQUIRED IMPORTED_TARGET wpe-webkit-2.0>=2.50 wpe-platform-2.0>=2.50)
+# Mail mode: the HTML sanitizer's parser (the WHATWG algorithm)
+pkg_check_modules(GUMBO REQUIRED IMPORTED_TARGET gumbo>=0.10)
 # X11 presentation: MIT-SHM (fallback), DRI3 + Present (DMA-BUF, zero copy)
 pkg_check_modules(KWPEX11 REQUIRED IMPORTED_TARGET
   x11 x11-xcb xext xfixes xpresent xrandr xcb xcb-dri3 libdrm)

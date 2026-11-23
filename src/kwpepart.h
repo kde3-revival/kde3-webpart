@@ -50,6 +50,10 @@ class KWPEPart : public KParts::ReadOnlyPart
      * from now on (KMail's "load external references").
      */
     Q_PROPERTY( bool mailLoadExternal READ mailLoadExternal WRITE setMailLoadExternal )
+    /** Mail mode: the message is scrolled to its end (KMail's "Read On"). */
+    Q_PROPERTY( bool mailAtBottom READ mailAtBottom )
+    /** Mail mode: the selected text, also in a frame of the message. */
+    Q_PROPERTY( QString mailSelectedText READ mailSelectedText )
 
 public:
     KWPEPart( QWidget* parentWidget, const char* widgetName,
@@ -73,6 +77,8 @@ public:
     bool isMailMode() const { return m_mail; }
     bool mailLoadExternal() const { return m_mailLoadExternal; }
     void setMailLoadExternal( bool load ) { m_mailLoadExternal = load; }
+    bool mailAtBottom() const;
+    QString mailSelectedText() const;
 
 public slots:
     /** Scroll the page by @p dx, @p dy pixels (the host's scroll keys). */
