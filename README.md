@@ -422,7 +422,12 @@ of its own:
   site, a new window (`target=_blank`, `window.open()` after a click), the
   middle button, `mailto:` and other schemes go to the host through the
   browser extension's `openURLRequest()` (kwhatsapp: the KDE browser, the
-  mail program).  A new window of a `blob:` or `data:` URL is downloaded,
+  mail program).  Whatever else leads elsewhere (a script, a form, a
+  refresh, a redirect) is stopped at the main frame's final response:
+  the main frame shows only http(s) documents of these sites (their
+  `blob:` too, and `about:blank`), never `data:`, `file:` or another
+  site; only these sites can ask for permissions or get dropped files.
+  A new window of a `blob:` or `data:` URL is downloaded,
   so is what the view cannot show (PDF too).  Downloads, uploads, the
   page's dialogs and HTTP authentication work as in Konqueror.
 * **Notifications:** the page's Notification API reaches the host as

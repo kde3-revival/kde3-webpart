@@ -34,6 +34,7 @@
 #include <qevent.h>
 
 #include <kglobal.h>
+#include <kstringhandler.h>
 #include <kmdcodec.h>
 #include <ksimpleconfig.h>
 #include <kio/passdlg.h>
@@ -807,6 +808,7 @@ public:
     bool isBrowser() const { return mode == KWPEWidget::Browser; }
     gboolean decideAppPolicy( WebKitPolicyDecision* decision, WebKitPolicyDecisionType type );
     bool isAppSite( const QString& host ) const;
+    bool isAppDocument( const char* uri ) const;
     static gboolean onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data );
     static void onNotificationClosed( WebKitNotification* notification, gpointer data );
     void forgetNotifications();
@@ -863,6 +865,7 @@ public:
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
     bool menuEditable;   // the context menu was asked for over a text field
+    QString blockedURL;  // app mode: a document of another site, not shown
     WebKitWebView* view;
     WPEView* wpeView;
     WPEToplevel* toplevel;
@@ -1500,6 +1503,18 @@ gboolean KWPEWidgetPrivate::decideAppPolicy( WebKitPolicyDecision* decision, Web
         WebKitResponsePolicyDecision* response = WEBKIT_RESPONSE_POLICY_DECISION( decision );
         if ( !webkit_response_policy_decision_is_main_frame_main_resource( response ) )
             return FALSE;
+        // The boundary, whatever led here (a script, a form, a refresh, a
+        // redirect, no user at all): the main frame shows the
+        // application's sites and nothing else.  This is the final
+        // response, after every redirect.
+        const char* responseURI = webkit_uri_response_get_uri( webkit_response_policy_decision_get_response( response ) );
+        if ( !isAppDocument( responseURI ) ) {
+            webkit_policy_decision_ignore( decision );
+            fprintf( stderr, "kwpe: app: %s is not one of the application's sites: not shown\n", responseURI );
+            blockedURL = QString::fromUtf8( responseURI );
+            QTimer::singleShot( 0, q, SLOT( reportBlocked() ) );
+            return TRUE;
+        }
         const char* mimeType = webkit_uri_response_get_mime_type( webkit_response_policy_decision_get_response( response ) );
         if ( g_strcmp0( mimeType, "application/pdf" ) == 0 || !webkit_response_policy_decision_is_mime_type_supported( response ) ) {
             webkit_policy_decision_download( decision );
@@ -1548,6 +1563,22 @@ gboolean KWPEWidgetPrivate::decideAppPolicy( WebKitPolicyDecision* decision, Web
 bool KWPEWidgetPrivate::isAppSite( const QString& host ) const
 {
     return appOptions.sites.contains( host.lower() );
+}
+
+// A document the main frame may show in app mode: http(s) of the
+// application's sites, a blob: of theirs; about:blank.  No data:, file:,
+// other blob: or other schemes.
+bool KWPEWidgetPrivate::isAppDocument( const char* uri ) const
+{
+    if ( !uri )
+        return false;
+    if ( g_ascii_strcasecmp( uri, "about:blank" ) == 0 )
+        return true;
+    QString text = QString::fromUtf8( uri );
+    if ( text.startsWith( "blob:", false ) )
+        text = text.mid( 5 );
+    KURL url( text );
+    return ( url.protocol() == "http" || url.protocol() == "https" ) && isAppSite( url.host() );
 }
 
 // The page's notification: for the host (KNotify), outside WebKit's
@@ -1937,6 +1968,12 @@ gboolean KWPEWidgetPrivate::onPermissionRequest( WebKitWebView* view, WebKitPerm
     }
     PendingPermission pending;
     pending.origin = originOf( webkit_web_view_get_uri( view ) );
+    // Only the application's own sites ask (the host is not asked for
+    // another page, which the main frame does not show anyway).
+    if ( !d->isAppDocument( webkit_web_view_get_uri( view ) ) ) {
+        webkit_permission_request_deny( request );
+        return TRUE;
+    }
     if ( WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST( request ) ) {
         pending.kind = QString::fromLatin1( "notifications" );
         // Answered before (WebKit asks again in a new web process).
@@ -2370,6 +2407,15 @@ void KWPEWidget::askPermissions()
     }
 }
 
+void KWPEWidget::reportBlocked()
+{
+    QString url = d->blockedURL;
+    d->blockedURL = QString::null;
+    if ( !url.isEmpty() )
+        emit statusMessage( i18n( "%1 is not part of this application and was not opened." )
+                            .arg( KStringHandler::csqueeze( url, 80 ) ) );
+}
+
 void KWPEWidget::startDownloads()
 {
     QStringList urls = d->pendingDownloads;
@@ -2435,7 +2481,8 @@ void KWPEWidgetPrivate::onDropDone( GObject* view, GAsyncResult* result, gpointe
 void KWPEWidget::dropEvent( QDropEvent* e )
 {
     QStringList files;
-    if ( !d->isApp() || !d->view || !droppedFiles( e, &files ) ) {
+    // Only the application's own page gets the user's files.
+    if ( !d->isApp() || !d->view || !droppedFiles( e, &files ) || !d->isAppDocument( webkit_web_view_get_uri( d->view ) ) ) {
         e->ignore();
         return;
     }
