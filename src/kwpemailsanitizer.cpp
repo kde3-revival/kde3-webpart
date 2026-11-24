@@ -19,7 +19,6 @@
 #include <string.h>
 #include <time.h>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace KWPEMailSanitizer
@@ -1972,10 +1971,24 @@ bool ParseCost::run()
 
 } // namespace
 
-// The source text in a <pre>: every character as text, NUL as U+FFFD.
+// The source text in a <pre>: every character as text, NUL as U+FFFD;
+// what would make it longer than 4 MB plus twice the source's length (up
+// to 5 times: "&amp;") is left out, with a note.
 static void escapeSource( std::string& out, const std::string& text )
 {
+    size_t limit = out.size() + 4 * 1024 * 1024 + 2 * text.size();
     for ( size_t i = 0; i < text.size(); ++i ) {
+        if ( out.size() >= limit ) {
+            // not in the middle of a character
+            while ( i > 0 && ( static_cast<unsigned char>( text[i] ) & 0xc0 ) == 0x80 ) {
+                --i;
+                out.erase( out.size() - 1 );
+            }
+            char note[96];
+            snprintf( note, sizeof note, "\n[... %zu more bytes not shown]", text.size() - i );
+            out += note;
+            return;
+        }
         switch ( text[i] ) {
         case '&': out += "&amp;"; break;
         case '<': out += "&lt;"; break;
@@ -1989,8 +2002,10 @@ static void escapeSource( std::string& out, const std::string& text )
 // Gumbo's memory, freed in one go after the tree has been written, and
 // a budget of what Gumbo may allocate (in all, freed or not): beyond it
 // the parse is abandoned (longjmp out of Gumbo, which is C: no destructors
-// are skipped; everything it allocated is in "pointers") and the document
-// is shown as its source text.
+// are skipped; every block it holds is in the list "blocks") and the
+// document is shown as its source text.  So it is too beyond
+// maxGumboMemory held at once, whatever the document (each block counted
+// with the list's header and malloc's), and when malloc fails.
 //
 // The same happens when the parse has taken more than maxParseCpu seconds
 // of this thread's CPU time (load elsewhere on the machine counts little):
@@ -2005,11 +2020,31 @@ static const double maxParseCpu = 2.0;
 static const size_t maxOutput = 8 * 1024 * 1024;
 static const size_t maxOutputPerByte = 8;
 
+// 256 MB: ordinary mail stays far below (KMail's HTML of a 7.5 MB log
+// holds 50 MB at most; of 200000 one-character lines, 4.4 MB, 75 MB).
+static const size_t maxGumboMemory = 256 * 1024 * 1024;
+
+// Each block Gumbo gets is preceded by a Block (32 bytes: what follows
+// stays aligned as malloc's), in a list: no allocation of ours that could
+// fail within Gumbo.
+struct Block
+{
+    Block* prev;
+    Block* next;
+    size_t size;
+    size_t unused;
+};
+// what a block costs beyond its size: the Block, malloc's header and
+// rounding
+static const size_t blockOverhead = sizeof( Block ) + 16;
+
 struct Allocations
 {
-    std::unordered_set<void*> pointers;
-    size_t allocated;
+    Block* blocks;
+    size_t allocated;   // in all, freed or not
     size_t budget;
+    size_t held;   // now, with blockOverhead each
+    size_t peak;
     unsigned calls;
     double cpuDeadline;
     jmp_buf abandon;
@@ -2019,29 +2054,48 @@ static void* allocate( void* userdata, size_t size )
 {
     Allocations* a = static_cast<Allocations*>( userdata );
     a->allocated += size;
-    if ( a->allocated > a->budget )
+    a->held += size + blockOverhead;
+    if ( a->allocated > a->budget || a->held > maxGumboMemory )
         longjmp( a->abandon, 1 );
     if ( ( ++a->calls & 63 ) == 0 && threadCpuSeconds() > a->cpuDeadline )
         longjmp( a->abandon, 1 );
-    void* p = malloc( size ? size : 1 );
-    if ( p )
-        a->pointers.insert( p );
-    return p;
+    Block* b = static_cast<Block*>( malloc( sizeof( Block ) + size ) );
+    if ( !b )
+        longjmp( a->abandon, 1 );   // out of memory
+    if ( a->held > a->peak )
+        a->peak = a->held;
+    b->size = size;
+    b->prev = 0;
+    b->next = a->blocks;
+    if ( a->blocks )
+        a->blocks->prev = b;
+    a->blocks = b;
+    return b + 1;
 }
 
 static void deallocate( void* userdata, void* p )
 {
     if ( !p )
         return;
-    static_cast<Allocations*>( userdata )->pointers.erase( p );
-    free( p );
+    Allocations* a = static_cast<Allocations*>( userdata );
+    Block* b = static_cast<Block*>( p ) - 1;
+    if ( b->prev )
+        b->prev->next = b->next;
+    else
+        a->blocks = b->next;
+    if ( b->next )
+        b->next->prev = b->prev;
+    a->held -= b->size + blockOverhead;
+    free( b );
 }
 
 static void freeAll( Allocations* arena )
 {
-    for ( std::unordered_set<void*>::const_iterator it = arena->pointers.begin(); it != arena->pointers.end(); ++it )
-        free( *it );
-    arena->pointers.clear();
+    while ( Block* b = arena->blocks ) {
+        arena->blocks = b->next;
+        free( b );
+    }
+    arena->held = 0;
 }
 
 static std::string sourceText( const std::string& html )
@@ -2057,9 +2111,11 @@ static void stats( const char* what, const Allocations& arena, const ParseCost& 
 {
 #ifdef KWPE_SANITIZE_TESTING
     if ( getenv( "KWPE_SANITIZE_STATS" ) )
-        fprintf( stderr, "%s: allocated %zu of %zu, output %zu; elements %zu, attributes %zu, clones %zu (%zu bytes)\n",
-                 what, arena.allocated, arena.budget, out, cost.elements(), cost.attributes(), cost.clones(),
-                 cost.cloneBytes() );
+        fprintf( stderr,
+                 "%s: allocated %zu of %zu, held %zu at most, output %zu; elements %zu, attributes %zu, "
+                 "clones %zu (%zu bytes)\n",
+                 what, arena.allocated, arena.budget, arena.peak, out, cost.elements(), cost.attributes(),
+                 cost.clones(), cost.cloneBytes() );
 #else
     (void)what;
     (void)arena;
@@ -2077,7 +2133,10 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
     Allocations arena;
+    arena.blocks = 0;
     arena.allocated = 0;
+    arena.held = 0;
+    arena.peak = 0;
     // Gumbo makes an element for each start tag that is not ignored
     // (175-500 bytes with its attributes and text: KMail's plain text, one
     // <div dir="ltr"> per line, 450-490 bytes per tag; an empty line, <br>,
