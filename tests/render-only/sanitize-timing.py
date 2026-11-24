@@ -10,9 +10,17 @@
 # else), as expected where a verdict is expected: what the parser would
 # work on too long (or allocate too much for) shown as source text, the
 # ordinary ones parsed; the source text must keep a NUL's neighbours.
-# Last, with the parse's CPU time limit lowered to 1 ms, an ordinary
-# message must be shown as source text.  Exit 0 if all passed.
-import os, subprocess, sys, time
+# Every run's peak RSS must stay under 320 MB plus twice the input (Gumbo
+# may hold 256 MB at most), its output under 8 MB plus 8 times the input
+# (reconstructed formatting elements copy their attributes: a long one
+# cloned for every word must not make gigabytes).
+# Then the CPU time limit (2 s plus 0.25 us per byte), the net under the
+# estimate: a shape the estimate does not count (Gumbo's search for a
+# duplicate attribute, quadratic in the attributes of a tag) shown as
+# source text within that limit, abandoned for time (not for memory).
+# Last, with the limit lowered to 1 ms, an ordinary message must be
+# shown as source text.  Exit 0 if all passed.
+import os, re, subprocess, sys, time
 
 tool = sys.argv[1]
 limit = float(sys.argv[2]) if len(sys.argv) > 2 else 100.0
@@ -39,6 +47,15 @@ def kmail(lines, line=None):
             '</div></div>\n</body></html>\n')
 
 
+def clones(size, attribute, filler):
+    # a <b> with a long style closed by </p>: each "x" after it clones it
+    # (with the style); <td> outside a table is ignored (no element)
+    head = '<p><b style="' + 'x' * attribute + '"></p>'
+    unit = '<p>x</p>' + '<td>' * filler
+    return head + unit * ((size - len(head)) // len(unit))
+
+
+MB = 1024 * 1024
 SOURCE, PARSED, ANY = 'source text', 'parsed', None
 cases = [
     # deep stacks of open elements, which closing tags must not hide
@@ -88,6 +105,13 @@ cases = [
     ('tables-20000', ANY, '<table><tr><td>' * 20000),
     ('comments-100000', ANY, '<!--<div>-->' * 100000),
     ('paragraphs-50000', ANY, '<p>x' * 50000),
+    # memory and output: clones of a long attribute (2.6 GB written once),
+    # floods of elements (each 60-100 bytes in Gumbo for 3-4 of input)
+    ('clone-attribute-stray-td-20M', SOURCE, clones(20 * MB, 100000, 200)),
+    ('clone-attribute-few-20M', ANY, clones(20 * MB, 100000, 20000)),
+    ('p-flood-8M', SOURCE, '<p>' * (8 * MB // 3)),
+    ('br-flood-20M', SOURCE, '<br>' * (20 * MB // 4)),
+    ('a-flood-20M', SOURCE, '<a>' * (20 * MB // 3)),
     # ordinary: parsed (nesting below the bound; KMail's plain text)
     ('nested-div-1500', PARSED, '<div>' * 1500 + 'x' + '</div>' * 1500),
     ('kmail-2300-lines', PARSED, kmail(2300)),
@@ -98,11 +122,32 @@ cases = [
 ]
 
 
-def run(data, env=None):
+STATS = dict(os.environ, KWPE_SANITIZE_STATS='1')
+
+
+def run(data, env=STATS):
     start = time.monotonic()
     p = subprocess.run([tool, 'html', 'content', 'render-only'], input=data, capture_output=True, timeout=120,
                        env=env)
     return p, (time.monotonic() - start) * 1000
+
+
+def bounds(p, data):
+    # peak RSS and output size within their bounds: [] or why not
+    why = []
+    m = re.search(rb'VmHWM:\s*(\d+) kB', p.stderr)
+    if not m:
+        why.append('no peak RSS')
+    elif int(m.group(1)) * 1024 > 320 * MB + 2 * len(data):
+        why.append('peak RSS %d MB' % (int(m.group(1)) // 1024))
+    if len(p.stdout) > 8 * MB + 8 * len(data):
+        why.append('output %d bytes' % len(p.stdout))
+    return why
+
+
+def rss(p):
+    m = re.search(rb'VmHWM:\s*(\d+) kB', p.stderr)
+    return int(m.group(1)) // 1024 if m else -1
 
 
 # this machine's time per byte of an ordinary message (the best of three)
@@ -130,11 +175,31 @@ for name, expected, doc in cases:
         why.append('NUL: source text cut')
     if fallback and b'<div' in out.split(FALLBACK)[1]:
         why.append('markup in the source text')
+    why += bounds(p, data)
     failed |= bool(why)
-    print('%-4s %-30s %8d bytes %7.1f ms %s%s' % ('FAIL' if why else 'ok', name, len(data), ms, verdict,
-          (' -> ' + ', '.join(why)) if why else ''))
-# the safety net under the estimate: a parse over its CPU time limit is
-# abandoned (the test tool may lower the limit, 2 s, to 1 ms)
+    print('%-4s %-30s %8d bytes %7.1f ms %4d MB %9d out %s%s' % ('FAIL' if why else 'ok', name, len(data), ms,
+          rss(p), len(out), verdict, (' -> ' + ', '.join(why)) if why else ''))
+# the safety net under the estimate: 20000 attributes in a tag, then the
+# last one 300000 times (each compared with all before it), which the
+# estimate does not count: abandoned by the CPU time limit (within it and
+# a second), not by the allocation budget or the memory bound
+names = ['a%d' % i for i in range(20000)]
+data = ('<b ' + ' '.join(names) + (' ' + names[-1]) * 300000 + '>x').encode()
+p, ms = run(data)
+cpuLimit = 2000 + 0.25e-3 * len(data)
+why = bounds(p, data)
+if p.returncode != 0 or FALLBACK not in p.stdout:
+    why.append('expected: source text (exit %d)' % p.returncode)
+if ms > cpuLimit + 1000:
+    why.append('%.0f ms > %.0f ms' % (ms, cpuLimit + 1000))
+m = re.search(rb'parse abandoned: allocated (\d+) of (\d+), held (\d+) at most', p.stderr)
+if not m or int(m.group(1)) > int(m.group(2)) or int(m.group(3)) > 256 * MB:
+    why.append('not abandoned for time')
+failed |= bool(why)
+print('%-4s %-30s %8d bytes %7.1f ms %4d MB %9d out %s%s' % ('FAIL' if why else 'ok', 'duplicate-attributes-cpu-limit',
+      len(data), ms, rss(p), len(p.stdout), SOURCE if FALLBACK in p.stdout else PARSED,
+      (' -> ' + ', '.join(why)) if why else ''))
+# the same net, lowered to 1 ms by the test tool
 env = dict(os.environ, KWPE_SANITIZE_CPU_LIMIT_MS='1')
 p, ms = run(reference, env)
 why = [] if p.returncode == 0 and FALLBACK in p.stdout else ['expected: source text (exit %d)' % p.returncode]

@@ -28,6 +28,9 @@ Built with -DKWPE_RENDER_ONLY_TEST=ON (nothing of it is installed):
       click handed to the host), "RENDERED <red pixels>" (reader a).
   kwpe-sanitize [html|css] [content|host] [render-only|external]
       the first layer alone: what WebKit gets of a document (stdin).
+      KWPE_SANITIZE_STATS set: what the parse allocated and held, and
+      the peak RSS, on stderr; KWPE_SANITIZE_CPU_LIMIT_MS: the parse's
+      CPU time limit instead of its own.
 
   run.sh BUILD_DIR [OUT_DIR]
       podman containers (JOBS, default 3), each with its own network
@@ -43,7 +46,10 @@ Built with -DKWPE_RENDER_ONLY_TEST=ON (nothing of it is installed):
       200000 lines) must each be sanitized within LIMIT_MS (default 100)
       plus four times the time per byte of an ordinary message there,
       parsed or shown as source text: the hostile ones whose parse would
-      not be linear as source text, the ordinary ones parsed.  Then every
+      not be linear as source text, the ordinary ones parsed; each within
+      a peak RSS and an output size bound (floods of tags, clones of long
+      attributes); a shape the estimate misses abandoned by the CPU time
+      limit.  Then every
       message (messages/ and two generated ones: 100000 nested <div>,
       which the sanitizer shows as source text, and 1500 nested,
       flattened, whose deepest text must render) runs in a fresh driver
