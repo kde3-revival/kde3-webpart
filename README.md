@@ -441,6 +441,7 @@ Environment variables:
 | variable | effect |
 | --- | --- |
 | `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports; every paste and clipboard read |
+| `KWPE_NETLOG=1` | with the time of day: the network state pages get as `navigator.onLine` (and its changes), subresources (fetch, XHR, streams) that failed or got an HTTP error, streams of 60 s or more when they end (scheme, host, path only), the view shown/hidden and its window active/inactive: to match a web app's "connection lost" with what happened |
 | `KWPE_DEBUG=2` / `3` | also every Present completion / every damage rectangle |
 | `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel event → first frame on screen, last wheel event of a burst → page at rest; time to commit, first paint and load end |
 | `KWPE_FORCE_SHM=1` | shared memory even when DRI3 is there (to compare) |

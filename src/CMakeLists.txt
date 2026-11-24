@@ -12,6 +12,7 @@ kde3_add_module(libkwpepart
     kwpemailsanitizer.cpp
     kwpeclipboard.cpp
     kwpexselection.cpp
+    kwpenetlog.cpp
     kwpedialogs.cpp
     kwpedownload.cpp
     kwpeadblock.cpp

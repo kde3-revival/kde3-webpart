@@ -40,6 +40,7 @@
 #include "kwpeadblock.h"
 #include "kwpemailsanitizer.h"
 #include "kwpeclipboard.h"
+#include "kwpenetlog.h"
 #include "kwpedialogs.h"
 #include "kwpedownload.h"
 #include "kwpesettings.h"
@@ -868,6 +869,7 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "submit-form", G_CALLBACK( onSubmitForm ), this );
     g_signal_connect( view, "run-file-chooser", G_CALLBACK( onRunFileChooser ), this );
     g_signal_connect( view, "script-dialog", G_CALLBACK( onScriptDialog ), this );
+    KWPENetLog::watch( view );
 
     cancellable = g_cancellable_new();
     WebKitFindController* finder = webkit_web_view_get_find_controller( view );
@@ -2191,12 +2193,25 @@ void KWPEWidget::resizeEvent( QResizeEvent* e )
     wpe_view_resized( d->wpeView, e->size().width(), e->size().height() );
 }
 
+// KWPE_NETLOG: what the page's view went through (shown, hidden, active)
+static void netNote( WebKitWebView* view, const char* what )
+{
+    if ( !KWPENetLog::enabled() || !view )
+        return;
+    const char* uri = webkit_web_view_get_uri( view );
+    GUri* parsed = uri ? g_uri_parse( uri, G_URI_FLAGS_NONE, 0 ) : 0;
+    KWPENetLog::note( "view %p (%s): %s", static_cast<void*>( view ), parsed && g_uri_get_host( parsed ) ? g_uri_get_host( parsed ) : "-", what );
+    if ( parsed )
+        g_uri_unref( parsed );
+}
+
 void KWPEWidget::showEvent( QShowEvent* )
 {
     if ( !d->wpeView )
         return;
     d->attach();
     wpe_view_map( d->wpeView );
+    netNote( d->view, isActiveWindow() ? "shown, window active" : "shown, window inactive" );
     if ( d->pageDialog && !d->pageDialog->isVisible() )
         d->showPageDialog( d->pageDialog );
     wpe_toplevel_state_changed( d->toplevel, isActiveWindow() ? WPE_TOPLEVEL_STATE_ACTIVE : WPE_TOPLEVEL_STATE_NONE );
@@ -2213,10 +2228,12 @@ void KWPEWidget::hideEvent( QHideEvent* )
         d->pageDialog->hide();
     if ( d->wpeView )
         wpe_view_unmap( d->wpeView );
+    netNote( d->view, "hidden (the page is told it is not visible)" );
 }
 
 void KWPEWidget::windowActivationChange( bool )
 {
+    netNote( d->view, isActiveWindow() ? "window active" : "window inactive" );
     if ( d->toplevel )
         wpe_toplevel_state_changed( d->toplevel, isActiveWindow() ? WPE_TOPLEVEL_STATE_ACTIVE : WPE_TOPLEVEL_STATE_NONE );
 }
