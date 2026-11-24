@@ -1087,6 +1087,19 @@ public:
     // One more each time a document ends (endNotificationDocument()):
     // notifications and announcements of different ones never match.
     int notificationGeneration;
+    // Announcements of this generation dropped before a notification took
+    // them (the limit of 20, or 10 seconds unshown): their keys (a hash of
+    // title, body and tag) for a minute, at most 64.  A notification with
+    // such a key may be the dropped one's: it gets no picture.
+    struct DroppedAnnouncement
+    {
+        Q_UINT64 key;
+        gint64 dropped;   // g_get_monotonic_time()
+    };
+    QValueList<DroppedAnnouncement> droppedAnnouncements;
+    static Q_UINT64 announcementKey( const QString& title, const QString& body, const QString& tag );
+    void dropAnnouncement( const NotificationIcon& icon );
+    bool wasDropped( Q_UINT64 key );
     void endNotificationDocument();
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
@@ -1924,7 +1937,53 @@ void KWPEWidgetPrivate::forgetNotifications()
     notificationShownIn.clear();
     notificationsEvicted.clear();
     notificationIcons.clear();
+    droppedAnnouncements.clear();
     notificationToken = QString::null;
+}
+
+// FNV-1a (64 bits) of title, body and tag (each with its length).
+Q_UINT64 KWPEWidgetPrivate::announcementKey( const QString& title, const QString& body, const QString& tag )
+{
+    Q_UINT64 hash = Q_UINT64( 14695981039346656037ULL );
+    const QString* parts[3] = { &title, &body, &tag };
+    for ( int p = 0; p < 3; ++p ) {
+        uint length = parts[p]->length();
+        for ( uint i = 0; i <= length; ++i ) {
+            uint c = i < length ? ( *parts[p] )[i].unicode() : 0x10000 + length;
+            for ( int b = 0; b < 3; ++b ) {
+                hash ^= ( c >> ( 8 * b ) ) & 0xff;
+                hash *= Q_UINT64( 1099511628211ULL );
+            }
+        }
+    }
+    return hash;
+}
+
+void KWPEWidgetPrivate::dropAnnouncement( const NotificationIcon& icon )
+{
+    if ( icon.generation != notificationGeneration )
+        return;
+    DroppedAnnouncement dropped;
+    dropped.key = announcementKey( icon.title, icon.body, icon.tag );
+    dropped.dropped = g_get_monotonic_time();
+    droppedAnnouncements.append( dropped );
+    while ( droppedAnnouncements.count() > 64 )
+        droppedAnnouncements.remove( droppedAnnouncements.begin() );
+}
+
+bool KWPEWidgetPrivate::wasDropped( Q_UINT64 key )
+{
+    gint64 now = g_get_monotonic_time();
+    bool found = false;
+    for ( QValueList<DroppedAnnouncement>::Iterator it = droppedAnnouncements.begin(); it != droppedAnnouncements.end(); ) {
+        if ( now - ( *it ).dropped > 60 * G_USEC_PER_SEC ) {
+            it = droppedAnnouncements.remove( it );
+            continue;
+        }
+        found = found || ( *it ).key == key;
+        ++it;
+    }
+    return found;
 }
 
 // The bridge's document is gone: its announcements too; a notification
@@ -1934,6 +1993,7 @@ void KWPEWidgetPrivate::forgetNotifications()
 void KWPEWidgetPrivate::endNotificationDocument()
 {
     ++notificationGeneration;
+    droppedAnnouncements.clear();
     bool waiting = false;
     for ( QValueList<NotificationIcon>::Iterator it = notificationIcons.begin(); it != notificationIcons.end(); ) {
         if ( ( *it ).id ) {
@@ -2017,6 +2077,7 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
                 ++it;
             if ( it == d->notificationIcons.end() )
                 return;
+            d->dropAnnouncement( *it );
             d->notificationIcons.remove( it );
         }
         d->notificationIcons.append( icon );
@@ -2865,8 +2926,10 @@ void KWPEWidget::emitNotifications()
     gint64 now = g_get_monotonic_time();
     for ( QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
           icon != d->notificationIcons.end(); ) {
-        if ( ( *icon ).id == 0 && now - ( *icon ).announced > 10 * G_USEC_PER_SEC )
+        if ( ( *icon ).id == 0 && now - ( *icon ).announced > 10 * G_USEC_PER_SEC ) {
+            d->dropAnnouncement( *icon );
             icon = d->notificationIcons.remove( icon );
+        }
         else
             ++icon;
     }
@@ -2907,7 +2970,8 @@ void KWPEWidget::emitNotifications()
                     else
                         ( *it ).ambiguous = true;
                 }
-            if ( alike > 1 )
+            // (several alike, or one alike dropped: whose is not known)
+            if ( alike > 1 || ( alike == 1 && d->wasDropped( KWPEWidgetPrivate::announcementKey( title, body, tag ) ) ) )
                 ( *icon ).ambiguous = true;
         }
         QImage image;
