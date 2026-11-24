@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #include <functional>
@@ -1458,12 +1461,22 @@ void ParseCost::fakeStartTag( const std::string& name )
 }
 
 // Every start tag in [@p from, @p to) as a fake one.
+// Their attributes are charged as a real tag's (Gumbo's search for
+// duplicates), except for those starting within a tag already measured
+// (each byte is scanned for that once at most).
 void ParseCost::fakeStartTags( size_t from, size_t to )
 {
+    size_t measured = from;
     for ( size_t s = m_html.find( '<', from ); s < to && !over(); s = m_html.find( '<', s + 1 ) ) {
         if ( s + 1 < to && isAlpha( m_html[s + 1] ) ) {
             size_t q = s + 1;
-            fakeStartTag( tagName( q ) );
+            std::string name = tagName( q );
+            if ( q >= measured ) {
+                size_t attributes = 0;
+                measured = tagEnd( q, 0, 0, &attributes );
+                chargeAttributes( attributes );
+            }
+            fakeStartTag( name );
         }
     }
 }
@@ -2048,9 +2061,10 @@ static const size_t maxOutputPerByte = 8;
 // input, maxHeldTotal at most.  KMail's plain text holds 36 bytes per byte
 // of one-character lines (780 per line), less for longer ones: a 7.5 MB
 // log (100000 lines) 84 MB; 300000 one-character lines (6.6 MB) 235 MB,
-// 400000 (8.8 MB) 312 MB, of 550 allowed; 640000 (14 MB) 501 MB.  Empty
-// elements take more, 75 bytes per byte of "<br>", 80-120 of "<p>": a
-// flood of them stops at half of what it would hold or at maxHeldTotal.
+// 400000 (8.8 MB) 312 MB, of 550 allowed; about 640000 (14 MB) reach the
+// ceiling.  Empty elements take more, 75 bytes per byte of "<br>", 80-120
+// of "<p>": a flood of them stops at half of what it would hold or at
+// maxHeldTotal.
 static const size_t maxHeld = 128 * 1024 * 1024;
 static const size_t maxHeldPerByte = 48;
 static const size_t maxHeldTotal = 512 * 1024 * 1024;
@@ -2129,13 +2143,23 @@ static void freeAll( Allocations* arena )
         free( b );
     }
     arena->held = 0;
+#ifdef __GLIBC__
+    // glibc keeps freed small blocks for reuse: after a large parse (up to
+    // maxHeldTotal) the process (KMail) would stay that large.  Given back
+    // to the system (a few ms).
+    if ( arena->peak > 64 * 1024 * 1024 )
+        malloc_trim( 0 );
+#endif
 }
 
 static std::string sourceText( const std::string& html )
 {
     std::string out = "<!DOCTYPE html>\n<html><body><p>[This message is too complex to be shown; its source:]</p><pre>\n";
+    // one block of the most it can take (no copies left behind growing)
+    out.reserve( out.size() + 4 * 1024 * 1024 + 2 * html.size() + 256 );
     escapeSource( out, html );
-    return out + "</pre></body></html>\n";
+    out += "</pre></body></html>\n";
+    return out;
 }
 
 // The test tool alone, with KWPE_SANITIZE_STATS set: how it went, on

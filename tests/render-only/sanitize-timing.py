@@ -12,7 +12,9 @@
 # ordinary ones parsed; the source text must keep a NUL's neighbours.
 # Every run's peak RSS must stay under what Gumbo may hold (128 MB plus 48
 # bytes per byte of input, 512 MB at most) plus 64 MB and twice the
-# input, its output under 8 MB plus 8 times the input
+# input, its RSS once the sanitizer has returned under 64 MB plus three
+# times the input (what Gumbo freed given back), its output under 8 MB
+# plus 8 times the input
 # (reconstructed formatting elements copy their attributes: a long one
 # cloned for every word must not make gigabytes).
 # Then the CPU time limit (2 s plus 0.25 us per byte, 4 s at most), the
@@ -118,6 +120,9 @@ cases = [
     # in the tag: quadratic (once 7.7 s for 21 MB, the CPU limit's)
     ('duplicate-attributes-21M', SOURCE,
      '<b ' + ' '.join('a%d' % i for i in range(30000)) + ' a29999' * 3000000 + '>x'),
+    # the same in raw text that may hold tags
+    ('duplicate-attributes-svg-style-21M', SOURCE,
+     '<svg><style><b ' + ' '.join('a%d' % i for i in range(30000)) + ' a29999' * 3000000 + '>x'),
     # ordinary: parsed (nesting below the bound; KMail's plain text)
     ('nested-div-1500', PARSED, '<div>' * 1500 + 'x' + '</div>' * 1500),
     ('kmail-2300-lines', PARSED, kmail(2300)),
@@ -149,6 +154,11 @@ def bounds(p, data):
         why.append('no peak RSS')
     elif int(m.group(1)) * 1024 > min(128 * MB + 48 * len(data), 512 * MB) + 64 * MB + 2 * len(data):
         why.append('peak RSS %d MB' % (int(m.group(1)) // 1024))
+    m = re.search(rb'VmRSS:\s*(\d+) kB', p.stderr)
+    if not m:
+        why.append('no RSS')
+    elif int(m.group(1)) * 1024 > 64 * MB + 3 * len(data):
+        why.append('RSS after %d MB' % (int(m.group(1)) // 1024))
     if len(p.stdout) > 8 * MB + 8 * len(data):
         why.append('output %d bytes' % len(p.stdout))
     return why

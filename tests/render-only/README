@@ -28,8 +28,8 @@ Built with -DKWPE_RENDER_ONLY_TEST=ON (nothing of it is installed):
       click handed to the host), "RENDERED <red pixels>" (reader a).
   kwpe-sanitize [html|css] [content|host] [render-only|external]
       the first layer alone: what WebKit gets of a document (stdin).
-      KWPE_SANITIZE_STATS set: what the parse allocated and held, and
-      the peak RSS, on stderr; KWPE_SANITIZE_CPU_LIMIT_MS: the parse's
+      KWPE_SANITIZE_STATS set: what the parse allocated and held, the
+      peak RSS and the RSS once done, on stderr; KWPE_SANITIZE_CPU_LIMIT_MS: the parse's
       CPU time limit instead of its own.
 
   run.sh BUILD_DIR [OUT_DIR]

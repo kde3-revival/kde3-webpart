@@ -14,7 +14,8 @@
 // With KWPE_SANITIZE_STATS set, on stderr: what the parse allocated (see
 // sanitizeHtml()) and this process's peak RSS ("VmHWM: ... kB", of this
 // program alone: getrusage() would count what the parent held when it
-// forked); KWPE_SANITIZE_CPU_LIMIT_MS replaces the parse's CPU time limit.
+// forked) and its RSS once done ("VmRSS: ... kB");
+// KWPE_SANITIZE_CPU_LIMIT_MS replaces the parse's CPU time limit.
 
 #include <stdlib.h>
 
@@ -40,7 +41,7 @@ int main( int argc, char** argv )
         std::ifstream status( "/proc/self/status" );
         std::string line;
         while ( std::getline( status, line ) )
-            if ( line.compare( 0, 6, "VmHWM:" ) == 0 )
+            if ( line.compare( 0, 6, "VmHWM:" ) == 0 || line.compare( 0, 6, "VmRSS:" ) == 0 )
                 std::cerr << line << std::endl;
     }
     return 0;
