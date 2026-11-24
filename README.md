@@ -437,11 +437,17 @@ of its own:
   the notification's picture, `notificationShown(id, title, body, QImage)`
   (kwhatsapp shows it in its balloon); `activateNotification(id)` gives the
   page its click.  WebKit's notification has no icon: a script in the
-  page's world (top frame) wraps the `Notification` constructor and draws
-  `options.icon` into a canvas of at most 96 pixels in the web process,
-  only for a picture of the page's own origin or a `data:`/`blob:` URL;
-  the host decodes a small PNG and fetches nothing.  A notification waits
-  for its picture at most 2 seconds.
+  page's world (top frame) wraps the `Notification` constructor and
+  announces each notification to a script in a world of its own (the
+  only one with the message handler), which draws `options.icon` into a
+  canvas of at most 96 pixels in the web process and sends its RGBA
+  pixels: only a picture of the page's own origin, a `data:`/`blob:` URL
+  or of the origins in `pictureOrigins=https://HOST,https://*.DOMAIN,...`
+  (loaded with CORS: a server that does not allow it gives no picture).
+  The host decodes no image format and fetches nothing.  A notification
+  waits for its picture at most 2 seconds; two alike in one document get
+  none.  `debug=true`: why a picture was not taken, on stderr, with only
+  the scheme and host of its URL.
 * **Permissions:** every request (notifications, microphone, camera,
   screen, geolocation, others) is `permissionRequested(kind, origin,
   bool& allow)` for the host, outside WebKit's signal.  Only

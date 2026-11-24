@@ -36,6 +36,18 @@ struct KWPEAppOptions
         goes to the host (linkActivated()).  Empty: the host of the first
         URL loaded. */
     QStringList sites;
+    /** Origins of the notifications' pictures besides the page's own,
+        data: and blob:: "https://HOST" or "https://" followed by
+        "*.DOMAIN" (any subdomain; http too, a port too).  Loaded by the web process
+        with CORS (crossOrigin "anonymous"): a server that does not allow
+        it gives no picture.  The host fetches nothing. */
+    QStringList pictureOrigins;
+    /** On stderr: why a notification's picture was not taken, with only
+        the scheme and host of its URL (refused: not an origin allowed;
+        failed: not loaded, or CORS refused; timed out). */
+    bool debug;
+
+    KWPEAppOptions() : debug( false ) {}
 };
 
 /**

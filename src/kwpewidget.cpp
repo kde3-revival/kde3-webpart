@@ -28,6 +28,7 @@
 #include <qcursor.h>
 #include <qdragobject.h>
 #include <qdatetime.h>
+#include <qregexp.h>
 #include <qdir.h>
 #include <qfileinfo.h>
 #include <qguardedptr.h>
@@ -214,8 +215,10 @@ static const char mailStateHandler[] = "kwpeMailState";
 // the page's scripts, of any frame, cannot run there; the message
 // handler exists only there), passes every announcement on ("pending",
 // with or without a picture) and turns one with an icon of the page's
-// own origin, data: or blob: (nothing of another site) into the
-// picture's pixels: drawn into a canvas of at most 96 pixels in the web
+// own origin, data: or blob:, or of an origin the application lists
+// (KWPEAppOptions::pictureOrigins: loaded with CORS, crossOrigin
+// "anonymous", so the canvas can be read only if that server allows
+// it), nothing of any other site, into the picture's pixels: drawn into a canvas of at most 96 pixels in the web
 // process, sent as RGBA (width x height x 4 bytes, base64); the host
 // fetches nothing and decodes no image format.  Title, body and tag
 // are taken up to 4096 characters, the icon's URL up to 512 KiB (a
@@ -284,8 +287,9 @@ static const char appNotificationWrapper[] =
     "  defineProperty(N.prototype, 'constructor', { value: Notification, writable: true, enumerable: false, configurable: true });\n"
     "  defineProperty(window, 'Notification', { value: Notification, writable: true, configurable: true, enumerable: false });\n"
     "})();\n";
+// (called with the application's picture origins, appPictureOrigins())
 static const char appNotificationBridge[] =
-    "(function () {\n"
+    "(function (pictureOrigins) {\n"
     "  'use strict';\n"
     "  var handlers = window.webkit && window.webkit.messageHandlers;\n"
     "  var handler = handlers && handlers.kwpeNotification;\n"
@@ -305,10 +309,24 @@ static const char appNotificationBridge[] =
     "  function post(message) { message.token = token; apply(postMessage, handler, [message]); }\n"
     "  post({ kind: 'hello' });\n"
     "  window.addEventListener('pageshow', function (e) { if (e.persisted) post({ kind: 'hello' }); });\n"
+    "  function where(url) { return url.protocol === 'data:' || url.protocol === 'blob:' ? url.protocol : url.protocol + '//' + url.host; }\n"
+    "  function report(what, url) { post({ kind: 'debug', what: what, origin: where(url) }); }\n"
+    "  function listed(url) {\n"
+    "    for (var i = 0; i < pictureOrigins.length; ++i) {\n"
+    "      var o = pictureOrigins[i];\n"
+    "      if (o.scheme !== url.protocol) continue;\n"
+    "      if (o.host === url.host || (o.host.charAt(0) === '.' && url.host.length > o.host.length &&\n"
+    "          url.host.slice(-o.host.length) === o.host)) return true;\n"
+    "    }\n"
+    "    return false;\n"
+    "  }\n"
     "  function source(icon) {\n"
     "    try {\n"
     "      var url = new URL_(icon, doc.baseURI);\n"
-    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === origin) return url.href;\n"
+    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === origin)\n"
+    "        return { href: url.href, url: url, cors: false };\n"
+    "      if (listed(url)) return { href: url.href, url: url, cors: true };\n"
+    "      report('refused', url);\n"
     "    } catch (e) {}\n"
     "    return null;\n"
     "  }\n"
@@ -317,13 +335,16 @@ static const char appNotificationBridge[] =
     "    post({ kind: 'pending', serial: s, title: title, body: body, tag: tag, picture: !!src });\n"
     "    if (!src) return;\n"
     "    var done = false, img = new Image_();\n"
-    "    function finish(w, h, pixels) {\n"
-    "      if (!done) { done = true; post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels }); }\n"
+    "    function finish(w, h, pixels, failure) {\n"
+    "      if (done) return;\n"
+    "      done = true;\n"
+    "      if (failure) report(failure, src.url);\n"
+    "      post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels });\n"
     "    }\n"
     "    img.onload = function () {\n"
     "      try {\n"
     "        var w = img.naturalWidth, h = img.naturalHeight;\n"
-    "        if (!w || !h) { finish(0, 0, ''); return; }\n"
+    "        if (!w || !h) { finish(0, 0, '', 'failed'); return; }\n"
     "        var k = min(1, size / max(w, h)), c = apply(createElement, doc, ['canvas']);\n"
     "        w = c.width = min(size, max(1, round(w * k)));\n"
     "        h = c.height = min(size, max(1, round(h * k)));\n"
@@ -333,11 +354,12 @@ static const char appNotificationBridge[] =
     "        for (var i = 0; i < data.length; i += 8192)\n"
     "          bytes += apply(fromCharCode, null, apply(subarray, data, [i, i + 8192]));\n"
     "        finish(w, h, btoa_(bytes));\n"
-    "      } catch (e) { finish(0, 0, ''); }\n"
+    "      } catch (e) { finish(0, 0, '', 'failed'); }\n"
     "    };\n"
-    "    img.onerror = function () { finish(0, 0, ''); };\n"
-    "    setTimeout_(function () { finish(0, 0, ''); }, 1500);\n"
-    "    img.src = src;\n"
+    "    img.onerror = function () { finish(0, 0, '', 'failed'); };\n"
+    "    setTimeout_(function () { finish(0, 0, '', 'timed out'); }, 1500);\n"
+    "    if (src.cors) img.crossOrigin = 'anonymous';\n"
+    "    img.src = src.href;\n"
     "  }\n"
     "  doc.addEventListener('kwpe-notification', function (e) {\n"
     "    try {\n"
@@ -349,9 +371,32 @@ static const char appNotificationBridge[] =
     "      announce(a[0], a[1], a[2], a[3]);\n"
     "    } catch (x) {}\n"
     "  }, true);\n"
-    "})();\n";
+    "})";
 // The picture: at most this size each way (the script's size).
 static const int appNotificationIconMax = 96;
+
+// The application's picture origins as the bridge's argument: a JSON
+// array of { scheme: "https:", host: "pps.example.net" | ".example.net"
+// (any subdomain) }.  Only "http(s)://HOST[:PORT]" and
+// "http(s)://*.DOMAIN[:PORT]" with host names of letters, digits, dots
+// and hyphens are taken.
+static QCString appPictureOrigins( const QStringList& origins )
+{
+    QCString json = "[";
+    QRegExp pattern( "^(https?):\\/\\/(\\*\\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)(:[0-9]{1,5})?$" );
+    for ( QStringList::ConstIterator it = origins.begin(); it != origins.end(); ++it ) {
+        QString origin = ( *it ).stripWhiteSpace().lower();
+        if ( pattern.search( origin ) != 0 ) {
+            fprintf( stderr, "kwpe: app: picture origin %s ignored\n", origin.latin1() );
+            continue;
+        }
+        QString host = ( pattern.cap( 2 ).isEmpty() ? QString::null : QString::fromLatin1( "." ) ) + pattern.cap( 3 ) + pattern.cap( 7 );
+        if ( json.length() > 1 )
+            json += ",";
+        json += QString( "{\"scheme\":\"%1:\",\"host\":\"%2\"}" ).arg( pattern.cap( 1 ) ).arg( host ).latin1();
+    }
+    return json + "]";
+}
 
 struct KWPEMailDocument
 {
@@ -1284,7 +1329,8 @@ void KWPEWidgetPrivate::create()
                                                            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, 0, 0 );
         webkit_user_content_manager_add_script( contentManager, script );
         webkit_user_script_unref( script );
-        script = webkit_user_script_new_for_world( appNotificationBridge, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        QCString bridge = QCString( appNotificationBridge ) + "(" + appPictureOrigins( appOptions.pictureOrigins ) + ");\n";
+        script = webkit_user_script_new_for_world( bridge.data(), WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
                                                    WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, appNotificationWorld, 0, 0 );
         webkit_user_content_manager_add_script( contentManager, script );
         webkit_user_script_unref( script );
@@ -2049,6 +2095,15 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
     }
     if ( token != d->notificationToken )
         return;
+    if ( kind == "debug" ) {
+        // only the scheme and host (the bridge's where()), checked again
+        QString what = jsString( value, "what" ), origin = jsString( value, "origin" );
+        if ( !d->appOptions.debug || ( what != "refused" && what != "failed" && what != "timed out" )
+             || origin.length() > 300 || !QRegExp( "^[a-z][a-z0-9+.-]*:(//[a-z0-9.:\\[\\]-]*)?$" ).exactMatch( origin ) )
+            return;
+        fprintf( stderr, "kwpe: app: a notification's picture %s: %s\n", what.latin1(), origin.latin1() );
+        return;
+    }
     JSCValue* serialValue = jsc_value_object_get_property( value, "serial" );
     int serial = jsc_value_is_number( serialValue ) ? jsc_value_to_int32( serialValue ) : 0;
     g_object_unref( serialValue );
