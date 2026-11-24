@@ -1010,7 +1010,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
-          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationGeneration( 0 ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationGeneration( 0 ), announcementsLost( false ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -1134,17 +1134,16 @@ public:
     int notificationGeneration;
     // Announcements of this generation dropped before a notification took
     // them (the limit of 20, or 10 seconds unshown): their keys (a hash of
-    // title, body and tag) for a minute, at most 64.  A notification with
-    // such a key may be the dropped one's: it gets no picture.
-    struct DroppedAnnouncement
-    {
-        Q_UINT64 key;
-        gint64 dropped;   // g_get_monotonic_time()
-    };
-    QValueList<DroppedAnnouncement> droppedAnnouncements;
+    // title, body and tag) until the document ends, at most 64 different
+    // ones.  A notification with such a key may be the dropped one's: it
+    // gets no picture.  More than 64: which ones were dropped is no longer
+    // known (announcementsLost), no notification of the document gets a
+    // picture any more.
+    QValueList<Q_UINT64> droppedAnnouncements;
+    bool announcementsLost;
     static Q_UINT64 announcementKey( const QString& title, const QString& body, const QString& tag );
     void dropAnnouncement( const NotificationIcon& icon );
-    bool wasDropped( Q_UINT64 key );
+    bool wasDropped( Q_UINT64 key ) const;
     void endNotificationDocument();
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
@@ -1984,6 +1983,7 @@ void KWPEWidgetPrivate::forgetNotifications()
     notificationsEvicted.clear();
     notificationIcons.clear();
     droppedAnnouncements.clear();
+    announcementsLost = false;
     notificationToken = QString::null;
 }
 
@@ -2009,27 +2009,25 @@ void KWPEWidgetPrivate::dropAnnouncement( const NotificationIcon& icon )
 {
     if ( icon.generation != notificationGeneration )
         return;
-    DroppedAnnouncement dropped;
-    dropped.key = announcementKey( icon.title, icon.body, icon.tag );
-    dropped.dropped = g_get_monotonic_time();
-    droppedAnnouncements.append( dropped );
-    while ( droppedAnnouncements.count() > 64 )
-        droppedAnnouncements.remove( droppedAnnouncements.begin() );
+    if ( announcementsLost )
+        return;
+    Q_UINT64 key = announcementKey( icon.title, icon.body, icon.tag );
+    if ( droppedAnnouncements.contains( key ) )
+        return;
+    if ( droppedAnnouncements.count() >= 64 ) {
+        // (fail closed: none forgotten, none matched from now on)
+        announcementsLost = true;
+        droppedAnnouncements.clear();
+        return;
+    }
+    droppedAnnouncements.append( key );
 }
 
-bool KWPEWidgetPrivate::wasDropped( Q_UINT64 key )
+// A dropped announcement may have had this key (or which ones were
+// dropped is not known any more).
+bool KWPEWidgetPrivate::wasDropped( Q_UINT64 key ) const
 {
-    gint64 now = g_get_monotonic_time();
-    bool found = false;
-    for ( QValueList<DroppedAnnouncement>::Iterator it = droppedAnnouncements.begin(); it != droppedAnnouncements.end(); ) {
-        if ( now - ( *it ).dropped > 60 * G_USEC_PER_SEC ) {
-            it = droppedAnnouncements.remove( it );
-            continue;
-        }
-        found = found || ( *it ).key == key;
-        ++it;
-    }
-    return found;
+    return announcementsLost || droppedAnnouncements.contains( key );
 }
 
 // The bridge's document is gone: its announcements too; a notification
@@ -2040,6 +2038,7 @@ void KWPEWidgetPrivate::endNotificationDocument()
 {
     ++notificationGeneration;
     droppedAnnouncements.clear();
+    announcementsLost = false;
     bool waiting = false;
     for ( QValueList<NotificationIcon>::Iterator it = notificationIcons.begin(); it != notificationIcons.end(); ) {
         if ( ( *it ).id ) {
@@ -3025,7 +3024,8 @@ void KWPEWidget::emitNotifications()
                     else
                         ( *it ).ambiguous = true;
                 }
-            // (several alike, or one alike dropped: whose is not known)
+            // (several alike, or one alike dropped, or the dropped ones no
+            // longer known: whose is not known)
             if ( alike > 1 || ( alike == 1 && d->wasDropped( KWPEWidgetPrivate::announcementKey( title, body, tag ) ) ) )
                 ( *icon ).ambiguous = true;
         }

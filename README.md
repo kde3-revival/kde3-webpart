@@ -446,7 +446,8 @@ of its own:
   (loaded with CORS: a server that does not allow it gives no picture).
   The host decodes no image format and fetches nothing.  A notification
   waits for its picture at most 2 seconds; two alike in one document get
-  none.  `debug=true`: why a picture was not taken, on stderr, with only
+  none (nor do any more of that document once too many announcements
+  were dropped to tell them apart).  `debug=true`: why a picture was not taken, on stderr, with only
   the scheme and host of its URL.
 * **Permissions:** every request (notifications, microphone, camera,
   screen, geolocation, others) is `permissionRequested(kind, origin,
