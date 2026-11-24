@@ -71,6 +71,17 @@ struct Limits
 Result read( Display* dpy, Atom selection, Atom target, Time time, const Limits& limits,
              std::string& data, Atom* type = 0, int* format = 0, const Service* service = 0 );
 
+/**
+ * Our own outgoing transfers, for a Service: noteRequest() with every
+ * SelectionRequest this program gets (it answers it, maybe with INCR);
+ * isOutgoingStep() is true for a PropertyDelete by such a requestor on the
+ * property it asked for, within 10 s of its last step (the steps of an
+ * INCR transfer we send).  Other PropertyNotify events are not ours to
+ * handle.  Both are safe inside Xlib's queue scan (no Xlib calls).
+ */
+void noteRequest( const XEvent* event );
+bool isOutgoingStep( const XEvent* event );
+
 /** Text for logs: "ok", "refused", ... */
 const char* resultName( Result result );
 

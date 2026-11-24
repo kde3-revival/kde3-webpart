@@ -22,7 +22,7 @@
 #include <qclipboard.h>
 #include <qimage.h>
 #include <qpixmap.h>
-#include <qwidget.h>
+#include <qtextcodec.h>
 #include <qcstring.h>
 #include <qmime.h>
 #include <qstrlist.h>
@@ -167,8 +167,8 @@ static Atom selectionAtom( QClipboard::Mode mode )
 
 // While we wait, Qt keeps serving this program's own selections: requests
 // for PRIMARY/CLIPBOARD (another view's copy) and the steps of its outgoing
-// INCR transfers (the other client deletes the property on its own window:
-// a PropertyDelete on a window that is not ours).  SelectionClear and
+// INCR transfers (the program that asked deletes the property it asked
+// for: KWPEXSelection::isOutgoingStep(), fed by noteXEvent()).  SelectionClear and
 // everything else wait for the event loop (Qt's dataChanged() slots would
 // read the clipboard themselves inside WebKit's read).
 struct ServiceAtoms
@@ -182,7 +182,7 @@ static bool serviceWants( const XEvent* e, void* data )
     const ServiceAtoms* atoms = static_cast<const ServiceAtoms*>( data );
     if ( e->type == SelectionRequest )
         return e->xselectionrequest.selection == atoms->primary || e->xselectionrequest.selection == atoms->clipboard;
-    return e->type == PropertyNotify && e->xproperty.state == PropertyDelete && !QWidget::find( e->xproperty.window );
+    return KWPEXSelection::isOutgoingStep( e );   // Qt's INCR transfer to a program that asked us
 }
 
 static void serviceHandle( XEvent* event, void* )
@@ -326,63 +326,156 @@ static std::string validUtf8( const std::string& in )
     return out;
 }
 
-// Plain text of another program, as UTF-8: UTF8_STRING (or a MIME UTF-8
-// type), else COMPOUND_TEXT, STRING (Latin-1), TEXT, text/plain.
-static bool readForeignText( std::string& utf8 )
+// The charset of a MIME text target ("text/plain;charset=X"), or null.
+static QCString charsetOf( const char* target )
 {
-    static const char* const targets[] = { "UTF8_STRING", "text/plain;charset=utf-8", "COMPOUND_TEXT", "STRING", "TEXT", "text/plain", 0 };
-    Display* dpy = qt_xdisplay();
-    for ( const char* const* t = targets; *t; ++t ) {
-        const char* name = offeredName( *t );
-        if ( !name )
-            continue;
-        std::string bytes;
-        Atom type = None;
-        if ( !readForeign( name, bytes, &type ) )
-            return false;   // the owner offered it: no point in trying the others for seconds
-        stripNuls( bytes );
-        if ( type == XInternAtom( dpy, "COMPOUND_TEXT", False ) ) {
-            XTextProperty property;
-            property.value = reinterpret_cast<unsigned char*>( const_cast<char*>( bytes.data() ) );
-            property.encoding = type;
-            property.format = 8;
-            property.nitems = bytes.size();
-            char** list = 0;
-            int count = 0;
-            utf8.clear();
-            if ( Xutf8TextPropertyToTextList( dpy, &property, &list, &count ) >= 0 && list ) {
-                for ( int i = 0; i < count; ++i )
-                    utf8 += list[i];
-                XFreeStringList( list );
-            }
-        } else if ( type == XA_STRING ) {
-            utf8 = toUtf8( bytes, "ISO-8859-1" );
-        } else if ( g_utf8_validate( bytes.data(), gssize( bytes.size() ), 0 ) ) {
-            utf8 = bytes;
-        } else if ( qstricmp( name, "text/plain" ) == 0 ) {
-            utf8 = toUtf8( bytes, "ISO-8859-1" );   // an old MIME owner: Latin-1
-        } else {
-            utf8 = validUtf8( bytes );
-        }
-        return true;
-    }
-    return false;
+    const char* p = strchr( target, ';' );
+    if ( !p )
+        return QCString();
+    QCString params = QCString( p + 1 ).stripWhiteSpace();
+    if ( qstrnicmp( params, "charset=", 8 ) != 0 )
+        return QCString();
+    QCString charset = params.mid( 8 ).stripWhiteSpace();
+    int end = charset.find( ';' );
+    if ( end >= 0 )
+        charset.truncate( end );
+    if ( charset.length() > 1 && charset[0] == '"' && charset[int( charset.length() ) - 1] == '"' )
+        charset = charset.mid( 1, charset.length() - 2 );
+    return charset;
 }
 
-// HTML of another program as UTF-8: Mozilla and Chrome send UTF-16 (with or
-// without a byte order mark), most others UTF-8.
+static bool isUtf8Name( const QCString& charset )
+{
+    return qstricmp( charset, "utf-8" ) == 0 || qstricmp( charset, "utf8" ) == 0;
+}
+
+// Bytes in a named charset -> UTF-8: Qt's codecs, else iconv's; false if
+// neither knows it.
+static bool decodeCharset( const QCString& charset, const std::string& in, std::string& utf8 )
+{
+    if ( isUtf8Name( charset ) ) {
+        utf8 = validUtf8( in );
+        return true;
+    }
+    if ( QTextCodec* codec = QTextCodec::codecForName( charset ) ) {
+        QCString out = codec->toUnicode( in.data(), int( in.size() ) ).utf8();
+        utf8.assign( out.data(), out.length() );
+        return true;
+    }
+    GIConv cd = g_iconv_open( "UTF-8", charset.data() );
+    if ( cd == (GIConv) -1 )
+        return false;
+    g_iconv_close( cd );
+    utf8 = toUtf8( in, charset.data() );
+    return true;
+}
+
+static bool knownCharset( const QCString& charset )
+{
+    std::string ignored;
+    return decodeCharset( charset, std::string(), ignored );
+}
+
+// A MIME text target (with or without a charset) we can decode.
+static bool readableMime( const char* target, const char* type )
+{
+    size_t n = strlen( type );
+    if ( qstrnicmp( target, type, uint( n ) ) != 0 )
+        return false;
+    if ( !target[n] )
+        return true;
+    if ( target[n] != ';' )
+        return false;
+    QCString charset = charsetOf( target );
+    return !charset.isEmpty() && knownCharset( charset );
+}
+
+// Plain text of another program, as UTF-8: UTF8_STRING, a UTF-8 MIME type,
+// a MIME type in another charset we know, COMPOUND_TEXT (Xlib), STRING
+// (Latin-1), TEXT, plain text/plain.
+static bool readForeignText( std::string& utf8 )
+{
+    Display* dpy = qt_xdisplay();
+    QCString name;
+    for ( int pass = 0; pass < 7 && name.isEmpty(); ++pass ) {
+        static const char* const fixed[] = { "UTF8_STRING", 0, 0, "COMPOUND_TEXT", "STRING", "TEXT", "text/plain" };
+        if ( fixed[pass] ) {
+            if ( const char* offeredTarget = offeredName( fixed[pass] ) )
+                name = offeredTarget;
+            continue;
+        }
+        // pass 1: text/plain;charset=utf-8, pass 2: any other known charset
+        for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); it != s_offered.end(); ++it ) {
+            QCString charset = charsetOf( *it );
+            if ( charset.isEmpty() || !readableMime( *it, "text/plain" ) )
+                continue;
+            if ( pass == 1 ? isUtf8Name( charset ) : !isUtf8Name( charset ) ) {
+                name = *it;
+                break;
+            }
+        }
+    }
+    if ( name.isEmpty() )
+        return false;
+    std::string bytes;
+    Atom type = None;
+    if ( !readForeign( name, bytes, &type ) )
+        return false;
+    stripNuls( bytes );
+    QCString charset = charsetOf( name );
+    if ( !charset.isEmpty() ) {
+        if ( !decodeCharset( charset, bytes, utf8 ) )
+            return false;
+    } else if ( type == XInternAtom( dpy, "COMPOUND_TEXT", False ) ) {
+        XTextProperty property;
+        property.value = reinterpret_cast<unsigned char*>( const_cast<char*>( bytes.data() ) );
+        property.encoding = type;
+        property.format = 8;
+        property.nitems = bytes.size();
+        char** list = 0;
+        int count = 0;
+        utf8.clear();
+        if ( Xutf8TextPropertyToTextList( dpy, &property, &list, &count ) >= 0 && list ) {
+            for ( int i = 0; i < count; ++i )
+                utf8 += list[i];
+            XFreeStringList( list );
+        }
+    } else if ( type == XA_STRING ) {
+        utf8 = toUtf8( bytes, "ISO-8859-1" );
+    } else if ( g_utf8_validate( bytes.data(), gssize( bytes.size() ), 0 ) ) {
+        utf8 = bytes;
+    } else if ( qstricmp( name, "text/plain" ) == 0 ) {
+        utf8 = toUtf8( bytes, "ISO-8859-1" );   // an old MIME owner: Latin-1
+    } else {
+        utf8 = validUtf8( bytes );
+    }
+    return true;
+}
+
+// HTML of another program as UTF-8.  Plain text/html: Mozilla and Chrome
+// send UTF-16 (with or without a byte order mark), most others UTF-8;
+// text/html;charset=X: in X (a byte order mark still wins).
 static bool readForeignHtml( std::string& utf8 )
 {
-    const char* name = offeredName( "text/html" );
+    QCString name;
+    if ( const char* plain = offeredName( "text/html" ) )
+        name = plain;
+    for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); name.isEmpty() && it != s_offered.end(); ++it )
+        if ( !charsetOf( *it ).isEmpty() && readableMime( *it, "text/html" ) )
+            name = *it;
     std::string bytes;
-    if ( !name || !readForeign( name, bytes ) )
+    if ( name.isEmpty() || !readForeign( name, bytes ) )
         return false;
     const unsigned char* b = reinterpret_cast<const unsigned char*>( bytes.data() );
+    QCString charset = charsetOf( name );
     if ( bytes.size() >= 2 && b[0] == 0xff && b[1] == 0xfe )
         utf8 = toUtf8( bytes.substr( 2 ), "UTF-16LE" );
     else if ( bytes.size() >= 2 && b[0] == 0xfe && b[1] == 0xff )
         utf8 = toUtf8( bytes.substr( 2 ), "UTF-16BE" );
-    else if ( bytes.size() >= 2 && bytes.size() % 2 == 0 && b[0] && !b[1] )
+    else if ( !charset.isEmpty() ) {
+        if ( !decodeCharset( charset, bytes, utf8 ) )
+            return false;
+    } else if ( bytes.size() >= 2 && bytes.size() % 2 == 0 && b[0] && !b[1] )
         utf8 = toUtf8( bytes, "UTF-16LE" );
     else if ( g_utf8_validate( bytes.data(), gssize( bytes.size() ), 0 ) )
         utf8 = bytes;
@@ -617,6 +710,11 @@ WPEClipboard* KWPE::createClipboard( WPEDisplay* display )
 
 // ---------------------------------------------------------------------
 
+void KWPEClipboard::noteXEvent( const XEvent* event )
+{
+    KWPEXSelection::noteRequest( event );
+}
+
 bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
 {
     if ( !s_clipboard || !qApp )
@@ -661,22 +759,31 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
             fprintf( stderr, "kwpe: paste: the selection changed hands while asking for its formats\n" );
         s_offered.clear();
     }
-    bool image = false, pixmap = false;
+    bool image = false, pixmap = false, html = false;
+    bool htmlPublished = false;
     GPtrArray* formats = g_ptr_array_new();
     bool text = false;
     for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); it != s_offered.end(); ++it ) {
         const char* format = ( *it ).data();
-        if ( qstrnicmp( format, "text/plain", 10 ) == 0 || qstrcmp( format, "UTF8_STRING" ) == 0
-             || qstrcmp( format, "STRING" ) == 0 || qstrcmp( format, "TEXT" ) == 0 || qstrcmp( format, "COMPOUND_TEXT" ) == 0 )
+        if ( s_pasteOwn ? qstrnicmp( format, "text/plain", 10 ) == 0
+                        : ( readableMime( format, "text/plain" ) || qstrcmp( format, "UTF8_STRING" ) == 0
+                            || qstrcmp( format, "STRING" ) == 0 || qstrcmp( format, "TEXT" ) == 0
+                            || qstrcmp( format, "COMPOUND_TEXT" ) == 0 ) )
             text = true;
         else if ( !s_pasteOwn && qstrcmp( format, "PIXMAP" ) == 0 )
             pixmap = true;
+        else if ( !s_pasteOwn && qstrnicmp( format, "text/html;", 10 ) == 0 )
+            html = html || readableMime( format, "text/html" );   // published as plain text/html
         else if ( ( qstricmp( format, "text/html" ) == 0 || qstricmp( format, "text/uri-list" ) == 0
                     || qstrnicmp( format, "image/", 6 ) == 0 ) ) {
+            html = html || qstricmp( format, "text/html" ) == 0;
             image = image || qstrnicmp( format, "image/", 6 ) == 0;
+            htmlPublished = htmlPublished || qstricmp( format, "text/html" ) == 0;
             g_ptr_array_add( formats, const_cast<char*>( g_intern_string( QCString( format ).lower().data() ) ) );
         }
     }
+    if ( html && !htmlPublished )
+        g_ptr_array_add( formats, const_cast<char*>( g_intern_static_string( "text/html" ) ) );
     if ( pixmap && !image )   // converted from the drawable (readForeignPixmap)
         g_ptr_array_add( formats, const_cast<char*>( g_intern_static_string( "image/png" ) ) );
     if ( text ) {

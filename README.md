@@ -205,12 +205,16 @@ same-document navigation and double every request, so:
   (Qt 3 waited 5 s per step), only targets the owner offers are asked for,
   and the last image read is reused within the same paste (WebKit reads
   it two or three times per paste).  Text and HTML of other programs come the same way (UTF8_STRING,
-  COMPOUND_TEXT, STRING as Latin-1; HTML in UTF-16 or UTF-8), converted
-  here; an owner offering only a PIXMAP gets its drawable copied as PNG
+  COMPOUND_TEXT, STRING as Latin-1, `text/plain;charset=X` and
+  `text/html;charset=X` in any charset Qt or iconv knows; plain HTML in
+  UTF-16 or UTF-8), converted here, and only what can be read is offered
+  to the page; an owner offering only a PIXMAP gets its drawable copied as PNG
   (16384 px a side, 32 Mpixels at most).  Every request of a paste uses
   the key's time; the paste ends when the selection changes hands after
   the key (also while its formats are asked for).  While we wait, Qt keeps
-  serving our own selections (requests, and its outgoing INCR transfers).
+  serving our own selections: requests, and the steps of its outgoing
+  INCR transfers (property deletions by programs that asked us within
+  10 s; other events stay queued).
   A read slower than 300 ms keeps the window open one second more (once).
 * **Page dialogs** are modal to the page only: non-modal windows, the
   page takes no input while one is open, they hide with their tab and
@@ -475,8 +479,9 @@ Pages for stage 3: `probe.html` (PDF, archive, attachment, mailto:),
 screenshot: the file, shown and scaled, while a counter keeps running).
 `tests/clipboard/run.sh DISPLAY BUILD_DIR` runs `xseltest`: the X
 selection reader against owners that behave and that do not (silent,
-stalled INCR, too large, endless pieces, our own CLIPBOARD read by
-another client during a read).
+stalled INCR, too large, endless pieces, a flooded window, our own
+CLIPBOARD read by another client during a read while an unrelated
+foreign event stays queued).
 
 Xephyr has no DRI3, so it exercises the SHM path.  A rootful Xwayland
 in a headless compositor has DRI3 and Present (glamor) and exercises the

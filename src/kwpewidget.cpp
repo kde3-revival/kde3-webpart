@@ -64,6 +64,7 @@ static QX11EventFilter s_previousFilter = 0;
 
 static int kwpeX11EventFilter( XEvent* event )
 {
+    KWPEClipboard::noteXEvent( event );   // (requests for our selections)
     if ( KWPE::handleXEvent( event ) )
         return 1;
     return s_previousFilter ? s_previousFilter( event ) : 0;

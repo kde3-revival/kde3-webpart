@@ -107,9 +107,17 @@ bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, const K
     for ( ;; ) {
         if ( nowMs() >= deadline )
             return false;
+        // (the deadline is looked at every 64: an owner that floods our
+        // window cannot keep us here past it)
         XEvent other;
-        while ( XCheckIfEvent( dpy, &other, isNoise, reinterpret_cast<XPointer>( &m ) ) )
-            ;
+        bool late = false;
+        for ( int i = 1; XCheckIfEvent( dpy, &other, isNoise, reinterpret_cast<XPointer>( &m ) ); ++i )
+            if ( i % 64 == 0 && nowMs() >= deadline ) {
+                late = true;
+                break;
+            }
+        if ( late )
+            return false;
         if ( XCheckIfEvent( dpy, event, matches, reinterpret_cast<XPointer>( &m ) ) )
             return true;
         if ( service && XCheckIfEvent( dpy, &other, isServiced, reinterpret_cast<XPointer>( &serviced ) ) ) {
@@ -301,6 +309,59 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
         }
         deadline = nowMs() + limits.idleMs < end ? nowMs() + limits.idleMs : end;
     }
+}
+
+namespace
+{
+
+struct Outgoing
+{
+    Window requestor;
+    Atom property;
+    long long last;
+};
+
+const int maxOutgoing = 32;
+const long long outgoingMs = 10000;
+Outgoing s_outgoing[maxOutgoing];
+
+}
+
+void KWPEXSelection::noteRequest( const XEvent* event )
+{
+    if ( event->type != SelectionRequest )
+        return;
+    const XSelectionRequestEvent& r = event->xselectionrequest;
+    Window requestor = r.requestor;
+    Atom property = r.property != None ? r.property : r.target;   // obsolete clients: the target
+    long long now = nowMs();
+    int slot = 0;
+    for ( int i = 0; i < maxOutgoing; ++i ) {
+        if ( s_outgoing[i].requestor == requestor && s_outgoing[i].property == property ) {
+            slot = i;
+            break;
+        }
+        if ( s_outgoing[i].last < s_outgoing[slot].last )
+            slot = i;   // the oldest (or a free one) otherwise
+    }
+    s_outgoing[slot].requestor = requestor;
+    s_outgoing[slot].property = property;
+    s_outgoing[slot].last = now;
+}
+
+bool KWPEXSelection::isOutgoingStep( const XEvent* event )
+{
+    if ( event->type != PropertyNotify || event->xproperty.state != PropertyDelete )
+        return false;
+    long long now = nowMs();
+    for ( int i = 0; i < maxOutgoing; ++i ) {
+        Outgoing& o = s_outgoing[i];
+        if ( o.requestor == event->xproperty.window && o.property == event->xproperty.atom && now - o.last < outgoingMs ) {
+            o.last = now;
+            return true;
+        }
+    }
+    return false;
 }
 
 const char* KWPEXSelection::resultName( Result result )

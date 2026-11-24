@@ -22,6 +22,7 @@
 //   too large      one property / INCR announcing more than the limit
 //   slow pieces    INCR pieces 100 ms apart: Ok (progress keeps it going)
 //   total          INCR pieces 300 ms apart, total limit 1 s: Timeout
+//   flood          property events on our window without end, no answer
 //   endless        pieces every 5 ms that never end: the total limit
 //   own INCR       while we read PRIMARY (slowly), another client reads our
 //                  CLIPBOARD by INCR: served through the Service hook
@@ -45,7 +46,7 @@
 namespace
 {
 
-enum Mode { Serve, Silent, IncrStall, Huge, SlowPieces, Endless };
+enum Mode { Serve, Silent, IncrStall, Huge, SlowPieces, Endless, Flood };
 
 long long nowMs()
 {
@@ -107,6 +108,21 @@ void owner( const char* name, Mode mode, size_t size, int pieceDelayMs, int read
             reply.xselection.property = None;
             if ( mode == Silent )
                 continue;
+            if ( mode == Flood && r.target == png ) {
+                // changes and deletions of a property on the requestor's
+                // window, without end and without an answer
+                Atom junk = XInternAtom( dpy, "XSELTEST_JUNK", False );
+                long long until = nowMs() + 3000;
+                while ( nowMs() < until ) {
+                    for ( int k = 0; k < 200; ++k ) {
+                        XChangeProperty( dpy, r.requestor, junk, XA_INTEGER, 8, PropModeReplace,
+                                         reinterpret_cast<const unsigned char*>( "x" ), 1 );
+                        XDeleteProperty( dpy, r.requestor, junk );
+                    }
+                    XFlush( dpy );
+                }
+                continue;
+            }
             if ( r.target == targets ) {
                 long list[2] = { long( targets ), long( png ) };
                 XChangeProperty( dpy, r.requestor, r.property, XA_ATOM, 32, PropModeReplace,
@@ -172,7 +188,7 @@ bool ownWants( const XEvent* e, void* data )
     const OwnServer* o = static_cast<const OwnServer*>( data );
     if ( e->type == SelectionRequest )
         return e->xselectionrequest.owner == o->window;
-    return e->type == PropertyNotify && e->xproperty.state == PropertyDelete && e->xproperty.window != o->window;
+    return KWPEXSelection::isOutgoingStep( e );
 }
 
 void ownHandle( XEvent* e, void* data )
@@ -180,6 +196,7 @@ void ownHandle( XEvent* e, void* data )
     OwnServer* o = static_cast<OwnServer*>( data );
     o->handled++;
     if ( e->type == SelectionRequest ) {
+        KWPEXSelection::noteRequest( e );
         XSelectionRequestEvent& r = e->xselectionrequest;
         XEvent reply;
         memset( &reply, 0, sizeof( reply ) );
@@ -221,6 +238,14 @@ void requester( const char* name, int fd )
     a.event_mask = PropertyChangeMask;
     Window w = XCreateWindow( dpy, DefaultRootWindow( dpy ), 0, 0, 1, 1, 0, 0, InputOnly, CopyFromParent, CWEventMask, &a );
     Atom prop = XInternAtom( dpy, "XSELTEST_IN", False );
+    // an unrelated property change the reader's owner watches (on the root
+    // window): not a step of its transfer, it must stay queued for it
+    Atom noise = XInternAtom( dpy, "XSELTEST_NOISE", False );
+    long one = 1;
+    usleep( 200000 );
+    XChangeProperty( dpy, DefaultRootWindow( dpy ), noise, XA_INTEGER, 32, PropModeReplace,
+                     reinterpret_cast<unsigned char*>( &one ), 1 );
+    XDeleteProperty( dpy, DefaultRootWindow( dpy ), noise );
     XConvertSelection( dpy, XInternAtom( dpy, "CLIPBOARD", False ), XInternAtom( dpy, "image/png", False ), prop, w, CurrentTime );
     XFlush( dpy );
     std::string got;
@@ -414,6 +439,16 @@ int main( int argc, char** argv )
     check( run.result == KWPEXSelection::Timeout && run.ms < 1400, "total limit", detail );
     stopOwner( pid );
 
+    // the owner floods our window with property events and never answers:
+    // the deadline still holds
+    pid = startOwner( argv[1], Flood, 1000 );
+    run = readPng( dpy, limits );
+    snprintf( detail, sizeof( detail ), "%s, %lld ms", KWPEXSelection::resultName( run.result ), run.ms );
+    check( run.result == KWPEXSelection::Timeout && run.ms < 1300, "flooded window", detail );
+    stopOwner( pid );
+    usleep( 300000 );
+    XSync( dpy, True );   // the flood to the old window: an event loop would take it, here nobody does
+
     // pieces keep coming (progress all the time): the total limit still ends it
     {
         const KWPEXSelection::Limits endless = { 1000, 1000, 1024u * 1024 * 1024 };
@@ -443,6 +478,7 @@ int main( int argc, char** argv )
         own.active = false;
         own.handled = 0;
         XSetSelectionOwner( dpy, own.clipboard, own.window, CurrentTime );
+        XSelectInput( dpy, DefaultRootWindow( dpy ), PropertyChangeMask );
         XSync( dpy, False );
         s_selection = "PRIMARY";
         pid = startOwner( argv[1], Serve, 2 * 1024 * 1024, 100 );   // about 1 s
@@ -472,6 +508,15 @@ int main( int argc, char** argv )
                   KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ), run.ms, bytes, readEnd - doneAt );
         check( run.result == KWPEXSelection::Ok && bytes == own.data.size() && doneAt && doneAt < readEnd,
                "own INCR served during a read", detail );
+        Atom noise = XInternAtom( dpy, "XSELTEST_NOISE", False );
+        int queued = 0;
+        XEvent e;
+        while ( XCheckTypedWindowEvent( dpy, DefaultRootWindow( dpy ), PropertyNotify, &e ) )
+            if ( e.xproperty.atom == noise && e.xproperty.state == PropertyDelete )
+                ++queued;
+        snprintf( detail, sizeof( detail ), "%d such event(s) left in the queue", queued );
+        check( queued == 1, "foreign PropertyDelete not serviced", detail );
+        XSelectInput( dpy, DefaultRootWindow( dpy ), NoEventMask );
         XDestroyWindow( dpy, own.window );
     }
 
