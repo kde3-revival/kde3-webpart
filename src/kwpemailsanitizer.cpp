@@ -559,6 +559,15 @@ std::string sanitizeCss( const std::string& css, Profile profile, bool external 
 // ---------------------------------------------------------------------
 // HTML
 
+// This thread's CPU time (load elsewhere on the machine counts little).
+static double threadCpuSeconds()
+{
+    struct timespec t;
+    if ( clock_gettime( CLOCK_THREAD_CPUTIME_ID, &t ) != 0 )
+        return 0;   // no clock: no limit
+    return double( t.tv_sec ) + double( t.tv_nsec ) * 1e-9;
+}
+
 namespace
 {
 
@@ -566,10 +575,15 @@ enum ElementAction { Keep, Unwrap, Drop, RenameToPre };
 
 struct Serializer
 {
-    Serializer( Profile p, bool e ) : profile( p ), external( e ), depth( 0 ) {}
+    Serializer( Profile p, bool e, size_t mo, double dl )
+        : profile( p ), external( e ), depth( 0 ), maxOut( mo ), deadline( dl ), abandoned( false ), steps( 0 ),
+          checkedAt( 0 )
+    {
+    }
 
     void open( const GumboNode* n, std::string& close, bool& descend );
     void walk( const GumboNode* root );
+    bool overLimits();
     void text( const char* t );
     void attribute( const char* name, const std::string& value );
     ElementAction actionFor( const GumboElement& e, std::string& name ) const;
@@ -580,6 +594,13 @@ struct Serializer
     std::string out;
     unsigned depth;   // elements written and open
     static const unsigned maxDepth = 400;
+    // beyond maxOut bytes written, or past the deadline (this thread's CPU
+    // time), the walk stops: abandoned
+    size_t maxOut;
+    double deadline;
+    bool abandoned;
+    unsigned steps;
+    size_t checkedAt;   // the output's size when the clock was last read
 };
 
 static bool inList( const std::string& s, const char* const* list )
@@ -843,9 +864,23 @@ void Serializer::open( const GumboNode* n, std::string& close, bool& descend )
     descend = true;
 }
 
+// Whether the output has grown beyond maxOut or the deadline has passed:
+// the clock is read every 64th node and after every 256 KB written (a
+// long style attribute sanitized).
+bool Serializer::overLimits()
+{
+    if ( out.size() > maxOut )
+        return true;
+    if ( ( ++steps & 63 ) != 0 && out.size() - checkedAt < 256 * 1024 )
+        return false;
+    checkedAt = out.size();
+    return threadCpuSeconds() > deadline;
+}
+
 // The tree without recursion: a message may nest elements 100000 deep
 // (Gumbo builds that tree; WebKit's parser would flatten it at 512).  The
 // stack lives on the heap; elements deeper than maxDepth are unwrapped.
+// Over the limits (overLimits()) it stops, abandoned.
 void Serializer::walk( const GumboNode* root )
 {
     struct Frame
@@ -861,6 +896,10 @@ void Serializer::walk( const GumboNode* root )
     f.next = 0;
     bool descend = false;
     open( root, f.close, descend );
+    if ( overLimits() ) {
+        abandoned = true;
+        return;
+    }
     if ( !descend ) {
         out += f.close;
         return;
@@ -881,6 +920,10 @@ void Serializer::walk( const GumboNode* root )
         const GumboNode* child = static_cast<const GumboNode*>( c.data[top.next++] );
         if ( child->type == GUMBO_NODE_TEXT || child->type == GUMBO_NODE_WHITESPACE ) {
             text( child->v.text.text );
+            if ( overLimits() ) {
+                abandoned = true;
+                return;
+            }
             continue;
         }
         if ( child->type != GUMBO_NODE_ELEMENT )
@@ -889,6 +932,10 @@ void Serializer::walk( const GumboNode* root )
         g.node = child;
         g.next = 0;
         open( child, g.close, descend );
+        if ( overLimits() ) {
+            abandoned = true;
+            return;
+        }
         if ( !descend ) {
             out += g.close;
             continue;
@@ -962,10 +1009,18 @@ void Serializer::walk( const GumboNode* root )
 // 100000 lines, costs 6e5); what it lets a hostile one buy costs less
 // than parsing it at all (at most 4 ns per unit measured: 20 ms, then
 // 30 ns per byte, where Gumbo takes 60-200 ns per byte).  The corpus's
-// newsletters (35-45 KB) cost 3e3-4e3.  What reconstructed elements
-// allocate within that, the allocation budget bounds (sanitizeHtml()).
+// newsletters (35-45 KB) cost 3e3-4e3.
+//
+// A clone also copies the attributes of its start tag, and the tree
+// holds every copy (written out again for each): a few characters of
+// text after a long start tag closed early cost its length again.  Above
+// maxCloneBytes plus maxCloneBytesPerByte per byte of input in the start
+// tags cloned the document is not parsed either.  What elements and
+// clones allocate, the allocation budget bounds (sanitizeHtml()).
 static const double maxParseWork = 5e6;
 static const double maxParseWorkPerByte = 8;
+static const double maxCloneBytes = 4 * 1024 * 1024;
+static const double maxCloneBytesPerByte = 2;
 // An element no tag opened (a clone of a formatting element): about what
 // Gumbo spends on an element, allocating it and its attributes, in steps
 // of a scope check.
@@ -1091,17 +1146,26 @@ static bool isAlpha( char c )
 class ParseCost
 {
 public:
-    ParseCost( const std::string& html, double limit )
-        : m_html( html ), m_limit( limit ), m_work( 0 ), m_textWork( 0 ), m_startTags( 0 ), m_serial( 0 ),
+    ParseCost( const std::string& html, double limit, double cloneLimit )
+        : m_html( html ), m_limit( limit ), m_cloneLimit( cloneLimit ), m_work( 0 ), m_textWork( 0 ),
+          m_elements( 0 ), m_attributes( 0 ), m_clones( 0 ), m_cloneBytes( 0 ), m_serial( 0 ),
           m_foreign( 0 ), m_fakeFormatting( false ), m_frameset( false ), m_commentEnd( "-->" ), m_commentBangEnd( "--!>" ),
           m_cdataEnd( "]]>" ), m_scriptComment( "<!--" )
     {
     }
 
-    // false: the work exceeds the limit (the pass stops there)
+    // false: the work, or what clones copy, exceeds its limit (the pass
+    // stops there)
     bool run();
     double work() const { return m_work + m_textWork / 8; }
-    size_t startTags() const { return m_startTags; }
+    // elements start tags make (not clones), their attributes and those
+    // of the clones
+    size_t elements() const { return m_elements; }
+    size_t attributes() const { return m_attributes; }
+    // elements no tag opened (reconstructed formatting elements) and the
+    // length of the start tags they copy
+    size_t clones() const { return m_clones; }
+    size_t cloneBytes() const { return m_cloneBytes; }
 
 private:
     struct Element
@@ -1114,19 +1178,22 @@ private:
     {
         std::string name;
         std::string tag;       // the start tag as written (for the Noah's Ark clause)
+        size_t attributes;     // in it
         unsigned long serial;  // its element; 0: a marker
         bool open;             // its element is on the stack
     };
 
-    bool over() const { return work() > m_limit; }
+    bool over() const { return work() > m_limit || double( m_cloneBytes ) > m_cloneLimit; }
     // a character makes Gumbo search the stack: the list ends with an element
     bool searchesStack() const { return m_fakeFormatting || ( !m_list.empty() && m_list.back().serial != 0 ); }
     void charge() { m_work += double( m_stack.size() + m_list.size() ); }
     void text( size_t length );
-    size_t tagEnd( size_t pos, bool* fontAttributes = 0, bool* selfClosing = 0 ) const;
+    size_t tagEnd( size_t pos, bool* fontAttributes = 0, bool* selfClosing = 0, size_t* attributes = 0 ) const;
     size_t rawEnd( size_t pos, const std::string& name, size_t& endTag, bool& unsure );
     std::string tagName( size_t& pos ) const;
-    void startTag( const std::string& name, size_t begin, size_t end, bool fontAttributes, bool selfClosing );
+    void startTag( const std::string& name, size_t begin, size_t end, bool fontAttributes, bool selfClosing,
+                   size_t attributes );
+    void ignored( size_t attributes );
     void pushForeign( const std::string& name, unsigned flags, bool selfClosing );
     void fakeStartTag( const std::string& name );
     void endTag( const std::string& name );
@@ -1140,7 +1207,7 @@ private:
     void popTo( size_t index );
     void pop();
     void clearToMarker();
-    void addFormatting( const std::string& name, const std::string& tag );
+    void addFormatting( const std::string& name, const std::string& tag, size_t attributes );
     void reconstruct();
     long lastFormatting( const std::string& name ) const;
 
@@ -1165,9 +1232,9 @@ private:
     };
 
     const std::string& m_html;
-    double m_limit;
+    double m_limit, m_cloneLimit;
     double m_work, m_textWork;
-    size_t m_startTags;
+    size_t m_elements, m_attributes, m_clones, m_cloneBytes;
     unsigned long m_serial;
     unsigned m_foreign;   // svg and math on the stack
     bool m_fakeFormatting;
@@ -1281,7 +1348,7 @@ long ParseCost::lastFormatting( const std::string& name ) const
     return -1;
 }
 
-void ParseCost::addFormatting( const std::string& name, const std::string& tag )
+void ParseCost::addFormatting( const std::string& name, const std::string& tag, size_t attributes )
 {
     // Noah's Ark: three alike after the last marker at most
     size_t alike = 0, earliest = 0;
@@ -1295,6 +1362,7 @@ void ParseCost::addFormatting( const std::string& name, const std::string& tag )
     Entry f;
     f.name = name;
     f.tag = tag;
+    f.attributes = attributes;
     f.serial = m_stack.back().serial;
     f.open = true;
     m_list.push_back( f );
@@ -1308,9 +1376,12 @@ void ParseCost::reconstruct()
     while ( i > 0 && m_list[i - 1].serial != 0 && !m_list[i - 1].open )
         --i;
     // a search of the stack for each entry looked at, then the clones:
-    // elements no tag opened
+    // elements no tag opened, each with a copy of the attributes
     m_work += double( m_list.size() - i + 1 ) * double( m_stack.size() ) + cloneWork * double( m_list.size() - i );
     for ( ; i < m_list.size(); ++i ) {
+        ++m_clones;
+        m_cloneBytes += m_list[i].tag.size();
+        m_attributes += m_list[i].attributes;
         push( m_list[i].name, elementFlags( m_list[i].name ) );
         m_list[i].serial = m_stack.back().serial;
         m_list[i].open = true;
@@ -1351,8 +1422,12 @@ void ParseCost::endFormatting( const std::string& name )
     for ( size_t i = s + 1; i < m_stack.size(); ++i ) {
         if ( m_stack[i].flags & Special ) {
             // a furthest block: elements move, up to eight rounds; the
-            // depth is taken to stay
+            // depth is taken to stay.  The formatting element is cloned
+            // (the clone takes its place).
             m_work += 8 * double( m_stack.size() + m_list.size() );
+            ++m_clones;
+            m_cloneBytes += m_list[f].tag.size();
+            m_attributes += m_list[f].attributes;
             return;
         }
     }
@@ -1363,7 +1438,7 @@ void ParseCost::endFormatting( const std::string& name )
 void ParseCost::fakeStartTag( const std::string& name )
 {
     charge();
-    ++m_startTags;
+    ++m_elements;   // maybe one
     unsigned flags = elementFlags( name );
     if ( flags & Void )
         return;
@@ -1399,13 +1474,22 @@ void ParseCost::pushForeign( const std::string& name, unsigned flags, bool selfC
     push( name, f );
 }
 
+// A start tag that makes no element after all (with @p attributes).
+void ParseCost::ignored( size_t attributes )
+{
+    --m_elements;
+    m_attributes -= attributes;
+}
+
 // The start tag @p name written at [@p begin, @p end); @p fontAttributes:
-// it has an attribute color, face or size; @p selfClosing: "/>".
+// it has an attribute color, face or size; @p selfClosing: "/>";
+// @p attributes: how many it has.
 void ParseCost::startTag( const std::string& name, size_t begin, size_t end, bool fontAttributes,
-                          bool selfClosing )
+                          bool selfClosing, size_t attributes )
 {
     charge();
-    ++m_startTags;
+    ++m_elements;
+    m_attributes += attributes;
     unsigned flags = elementFlags( name );
     static const std::string font( "font" );
     if ( inForeignContent() ) {
@@ -1429,8 +1513,10 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
     }
     if ( name == "frameset" )
         m_frameset = true;
-    if ( flags & NotOnStack )
+    if ( flags & NotOnStack ) {
+        ignored( attributes );   // html, head, body: theirs, if new, go to the one there
         return;
+    }
     static const std::string a( "a" ), nobr( "nobr" ), li( "li" ), dd( "dd" ), dt( "dt" ), p( "p" ),
         button( "button" ), option( "option" ), optgroup( "optgroup" ), select( "select" ), tr( "tr" ),
         table( "table" ), col( "col" ), colgroup( "colgroup" ), tbody( "tbody" );
@@ -1468,6 +1554,7 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
     } else if ( name == select ) {
         if ( ( i = find( &select, 0, Scope ) ) >= 0 ) {
             popTo( size_t( i ) );
+            ignored( attributes );
             return;
         }
     } else if ( name == option || name == optgroup ) {
@@ -1491,16 +1578,24 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
         if ( i >= 0 )
             popTo( size_t( i ) );
         long c = tableContext( context );
-        if ( c < 0 )
+        if ( c < 0 ) {
+            ignored( attributes );
             return;
+        }
         popTo( size_t( c ) + 1 );
         // the row group and row a table implies, the colgroup of a col
-        if ( ( flags & ( Cell | Row ) ) && topIs( TableElement ) )
+        if ( ( flags & ( Cell | Row ) ) && topIs( TableElement ) ) {
             push( tbody, elementFlags( tbody ) );
-        if ( ( flags & Cell ) && topIs( RowGroup ) )
+            ++m_elements;
+        }
+        if ( ( flags & Cell ) && topIs( RowGroup ) ) {
             push( tr, elementFlags( tr ) );
-        if ( name == col && !topIs( 0, &colgroup ) )
+            ++m_elements;
+        }
+        if ( name == col && !topIs( 0, &colgroup ) ) {
             push( colgroup, elementFlags( colgroup ) );
+            ++m_elements;
+        }
     } else if ( name == table ) {
         if ( topIs( ClosesTable ) && ( i = find( &table, 0, TableScope ) ) >= 0 )
             popTo( size_t( i ) );
@@ -1521,9 +1616,10 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
     }
     push( name, flags );
     if ( flags & Formatting )
-        addFormatting( name, m_html.substr( begin, end - begin ) );
+        addFormatting( name, m_html.substr( begin, end - begin ), attributes );
     if ( flags & Marker ) {
         Entry m;
+        m.attributes = 0;
         m.serial = 0;
         m.open = false;
         m_list.push_back( m );
@@ -1607,8 +1703,8 @@ std::string ParseCost::tagName( size_t& pos ) const
 // After the tag's '>', from just after its name (the standard's states
 // from "tag name" on); npos: the input ends in the tag.  @p fontAttributes:
 // whether it has an attribute color, face or size; @p selfClosing: whether
-// it ends with "/>".
-size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing ) const
+// it ends with "/>"; @p attributes: how many it has (duplicates too).
+size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing, size_t* attributes ) const
 {
     enum State { BeforeName, Name, AfterName, BeforeValue, Quoted, Unquoted, AfterQuoted, SelfClosing };
     State state = BeforeName;
@@ -1618,6 +1714,8 @@ size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing ) 
         *fontAttributes = false;
     if ( selfClosing )
         *selfClosing = false;
+    if ( attributes )
+        *attributes = 0;
     if ( pos < n && m_html[pos] == '/' ) {
         state = SelfClosing;
         ++pos;
@@ -1640,6 +1738,8 @@ size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing ) 
             else {
                 state = Name;   // '=' too: the first character of the name
                 name = pos;
+                if ( attributes )
+                    ++*attributes;
             }
             break;
         case Name:
@@ -1664,6 +1764,8 @@ size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing ) 
             else {
                 state = Name;
                 name = pos;
+                if ( attributes )
+                    ++*attributes;
             }
             break;
         case BeforeValue:
@@ -1769,10 +1871,11 @@ bool ParseCost::run()
             size_t pos = i;
             std::string name = tagName( pos );
             bool fontAttributes = false, selfClosing = false;
-            size_t end = tagEnd( pos, name == "font" ? &fontAttributes : 0, &selfClosing );
+            size_t attributes = 0;
+            size_t end = tagEnd( pos, name == "font" ? &fontAttributes : 0, &selfClosing, &attributes );
             if ( end == std::string::npos )
                 break;   // the input ends in the tag: it is dropped
-            startTag( name, lt, end, fontAttributes, selfClosing );
+            startTag( name, lt, end, fontAttributes, selfClosing, attributes );
             i = end;
             if ( ( elementFlags( name ) & Raw ) && !m_stack.empty() && m_stack.back().name == name ) {
                 size_t element = m_stack.size() - 1;
@@ -1869,16 +1972,6 @@ bool ParseCost::run()
 
 } // namespace
 
-// Whether Gumbo would work too much on @p html; @p startTags: the start
-// tags in it (for the allocation budget).
-static bool tooMuchParsing( const std::string& html, size_t& startTags )
-{
-    ParseCost cost( html, maxParseWork + maxParseWorkPerByte * double( html.size() ) );
-    bool ok = cost.run();
-    startTags = cost.startTags();
-    return !ok;
-}
-
 // The source text in a <pre>: every character as text, NUL as U+FFFD.
 static void escapeSource( std::string& out, const std::string& text )
 {
@@ -1908,6 +2001,10 @@ static void escapeSource( std::string& out, const std::string& text )
 // within one long run of text.
 static const double maxParseCpu = 2.0;
 
+// What the sanitized document may grow to (sanitizeHtml()).
+static const size_t maxOutput = 8 * 1024 * 1024;
+static const size_t maxOutputPerByte = 8;
+
 struct Allocations
 {
     std::unordered_set<void*> pointers;
@@ -1917,14 +2014,6 @@ struct Allocations
     double cpuDeadline;
     jmp_buf abandon;
 };
-
-static double threadCpuSeconds()
-{
-    struct timespec t;
-    if ( clock_gettime( CLOCK_THREAD_CPUTIME_ID, &t ) != 0 )
-        return 0;   // no clock: no limit
-    return double( t.tv_sec ) + double( t.tv_nsec ) * 1e-9;
-}
 
 static void* allocate( void* userdata, size_t size )
 {
@@ -1962,22 +2051,42 @@ static std::string sourceText( const std::string& html )
     return out + "</pre></body></html>\n";
 }
 
+// The test tool alone, with KWPE_SANITIZE_STATS set: how it went, on
+// stderr.
+static void stats( const char* what, const Allocations& arena, const ParseCost& cost, size_t out )
+{
+#ifdef KWPE_SANITIZE_TESTING
+    if ( getenv( "KWPE_SANITIZE_STATS" ) )
+        fprintf( stderr, "%s: allocated %zu of %zu, output %zu; elements %zu, attributes %zu, clones %zu (%zu bytes)\n",
+                 what, arena.allocated, arena.budget, out, cost.elements(), cost.attributes(), cost.clones(),
+                 cost.cloneBytes() );
+#else
+    (void)what;
+    (void)arena;
+    (void)cost;
+    (void)out;
+#endif
+}
+
 std::string sanitizeHtml( const std::string& html, Profile profile, bool external )
 {
-    size_t startTags = 0;
-    if ( tooMuchParsing( html, startTags ) )
-        return sourceText( html );   // not parsed (see maxParseWork)
+    double n = double( html.size() );
+    ParseCost cost( html, maxParseWork + maxParseWorkPerByte * n, maxCloneBytes + maxCloneBytesPerByte * n );
+    if ( !cost.run() )
+        return sourceText( html );   // Gumbo would work or clone too much (see maxParseWork)
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
     Allocations arena;
     arena.allocated = 0;
-    // Gumbo makes an element for each start tag (175-500 bytes with its
-    // attributes and text: KMail's plain text, one <div dir="ltr"> per
-    // line, 450-490 bytes per tag; an empty line, <br>, 175 bytes for 4),
-    // and keeps text and attributes 3-7 times their size (the corpus's
-    // newsletters: 5-6 times theirs).  Elements beyond that are clones of
-    // formatting elements.
-    arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * startTags;
+    // Gumbo makes an element for each start tag that is not ignored
+    // (175-500 bytes with its attributes and text: KMail's plain text, one
+    // <div dir="ltr"> per line, 450-490 bytes per tag; an empty line, <br>,
+    // 175 bytes for 4), and keeps text and attributes 3-7 times their size
+    // (the corpus's newsletters: 5-6 times theirs).  A clone of a
+    // formatting element is an element with a copy of its attributes.
+    // Tags Gumbo ignores (a <td> outside a table) count nothing.
+    arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * cost.elements() + 256 * cost.attributes() +
+                   512 * cost.clones() + 2 * cost.cloneBytes();
     arena.calls = 0;
     double cpuLimit = maxParseCpu;
 #ifdef KWPE_SANITIZE_TESTING
@@ -1992,10 +2101,15 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     options.userdata = &arena;
     if ( setjmp( arena.abandon ) ) {
         freeAll( &arena );
+        stats( "parse abandoned", arena, cost, 0 );
         return sourceText( html );
     }
     GumboOutput* output = gumbo_parse_with_options( &options, html.data(), html.size() );
-    Serializer s( profile, external );
+    // The output: KMail's plain text grows by a third at most (an empty
+    // line's <br> becomes <br />, entities stay); beyond maxOutput plus
+    // maxOutputPerByte per byte of input, or past the CPU deadline, the
+    // walk is abandoned as the parse is.
+    Serializer s( profile, external, maxOutput + maxOutputPerByte * html.size(), arena.cpuDeadline );
     // The document's mode as Gumbo found it (tables of mails depend on
     // quirks mode): no doctype is quirks mode.
     switch ( output->document->v.document.doc_type_quirks_mode ) {
@@ -2015,6 +2129,11 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     // message would exhaust the stack there).  Everything Gumbo allocated
     // is ours to free.
     freeAll( &arena );
+    stats( s.abandoned ? "walk abandoned" : "written", arena, cost, s.out.size() );
+    if ( s.abandoned ) {
+        std::string().swap( s.out );
+        return sourceText( html );
+    }
     return s.out;
 }
 
