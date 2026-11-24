@@ -193,38 +193,113 @@ static const char mailStateHandler[] = "kwpeMailState";
 
 // App mode: the picture of the page's notifications.  WebKit's
 // notification has no icon (WebKitNotification: title, body, tag), so
-// this script (the page's own world, the top frame of the application's
-// site, before the page's scripts) wraps the Notification constructor:
-// options.icon of the page's own origin, data: or blob: (nothing of
-// another site) is drawn into a canvas of at most 96 pixels in the web
-// process and handed to us as its pixels (RGBA, width x height x 4
-// bytes, base64): the host fetches nothing and decodes no image format.
-// "pending" comes before the notification itself (the constructor), the
-// picture or none when it is ready (at most 1.5 seconds later).
+// two scripts (the top frame, before the page's scripts) find it:
+//
+// appNotificationWrapper, in the page's world, wraps the Notification
+// constructor: it reads the constructor's arguments once (converted to
+// strings as WebKit would, the options copied to an object of their
+// own) and gives the native constructor exactly these values; with an
+// icon it announces title, body, tag and icon to the other script by a
+// DOM event on the top document (a frame of another site cannot reach
+// it).  It uses only what it took before the page's scripts ran.  What
+// it announces is the page's word, nothing more.
+//
+// appNotificationBridge, in a world of its own (appNotificationWorld:
+// the page's scripts, of any frame, cannot run there; the message
+// handler exists only there), turns an announcement with an icon of the
+// page's own origin, data: or blob: (nothing of another site) into the
+// picture's pixels: drawn into a canvas of at most 96 pixels in the web
+// process, sent as RGBA (width x height x 4 bytes, base64); the host
+// fetches nothing and decodes no image format.  Every message carries
+// the document's token (random, made by the script when the document
+// starts, sent first as "hello"): the host takes only the current
+// document's messages.  "pending" comes before the notification itself
+// (the constructor), the picture or none when it is ready (at most 1.5
+// seconds later).
 static const char appNotificationHandler[] = "kwpeNotification";
-static const char appNotificationScript[] =
+static const char appNotificationWorld[] = "kwpenotification";
+static const char appNotificationWrapper[] =
     "(function () {\n"
     "  'use strict';\n"
     "  var N = window.Notification;\n"
+    "  if (typeof N !== 'function') return;\n"
+    "  var construct = Reflect.construct, apply = Reflect.apply, create = Object.create,\n"
+    "      defineProperty = Object.defineProperty, setPrototypeOf = Object.setPrototypeOf,\n"
+    "      quote = JSON.stringify, toString = String, TypeError_ = TypeError, Event_ = window.CustomEvent,\n"
+    "      dispatch = EventTarget.prototype.dispatchEvent, doc = document;\n"
+    "  var keys = ['actions', 'badge', 'body', 'data', 'dir', 'icon', 'image', 'lang', 'renotify',\n"
+    "              'requireInteraction', 'silent', 'tag', 'timestamp', 'vibrate'];\n"
+    "  var strings = { badge: true, body: true, dir: true, icon: true, image: true, lang: true, tag: true };\n"
+    "  function string(value) {\n"
+    "    if (typeof value === 'symbol') throw new TypeError_('Cannot convert a symbol to a string');\n"
+    "    return toString(value);\n"
+    "  }\n"
+    "  function define(object, key, value) {\n"
+    "    var d = create(null);\n"
+    "    d.value = value; d.writable = true; d.enumerable = true; d.configurable = true;\n"
+    "    defineProperty(object, key, d);\n"
+    "  }\n"
+    "  function announce(title, options) {\n"
+    "    try {\n"
+    "      var detail = '[' + quote(title) + ',' + quote(options.body === undefined ? '' : options.body) + ',' +\n"
+    "                   quote(options.tag === undefined ? '' : options.tag) + ',' + quote(options.icon) + ']';\n"
+    "      var init = create(null);\n"
+    "      init.detail = detail;\n"
+    "      apply(dispatch, doc, [construct(Event_, ['kwpe-notification', init])]);\n"
+    "    } catch (e) {}\n"
+    "  }\n"
+    "  function Notification(title) {\n"
+    "    if (!new.target) return apply(N, this, arguments);\n"
+    "    if (arguments.length === 0) return construct(N, [], new.target);\n"
+    "    var t = string(title), options = arguments[1], copy = options;\n"
+    "    if (options !== null && (typeof options === 'object' || typeof options === 'function')) {\n"
+    "      copy = create(null);\n"
+    "      for (var i = 0; i < keys.length; ++i) {\n"
+    "        var value = options[keys[i]];\n"
+    "        if (value !== undefined) define(copy, keys[i], strings[keys[i]] ? string(value) : value);\n"
+    "      }\n"
+    "      if (copy.icon) announce(t, copy);\n"
+    "    }\n"
+    "    return construct(N, arguments.length > 1 ? [t, copy] : [t], new.target);\n"
+    "  }\n"
+    "  setPrototypeOf(Notification, N);\n"
+    "  defineProperty(Notification, 'prototype', { value: N.prototype, writable: false });\n"
+    "  defineProperty(N.prototype, 'constructor', { value: Notification, writable: true, enumerable: false, configurable: true });\n"
+    "  defineProperty(window, 'Notification', { value: Notification, writable: true, configurable: true, enumerable: false });\n"
+    "})();\n";
+static const char appNotificationBridge[] =
+    "(function () {\n"
+    "  'use strict';\n"
     "  var handlers = window.webkit && window.webkit.messageHandlers;\n"
     "  var handler = handlers && handlers.kwpeNotification;\n"
-    "  if (typeof N !== 'function' || !handler) return;\n"
-    "  var post = handler.postMessage.bind(handler);\n"
-    "  var serial = 0, size = 96;\n"
+    "  if (!handler) return;\n"
+    "  var apply = Reflect.apply, postMessage = handler.postMessage, parse = JSON.parse, isArray = Array.isArray,\n"
+    "      URL_ = URL, Image_ = Image, setTimeout_ = setTimeout, min = Math.min, max = Math.max, round = Math.round,\n"
+    "      fromCharCode = String.fromCharCode, btoa_ = btoa, doc = document,\n"
+    "      createElement = Document.prototype.createElement,\n"
+    "      getContext = HTMLCanvasElement.prototype.getContext,\n"
+    "      drawImage = CanvasRenderingContext2D.prototype.drawImage,\n"
+    "      getImageData = CanvasRenderingContext2D.prototype.getImageData,\n"
+    "      subarray = Uint8ClampedArray.prototype.subarray,\n"
+    "      origin = location.origin, size = 96, serial = 0, random = new Uint32Array(4);\n"
+    "  crypto.getRandomValues(random);\n"
+    "  var token = '';\n"
+    "  for (var r = 0; r < random.length; ++r) token += ('0000000' + random[r].toString(16)).slice(-8);\n"
+    "  function post(message) { message.token = token; apply(postMessage, handler, [message]); }\n"
+    "  post({ kind: 'hello' });\n"
+    "  window.addEventListener('pageshow', function (e) { if (e.persisted) post({ kind: 'hello' }); });\n"
     "  function source(icon) {\n"
     "    try {\n"
-    "      var url = new URL(String(icon), document.baseURI);\n"
-    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === location.origin) return url.href;\n"
+    "      var url = new URL_(icon, doc.baseURI);\n"
+    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === origin) return url.href;\n"
     "    } catch (e) {}\n"
     "    return null;\n"
     "  }\n"
-    "  function text(value) { return value === undefined ? '' : String(value); }\n"
-    "  function announce(title, options) {\n"
-    "    if (!options || !options.icon) return;\n"
-    "    var src = source(options.icon);\n"
+    "  function announce(title, body, tag, icon) {\n"
+    "    var src = source(icon);\n"
     "    if (!src) return;\n"
-    "    var s = ++serial, done = false, img = new Image();\n"
-    "    post({ kind: 'pending', serial: s, title: String(title), body: text(options.body), tag: text(options.tag) });\n"
+    "    var s = ++serial, done = false, img = new Image_();\n"
+    "    post({ kind: 'pending', serial: s, title: title, body: body, tag: tag });\n"
     "    function finish(w, h, pixels) {\n"
     "      if (!done) { done = true; post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels }); }\n"
     "    }\n"
@@ -232,29 +307,31 @@ static const char appNotificationScript[] =
     "      try {\n"
     "        var w = img.naturalWidth, h = img.naturalHeight;\n"
     "        if (!w || !h) { finish(0, 0, ''); return; }\n"
-    "        var k = Math.min(1, size / Math.max(w, h)), c = document.createElement('canvas');\n"
-    "        w = c.width = Math.min(size, Math.max(1, Math.round(w * k)));\n"
-    "        h = c.height = Math.min(size, Math.max(1, Math.round(h * k)));\n"
-    "        var g = c.getContext('2d');\n"
-    "        g.drawImage(img, 0, 0, w, h);\n"
-    "        var data = g.getImageData(0, 0, w, h).data, bytes = '';\n"
+    "        var k = min(1, size / max(w, h)), c = apply(createElement, doc, ['canvas']);\n"
+    "        w = c.width = min(size, max(1, round(w * k)));\n"
+    "        h = c.height = min(size, max(1, round(h * k)));\n"
+    "        var g = apply(getContext, c, ['2d']);\n"
+    "        apply(drawImage, g, [img, 0, 0, w, h]);\n"
+    "        var data = apply(getImageData, g, [0, 0, w, h]).data, bytes = '';\n"
     "        for (var i = 0; i < data.length; i += 8192)\n"
-    "          bytes += String.fromCharCode.apply(null, data.subarray(i, i + 8192));\n"
-    "        finish(w, h, btoa(bytes));\n"
+    "          bytes += apply(fromCharCode, null, apply(subarray, data, [i, i + 8192]));\n"
+    "        finish(w, h, btoa_(bytes));\n"
     "      } catch (e) { finish(0, 0, ''); }\n"
     "    };\n"
     "    img.onerror = function () { finish(0, 0, ''); };\n"
-    "    setTimeout(function () { finish(0, 0, ''); }, 1500);\n"
+    "    setTimeout_(function () { finish(0, 0, ''); }, 1500);\n"
     "    img.src = src;\n"
     "  }\n"
-    "  function Notification(title, options) {\n"
-    "    if (!new.target) return N.apply(this, arguments);\n"
-    "    try { announce(title, options); } catch (e) {}\n"
-    "    return Reflect.construct(N, arguments, new.target);\n"
-    "  }\n"
-    "  Object.setPrototypeOf(Notification, N);\n"
-    "  Object.defineProperty(Notification, 'prototype', { value: N.prototype });\n"
-    "  Object.defineProperty(window, 'Notification', { value: Notification, writable: true, configurable: true, enumerable: false });\n"
+    "  doc.addEventListener('kwpe-notification', function (e) {\n"
+    "    try {\n"
+    "      var a = e.detail;\n"
+    "      if (e.target !== doc || typeof a !== 'string' || a.length > 65536) return;\n"
+    "      a = parse(a);\n"
+    "      if (!isArray(a) || a.length !== 4) return;\n"
+    "      for (var i = 0; i < 4; ++i) if (typeof a[i] !== 'string' || a[i].length > 4096) return;\n"
+    "      announce(a[0], a[1], a[2], a[3]);\n"
+    "    } catch (x) {}\n"
+    "  }, true);\n"
     "})();\n";
 // The picture: at most this size each way (the script's size).
 static const int appNotificationIconMax = 96;
@@ -871,7 +948,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
-          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -959,7 +1036,7 @@ public:
     QValueList<PendingPermission> pendingPermissions;   // for the host, outside WebKit's signal
     QMap<int, WebKitNotification*> notifications;   // shown by the page, not closed yet (ref)
     QValueList<int> notificationsToShow;   // for the host, outside WebKit's signal
-    // The pictures our script announced (appNotificationScript), oldest
+    // The pictures our script announced (appNotificationBridge), oldest
     // first: a notification waits for its picture (at most 2 seconds).
     struct NotificationIcon
     {
@@ -973,6 +1050,11 @@ public:
         QTime announced;
     };
     QValueList<NotificationIcon> notificationIcons;
+    // The document whose bridge's messages are taken: its token (its
+    // "hello"); a commit without a hello since the load started ends it.
+    QString notificationToken;
+    bool notificationHello;
+    void endNotificationDocument();
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
     bool menuEditable;   // the context menu was asked for over a text field
@@ -1150,14 +1232,20 @@ void KWPEWidgetPrivate::create()
     g_signal_connect( view, "script-dialog", G_CALLBACK( onScriptDialog ), this );
     if ( isApp() ) {
         g_signal_connect( view, "show-notification", G_CALLBACK( onShowNotification ), this );
-        // The notifications' pictures (see appNotificationScript).
-        WebKitUserScript* script = webkit_user_script_new( appNotificationScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        // The notifications' pictures (see appNotificationWrapper): the
+        // handler only in the bridge's own world.
+        WebKitUserScript* script = webkit_user_script_new( appNotificationWrapper, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
                                                            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, 0, 0 );
+        webkit_user_content_manager_add_script( contentManager, script );
+        webkit_user_script_unref( script );
+        script = webkit_user_script_new_for_world( appNotificationBridge, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                                   WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, appNotificationWorld, 0, 0 );
         webkit_user_content_manager_add_script( contentManager, script );
         webkit_user_script_unref( script );
         g_signal_connect( contentManager, ( QCString( "script-message-received::" ) + appNotificationHandler ).data(),
                           G_CALLBACK( onAppNotification ), this );
-        webkit_user_content_manager_register_script_message_handler( contentManager, appNotificationHandler, 0 );
+        webkit_user_content_manager_register_script_message_handler( contentManager, appNotificationHandler,
+                                                                     appNotificationWorld );
         g_signal_connect( view, "query-permission-state", G_CALLBACK( onQueryPermissionState ), this );
     }
 
@@ -1289,6 +1377,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     switch ( event ) {
     case WEBKIT_LOAD_STARTED:
+        d->notificationHello = false;
         d->reloadForFilters = false;
         d->redirected = false;
         d->loading = true;
@@ -1308,6 +1397,12 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         // list, ...) is not the application's: the application's page
         // is loaded again, nothing reaches the page meanwhile (drops and
         // permission requests check the URL too).
+        // The previous document's announcements are gone with it (unless
+        // the new one's bridge said hello already: see onAppNotification()).
+        if ( d->isApp() && !d->notificationHello ) {
+            d->notificationToken = QString::null;
+            d->endNotificationDocument();
+        }
         if ( d->isApp() && d->ownBlank ) {
             d->ownBlank = false;
         } else if ( d->isApp() && !d->isAppDocument( webkit_web_view_get_uri( view ) ) ) {
@@ -1774,6 +1869,25 @@ void KWPEWidgetPrivate::forgetNotifications()
     notifications.clear();
     notificationsToShow.clear();
     notificationIcons.clear();
+    notificationToken = QString::null;
+}
+
+// The bridge's document is gone: its announcements too; a notification
+// waiting for its picture waits no more.
+void KWPEWidgetPrivate::endNotificationDocument()
+{
+    bool waiting = false;
+    for ( QValueList<NotificationIcon>::Iterator it = notificationIcons.begin(); it != notificationIcons.end(); ) {
+        if ( ( *it ).id ) {
+            waiting = waiting || !( *it ).done;
+            ( *it ).done = true;
+            ++it;
+        } else {
+            it = notificationIcons.remove( it );
+        }
+    }
+    if ( waiting )
+        QTimer::singleShot( 0, q, SLOT( emitNotifications() ) );
 }
 
 static QString jsString( JSCValue* object, const char* name )
@@ -1789,16 +1903,34 @@ static QString jsString( JSCValue* object, const char* name )
     return result;
 }
 
-// Our script's message: a picture announced ("pending") or ready
-// ("icon"; its pixels or none).  The page can post anything here (its
-// own world): only for the application's site, a bounded list, a small
-// picture of exactly its bytes or nothing.
+// The bridge's message (appNotificationBridge): a new document
+// ("hello"), a picture announced ("pending") or ready ("icon"; its
+// pixels or none).  Only the bridge's world reaches the handler (of the
+// top frame: no other frame runs it); what it says of a notification is
+// still the page's word: only for the application's site, the current
+// document, a bounded list, a small picture of exactly its bytes or
+// nothing.
 void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* value, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     if ( !jsc_value_is_object( value ) || !d->view || !d->isAppDocument( webkit_web_view_get_uri( d->view ) ) )
         return;
     QString kind = jsString( value, "kind" );
+    QString token = jsString( value, "token" );
+    if ( token.length() != 32 )
+        return;
+    if ( kind == "hello" ) {
+        // A new document (or one back from the page cache): the
+        // previous one's announcements are gone, its late messages too.
+        d->notificationHello = true;
+        if ( token != d->notificationToken ) {
+            d->notificationToken = token;
+            d->endNotificationDocument();
+        }
+        return;
+    }
+    if ( token != d->notificationToken )
+        return;
     JSCValue* serialValue = jsc_value_object_get_property( value, "serial" );
     int serial = jsc_value_is_number( serialValue ) ? jsc_value_to_int32( serialValue ) : 0;
     g_object_unref( serialValue );
