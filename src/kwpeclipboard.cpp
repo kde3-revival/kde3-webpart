@@ -113,6 +113,7 @@ static WPEClipboard* s_clipboard = 0;           // no reference: the display kee
 static WPEClipboardContent* s_localContent = 0; // WebKit's last copy (ref): pasted again from s_forwarded
 static QClipboard::Mode s_pasteMode = QClipboard::Clipboard;
 static gint64 s_pasteUntil = 0;                 // reads allowed until then (a user paste)
+static gint64 s_pasteStart = 0;
 static bool s_updating = false;                 // our own changed() call
 static bool s_pasteOwn = false;                 // that selection is ours (Qt has its data, no X)
 static QValueList<QCString> s_offered;          // another program's targets for that paste
@@ -276,6 +277,11 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
         dropCache();
         s_cachedFormat = name;
         s_cachedBytes = g_bytes_new( bytes.data(), bytes.size() );
+        // A slow owner (xclip sends 10 MB in about 3 s) used up the
+        // window: WebKit's further reads of this paste come right after.
+        gint64 now = g_get_monotonic_time();
+        if ( now + G_USEC_PER_SEC > s_pasteUntil && now < s_pasteStart + 15 * G_USEC_PER_SEC )
+            s_pasteUntil = now + G_USEC_PER_SEC;
         return g_bytes_ref( s_cachedBytes );
     }
     if ( data.isNull() )
@@ -372,7 +378,8 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
     if ( debugging() )
         fprintf( stderr, "kwpe: paste from %s, %u format(s)\n", mode == QClipboard::Selection ? "PRIMARY" : "CLIPBOARD", formats->len );
     s_pasteMode = mode;
-    s_pasteUntil = empty ? 0 : g_get_monotonic_time() + G_USEC_PER_SEC;
+    s_pasteStart = g_get_monotonic_time();
+    s_pasteUntil = empty ? 0 : s_pasteStart + G_USEC_PER_SEC;
     s_updating = true;
     WPE_CLIPBOARD_GET_CLASS( s_clipboard )->changed( s_clipboard, formats, FALSE, 0 );
     s_updating = false;

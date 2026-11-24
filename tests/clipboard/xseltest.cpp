@@ -9,7 +9,7 @@
     (at your option) any later version.
 */
 
-// xseltest DISPLAY: KWPEXSelection against owners that behave and owners
+// xseltest DISPLAY [read TARGET]: KWPEXSelection against owners that behave and owners
 // that do not, on a nested X server (never :0/:1).  An owner runs in a
 // child process per case; it serves "image/png" (or stalls, refuses, ...).
 //
@@ -211,6 +211,14 @@ int main( int argc, char** argv )
     }
     const KWPEXSelection::Limits limits = { 1000, 5000, 32 * 1024 * 1024 };
     char detail[200];
+
+    // xseltest :D read TARGET: read the CLIPBOARD of another program (timing)
+    if ( argc > 3 && !strcmp( argv[2], "read" ) ) {
+        const KWPEXSelection::Limits generous = { 3000, 10000, 64 * 1024 * 1024 };
+        Run run = readPng( dpy, generous, argv[3] );
+        printf( "%s: %s, %u bytes, %lld ms\n", argv[3], KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ), run.ms );
+        return run.result == KWPEXSelection::Ok ? 0 : 1;
+    }
 
     pid_t pid = startOwner( argv[1], Serve, 1000 );
     Run run = readPng( dpy, limits );

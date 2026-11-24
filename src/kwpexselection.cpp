@@ -99,12 +99,15 @@ bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, KWPEXSe
         long long left = deadline - nowMs();
         if ( left <= 0 )
             return false;
-        // Everything read is in Xlib's queue now: wait for more on the socket.
+        // Wait for more on the socket.  An event that Xlib/XCB already read
+        // (while waiting for a property reply) does not wake poll(): seen
+        // as 3 s stalls with xclip, so the wait is short and looks again.
+        // (Events of other windows stay queued for Qt: no busy loop on them.)
         struct pollfd fd;
         fd.fd = ConnectionNumber( dpy );
         fd.events = POLLIN;
         fd.revents = 0;
-        int n = poll( &fd, 1, int( left ) );
+        int n = poll( &fd, 1, int( left < 10 ? left : 10 ) );
         if ( n < 0 && errno != EINTR )
             return false;
         if ( n > 0 && ( fd.revents & ( POLLERR | POLLHUP | POLLNVAL ) ) )
@@ -114,55 +117,59 @@ bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, KWPEXSe
     }
 }
 
-// Reads (and deletes) the whole property; appends its items to data.
+// Reads (and deletes) the whole property; appends its items to data.  One
+// round trip per piece: INCR owners that send small pieces (xclip) make
+// many of them.
 bool takeProperty( Display* dpy, Window w, Atom property, std::string& data, Atom* type, int* format,
                    unsigned long* items, size_t maxBytes, bool* tooLarge )
 {
-    Atom actualType = None;
-    int actualFormat = 0;
-    unsigned long count = 0, after = 0;
-    unsigned char* value = 0;
     *items = 0;
     *tooLarge = false;
-    // size first
-    if ( XGetWindowProperty( dpy, w, property, 0, 0, False, AnyPropertyType, &actualType, &actualFormat,
-                             &count, &after, &value ) != Success )
-        return false;
-    if ( value )
-        XFree( value );
-    if ( actualType == None )
-        return false;
-    if ( data.size() + after > maxBytes ) {
-        *tooLarge = true;
-        XDeleteProperty( dpy, w, property );
-        return false;
-    }
-    long length = long( ( after + 3 ) / 4 );
-    value = 0;
-    if ( XGetWindowProperty( dpy, w, property, 0, length, True, AnyPropertyType, &actualType, &actualFormat,
-                             &count, &after, &value ) != Success )
-        return false;
-    if ( type )
-        *type = actualType;
-    if ( format )
-        *format = actualFormat;
-    if ( value ) {
-        if ( actualFormat == 8 ) {
-            data.append( reinterpret_cast<const char*>( value ), count );
-        } else if ( actualFormat == 16 ) {
-            data.append( reinterpret_cast<const char*>( value ), count * sizeof( short ) );
-        } else if ( actualFormat == 32 ) {
-            // Xlib hands format 32 items as longs
-            const long* longs = reinterpret_cast<const long*>( value );
-            for ( unsigned long i = 0; i < count; ++i ) {
-                uint32_t item = uint32_t( longs[i] );
-                data.append( reinterpret_cast<const char*>( &item ), sizeof( item ) );
-            }
+    long offset = 0;   // in 32-bit units
+    for ( ;; ) {
+        Atom actualType = None;
+        int actualFormat = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* value = 0;
+        // delete with the last part (Xlib deletes only when nothing is left)
+        if ( XGetWindowProperty( dpy, w, property, offset, 0x400000, True, AnyPropertyType, &actualType, &actualFormat,
+                                 &count, &after, &value ) != Success )
+            return false;
+        if ( actualType == None ) {
+            if ( value )
+                XFree( value );
+            return false;
         }
-        XFree( value );
+        if ( type )
+            *type = actualType;
+        if ( format )
+            *format = actualFormat;
+        size_t bytes = actualFormat == 8 ? count : actualFormat == 16 ? count * sizeof( short ) : actualFormat == 32 ? count * 4 : 0;
+        bool fits = data.size() + bytes + after <= maxBytes;
+        if ( value ) {
+            if ( fits && actualFormat == 32 ) {
+                // Xlib hands format 32 items as longs
+                const long* longs = reinterpret_cast<const long*>( value );
+                for ( unsigned long i = 0; i < count; ++i ) {
+                    uint32_t item = uint32_t( longs[i] );
+                    data.append( reinterpret_cast<const char*>( &item ), sizeof( item ) );
+                }
+            } else if ( fits ) {
+                data.append( reinterpret_cast<const char*>( value ), bytes );
+            }
+            XFree( value );
+        }
+        *items += count;
+        if ( !fits ) {
+            *tooLarge = true;
+            if ( after )
+                XDeleteProperty( dpy, w, property );
+            return false;
+        }
+        if ( !after )
+            return true;
+        offset += long( bytes / 4 );
     }
-    *items = count;
-    return true;
 }
 
 }
