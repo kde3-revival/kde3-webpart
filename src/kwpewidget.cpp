@@ -203,16 +203,18 @@ static const char mailStateHandler[] = "kwpeMailState";
 // WebKit's own error), copies them to an object of their own and gives
 // the native constructor exactly these values.  Only when the native
 // constructor succeeded (it shows the notification later, from a task
-// of its own) and the notification has an icon, it announces title,
-// body, tag and icon to the other script by a DOM event on the top
-// document (a frame of another site cannot reach it).  It uses only
+// of its own), it announces title, body, tag and icon (if any) of every
+// notification to the other script by a DOM event on the top document
+// (a frame of another site cannot reach it): the host sees each one
+// constructed, also those without a picture.  It uses only
 // what it took before the page's scripts ran.  What it announces is the
 // page's word, nothing more.
 //
 // appNotificationBridge, in a world of its own (appNotificationWorld:
 // the page's scripts, of any frame, cannot run there; the message
-// handler exists only there), turns an announcement with an icon of the
-// page's own origin, data: or blob: (nothing of another site) into the
+// handler exists only there), passes every announcement on ("pending",
+// with or without a picture) and turns one with an icon of the page's
+// own origin, data: or blob: (nothing of another site) into the
 // picture's pixels: drawn into a canvas of at most 96 pixels in the web
 // process, sent as RGBA (width x height x 4 bytes, base64); the host
 // fetches nothing and decodes no image format.  Title, body and tag
@@ -246,8 +248,10 @@ static const char appNotificationWrapper[] =
     "  }\n"
     "  function announce(title, options) {\n"
     "    try {\n"
-    "      var detail = '[' + quote(title) + ',' + quote(options.body === undefined ? '' : options.body) + ',' +\n"
-    "                   quote(options.tag === undefined ? '' : options.tag) + ',' + quote(options.icon) + ']';\n"
+    "      var body = options && options.body !== undefined ? options.body : '',\n"
+    "          tag = options && options.tag !== undefined ? options.tag : '',\n"
+    "          icon = options && options.icon !== undefined ? options.icon : '';\n"
+    "      var detail = '[' + quote(title) + ',' + quote(body) + ',' + quote(tag) + ',' + quote(icon) + ']';\n"
     "      var init = create(null);\n"
     "      init.detail = detail;\n"
     "      apply(dispatch, doc, [construct(Event_, ['kwpe-notification', init])]);\n"
@@ -272,7 +276,7 @@ static const char appNotificationWrapper[] =
     "      v = options.tag; if (v !== undefined) define(copy, 'tag', string(v));\n"
     "    }\n"
     "    var n = construct(N, arguments.length > 1 ? [t, copy] : [t], new.target);\n"
-    "    if (copy && typeof copy === 'object' && copy.icon) announce(t, copy);\n"
+    "    announce(t, copy && typeof copy === 'object' ? copy : null);\n"
     "    return n;\n"
     "  }\n"
     "  setPrototypeOf(Notification, N);\n"
@@ -309,10 +313,10 @@ static const char appNotificationBridge[] =
     "    return null;\n"
     "  }\n"
     "  function announce(title, body, tag, icon) {\n"
-    "    var src = source(icon);\n"
+    "    var src = icon ? source(icon) : null, s = ++serial;\n"
+    "    post({ kind: 'pending', serial: s, title: title, body: body, tag: tag, picture: !!src });\n"
     "    if (!src) return;\n"
-    "    var s = ++serial, done = false, img = new Image_();\n"
-    "    post({ kind: 'pending', serial: s, title: title, body: body, tag: tag });\n"
+    "    var done = false, img = new Image_();\n"
     "    function finish(w, h, pixels) {\n"
     "      if (!done) { done = true; post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels }); }\n"
     "    }\n"
@@ -1070,6 +1074,10 @@ public:
         QImage image;
         gint64 announced;   // g_get_monotonic_time()
         int generation;     // the document's (notificationGeneration)
+        // Announced with the same title, body and tag as another one
+        // when a notification took one of them: which notification is
+        // whose is not known, none of them gets a picture.
+        bool ambiguous;
     };
     QValueList<NotificationIcon> notificationIcons;
     // The document whose bridge's messages are taken: its token (its
@@ -1991,7 +1999,11 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
         icon.body = jsString( value, "body" );
         icon.tag = jsString( value, "tag" );
         icon.id = 0;
-        icon.done = false;
+        // (a notification without a picture: nothing to wait for)
+        JSCValue* picture = jsc_value_object_get_property( value, "picture" );
+        icon.done = !( jsc_value_is_boolean( picture ) && jsc_value_to_boolean( picture ) );
+        g_object_unref( picture );
+        icon.ambiguous = false;
         icon.announced = g_get_monotonic_time();
         icon.generation = d->notificationGeneration;
         if ( icon.title.length() > 4096 || icon.body.length() > 4096 || icon.tag.length() > 4096 )
@@ -2875,16 +2887,33 @@ void KWPEWidget::emitNotifications()
         QString body = QString::fromUtf8( webkit_notification_get_body( it.data() ) );
         QString tag = QString::fromUtf8( webkit_notification_get_tag( it.data() ) );
         int generation = d->notificationShownIn.contains( id ) ? d->notificationShownIn[id] : -1;
+        // Its announcement: the one given to it already, else the first of
+        // its document with its title, body and tag.  Several of these:
+        // WebKit shows a notification once its icon is loaded, so two
+        // alike may come in either order; none of them gets a picture
+        // (never another one's).
         QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
         for ( ; icon != d->notificationIcons.end(); ++icon )
-            if ( ( *icon ).id == id
-                 || ( ( *icon ).id == 0 && ( *icon ).generation == generation
-                      && ( *icon ).title == title && ( *icon ).body == body && ( *icon ).tag == tag ) )
+            if ( ( *icon ).id == id )
                 break;
+        if ( icon == d->notificationIcons.end() ) {
+            int alike = 0;
+            for ( QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator it = d->notificationIcons.begin();
+                  it != d->notificationIcons.end(); ++it )
+                if ( ( *it ).id == 0 && ( *it ).generation == generation
+                     && ( *it ).title == title && ( *it ).body == body && ( *it ).tag == tag ) {
+                    if ( !alike++ )
+                        icon = it;
+                    else
+                        ( *it ).ambiguous = true;
+                }
+            if ( alike > 1 )
+                ( *icon ).ambiguous = true;
+        }
         QImage image;
         if ( icon != d->notificationIcons.end() ) {
             ( *icon ).id = id;
-            if ( !( *icon ).done ) {
+            if ( !( *icon ).done && !( *icon ).ambiguous ) {
                 // 2 seconds after WebKit showed it, fixed then.
                 gint64 shown = d->notificationShownAt.contains( id ) ? d->notificationShownAt[id] : now;
                 gint64 left = shown + 2 * G_USEC_PER_SEC - now;
@@ -2893,7 +2922,8 @@ void KWPEWidget::emitNotifications()
                     return;
                 }
             }
-            image = ( *icon ).image;
+            if ( !( *icon ).ambiguous )
+                image = ( *icon ).image;
             d->notificationIcons.remove( icon );
         }
         d->notificationsToShow.remove( d->notificationsToShow.begin() );
