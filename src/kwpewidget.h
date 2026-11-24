@@ -242,7 +242,10 @@ signals:
      * process: nothing is fetched for it.
      */
     void notificationShown( int id, const QString& title, const QString& body, const QImage& icon );
-    /** App mode: the page (or WebKit) closed the notification @p id. */
+    /**
+     * App mode: the page (or WebKit) closed the notification @p id, or
+     * it was dropped (at most 100 are kept: the oldest goes).
+     */
     void notificationClosed( int id );
     /**
      * App mode: the page asks for @p kind ("notifications", "microphone",

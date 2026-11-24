@@ -1039,6 +1039,7 @@ public:
     // When WebKit showed each of these: it waits for its picture until
     // 2 seconds after that, whatever is announced meanwhile.
     QMap<int, gint64> notificationShownAt;
+    QValueList<int> notificationsEvicted;   // dropped by the limit: closed for the host
     // The pictures our script announced (appNotificationBridge), oldest
     // first (at most 20): a notification waits for its picture (see
     // notificationShownAt).
@@ -1827,13 +1828,22 @@ bool KWPEWidgetPrivate::isAppDocument( const char* uri ) const
 gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
-    // A long-running page: the oldest go (their clicks do nothing then).
+    // A long-running page: the oldest go (their clicks do nothing then),
+    // reported closed to the host (outside WebKit's signal).
     while ( d->notifications.count() >= 100 ) {
         QMap<int, WebKitNotification*>::Iterator oldest = d->notifications.begin();
+        int old = oldest.key();
         g_signal_handlers_disconnect_by_data( oldest.data(), d );
         g_object_unref( oldest.data() );
-        d->notificationShownAt.remove( oldest.key() );
+        d->notificationShownAt.remove( old );
+        d->notificationsToShow.remove( old );
+        for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
+            if ( ( *icon ).id == old ) {
+                d->notificationIcons.remove( icon );
+                break;
+            }
         d->notifications.remove( oldest );
+        d->notificationsEvicted.append( old );
     }
     int id = ++d->notificationSerial;
     g_object_ref( notification );
@@ -1876,6 +1886,7 @@ void KWPEWidgetPrivate::forgetNotifications()
     notifications.clear();
     notificationsToShow.clear();
     notificationShownAt.clear();
+    notificationsEvicted.clear();
     notificationIcons.clear();
     notificationToken = QString::null;
 }
@@ -2816,6 +2827,11 @@ void KWPEWidget::emitNotifications()
             ++icon;
     }
     QGuardedPtr<KWPEWidget> self( this );
+    while ( self && !d->notificationsEvicted.isEmpty() ) {
+        int id = d->notificationsEvicted.first();
+        d->notificationsEvicted.remove( d->notificationsEvicted.begin() );
+        emit notificationClosed( id );
+    }
     while ( self && !d->notificationsToShow.isEmpty() ) {
         int id = d->notificationsToShow.first();
         QMap<int, WebKitNotification*>::ConstIterator it = d->notifications.find( id );
