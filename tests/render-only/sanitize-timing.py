@@ -72,6 +72,7 @@ cases = [
     ('th-outside-table-3000', SOURCE, '<dl></div></tbody><i><th></li><!-- x --></title><p>' * 3000),
     ('cdata-in-html-10000', SOURCE, '<p><pre></nobr></x><keygen><![CDATA[<rt><ol>' * 10000),
     ('math-br-10000', SOURCE, '<p>' + '<marquee></ x></br><wbr><td></s><table><math><frame>' * 10000),
+    ('frameset-script-20000', SOURCE, '<svg>' + '</div><option><h2><colgroup><html><frameset></title><div><script>' * 20000),
     ('math-self-closing-3000', SOURCE, '<!-- x --><frame></nobr></font></applet><math/><<noscript><font color=1>' * 3000),
     # formatting elements: reconstruction, and text after a deep one
     ('font-reconstruction', SOURCE, '<p>' + ''.join('<font color=%d>' % i for i in range(2000)) + '</p>' + '<p>x' * 20000),
