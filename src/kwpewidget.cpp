@@ -217,7 +217,8 @@ static const char mailStateHandler[] = "kwpeMailState";
 // with or without a picture) and turns one with an icon of the page's
 // own origin, data: or blob:, or of an origin the application lists
 // (KWPEAppOptions::pictureOrigins), nothing of any other site, into the
-// picture's pixels.  An http(s) picture is fetched first (at most 4 MiB),
+// picture's pixels.  An http(s) picture is fetched first (at most 4 MiB,
+// counted as its body comes: more cancels the fetch),
 // then decoded from its blob: one of the page's origin in "same-origin"
 // mode (a redirect to another origin fails), one of a listed origin with
 // CORS, no credentials and no redirect at all (a listed server could send
@@ -303,7 +304,8 @@ static const char appNotificationBridge[] =
     "  var apply = Reflect.apply, postMessage = handler.postMessage, parse = JSON.parse, isArray = Array.isArray,\n"
     "      URL_ = URL, Image_ = Image, setTimeout_ = setTimeout, min = Math.min, max = Math.max, round = Math.round,\n"
     "      fetch_ = fetch, AbortController_ = AbortController, create = Object.create,\n"
-    "      createObjectURL = URL.createObjectURL, revokeObjectURL = URL.revokeObjectURL,\n"
+    "      createObjectURL = URL.createObjectURL, revokeObjectURL = URL.revokeObjectURL, Blob_ = Blob,\n"
+    "      getReader = ReadableStream.prototype.getReader, readChunk = ReadableStreamDefaultReader.prototype.read,\n"
     "      fromCharCode = String.fromCharCode, btoa_ = btoa, doc = document,\n"
     "      createElement = Document.prototype.createElement,\n"
     "      getContext = HTMLCanvasElement.prototype.getContext,\n"
@@ -390,13 +392,31 @@ static const char appNotificationBridge[] =
     "          finish(0, 0, '', 'failed');\n"
     "          return null;\n"
     "        }\n"
-    "        return response.blob();\n"
+    "        return read(response);\n"
     "      }).then(function (blob) {\n"
     "        if (done || !blob) return;\n"
-    "        if (blob.size > maxBytes) { finish(0, 0, '', 'failed'); return; }\n"
     "        blobURL = apply(createObjectURL, URL_, [blob]);\n"
     "        img.src = blobURL;\n"
     "      }).catch(function () { finish(0, 0, '', 'failed'); });\n"
+    "    }\n"
+    "    // the body as it comes, at most maxBytes: more cancels the fetch\n"
+    "    // at once (finish() aborts it), so does the timeout\n"
+    "    function read(response) {\n"
+    "      var length = +response.headers.get('Content-Length'), body = response.body;\n"
+    "      if (length > maxBytes || !body) { finish(0, 0, '', 'failed'); return null; }\n"
+    "      var reader = apply(getReader, body, []), chunks = [], total = 0, options = create(null);\n"
+    "      options.type = response.headers.get('Content-Type') || '';\n"
+    "      function next() {\n"
+    "        return apply(readChunk, reader, []).then(function (chunk) {\n"
+    "          if (done) return null;\n"
+    "          if (chunk.done) return new Blob_(chunks, options);\n"
+    "          total += chunk.value.byteLength;\n"
+    "          if (total > maxBytes) { chunks = []; finish(0, 0, '', 'failed'); return null; }\n"
+    "          chunks.push(chunk.value);\n"
+    "          return next();\n"
+    "        });\n"
+    "      }\n"
+    "      return next();\n"
     "    }\n"
     "  }\n"
     "  // (at most 2 fetches at a time, the others wait their turn or time out)\n"
