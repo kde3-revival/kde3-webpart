@@ -196,13 +196,18 @@ static const char mailStateHandler[] = "kwpeMailState";
 // two scripts (the top frame, before the page's scripts) find it:
 //
 // appNotificationWrapper, in the page's world, wraps the Notification
-// constructor: it reads the constructor's arguments once (converted to
-// strings as WebKit would, the options copied to an object of their
-// own) and gives the native constructor exactly these values; with an
-// icon it announces title, body, tag and icon to the other script by a
-// DOM event on the top document (a frame of another site cannot reach
-// it).  It uses only what it took before the page's scripts ran.  What
-// it announces is the page's word, nothing more.
+// constructor: it converts the constructor's arguments once, as WebKit's
+// bindings do (the members of WebKit's NotificationOptions only, in
+// their order: body, data, dir, icon, lang, silent, tag; each read and
+// converted before the next is read; an invalid dir stops there, with
+// WebKit's own error), copies them to an object of their own and gives
+// the native constructor exactly these values.  Only when the native
+// constructor succeeded (it shows the notification later, from a task
+// of its own) and the notification has an icon, it announces title,
+// body, tag and icon to the other script by a DOM event on the top
+// document (a frame of another site cannot reach it).  It uses only
+// what it took before the page's scripts ran.  What it announces is the
+// page's word, nothing more.
 //
 // appNotificationBridge, in a world of its own (appNotificationWorld:
 // the page's scripts, of any frame, cannot run there; the message
@@ -213,9 +218,9 @@ static const char mailStateHandler[] = "kwpeMailState";
 // fetches nothing and decodes no image format.  Every message carries
 // the document's token (random, made by the script when the document
 // starts, sent first as "hello"): the host takes only the current
-// document's messages.  "pending" comes before the notification itself
-// (the constructor), the picture or none when it is ready (at most 1.5
-// seconds later).
+// document's messages.  "pending" comes before WebKit shows the
+// notification (the constructor schedules that for a later task), the
+// picture or none when it is ready (at most 1.5 seconds later).
 static const char appNotificationHandler[] = "kwpeNotification";
 static const char appNotificationWorld[] = "kwpenotification";
 static const char appNotificationWrapper[] =
@@ -227,9 +232,6 @@ static const char appNotificationWrapper[] =
     "      defineProperty = Object.defineProperty, setPrototypeOf = Object.setPrototypeOf,\n"
     "      quote = JSON.stringify, toString = String, TypeError_ = TypeError, Event_ = window.CustomEvent,\n"
     "      dispatch = EventTarget.prototype.dispatchEvent, doc = document;\n"
-    "  var keys = ['actions', 'badge', 'body', 'data', 'dir', 'icon', 'image', 'lang', 'renotify',\n"
-    "              'requireInteraction', 'silent', 'tag', 'timestamp', 'vibrate'];\n"
-    "  var strings = { badge: true, body: true, dir: true, icon: true, image: true, lang: true, tag: true };\n"
     "  function string(value) {\n"
     "    if (typeof value === 'symbol') throw new TypeError_('Cannot convert a symbol to a string');\n"
     "    return toString(value);\n"
@@ -251,16 +253,24 @@ static const char appNotificationWrapper[] =
     "  function Notification(title) {\n"
     "    if (!new.target) return apply(N, this, arguments);\n"
     "    if (arguments.length === 0) return construct(N, [], new.target);\n"
-    "    var t = string(title), options = arguments[1], copy = options;\n"
-    "    if (options !== null && (typeof options === 'object' || typeof options === 'function')) {\n"
+    "    var t = string(title), options = arguments[1], copy = options, v;\n"
+    "    if (options !== undefined && options !== null && (typeof options === 'object' || typeof options === 'function')) {\n"
     "      copy = create(null);\n"
-    "      for (var i = 0; i < keys.length; ++i) {\n"
-    "        var value = options[keys[i]];\n"
-    "        if (value !== undefined) define(copy, keys[i], strings[keys[i]] ? string(value) : value);\n"
+    "      v = options.body; if (v !== undefined) define(copy, 'body', string(v));\n"
+    "      v = options.data; if (v !== undefined) define(copy, 'data', v);\n"
+    "      v = options.dir;\n"
+    "      if (v !== undefined) {\n"
+    "        define(copy, 'dir', v = string(v));\n"
+    "        if (v !== 'auto' && v !== 'ltr' && v !== 'rtl') return construct(N, [t, copy], new.target);\n"
     "      }\n"
-    "      if (copy.icon) announce(t, copy);\n"
+    "      v = options.icon; if (v !== undefined) define(copy, 'icon', string(v));\n"
+    "      v = options.lang; if (v !== undefined) define(copy, 'lang', string(v));\n"
+    "      v = options.silent; if (v !== undefined) define(copy, 'silent', v === null ? null : !!v);\n"
+    "      v = options.tag; if (v !== undefined) define(copy, 'tag', string(v));\n"
     "    }\n"
-    "    return construct(N, arguments.length > 1 ? [t, copy] : [t], new.target);\n"
+    "    var n = construct(N, arguments.length > 1 ? [t, copy] : [t], new.target);\n"
+    "    if (copy && typeof copy === 'object' && copy.icon) announce(t, copy);\n"
+    "    return n;\n"
     "  }\n"
     "  setPrototypeOf(Notification, N);\n"
     "  defineProperty(Notification, 'prototype', { value: N.prototype, writable: false });\n"
