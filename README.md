@@ -422,6 +422,80 @@ keep the probe.  Whatever WebKit cannot show still reaches Konqueror
 save dialog; KIO fetches it once more), attachments are downloaded by
 WebKit, and the location bar returns to the page on screen.
 
+### App mode: an application around one web site
+
+`KWPEPart` created with the arguments `mode=app` and `appName=NAME` (as
+kde3-apps' kwhatsapp does, through `KParts::ComponentFactory`, the way
+KMail creates the mail mode) shows one web application as an application
+of its own:
+
+* **Its own WebKit:** a `WebKitWebContext`, a persistent
+  `WebKitNetworkSession` and `WebKitSettings` per data directory
+  (`storage=DIR`, by default `$KDEHOME/share/apps/NAME/webkit/`; the HTTP
+  cache in KDE's cache directory, `NAME-webkit/`): cookies (SQLite),
+  local storage, IndexedDB, service workers stay across restarts, apart
+  from Konqueror's and KMail's.  No ad blocker, no history for the host.
+  `userAgent=STRING` replaces WebKit's User-Agent.
+* **Its sites:** `sites=HOST,...` (default: the host of the first URL
+  opened) are shown in the part.  A link the user follows to another
+  site, a new window (`target=_blank`, `window.open()` after a click), the
+  middle button, `mailto:` and other schemes go to the host through the
+  browser extension's `openURLRequest()` (kwhatsapp: the KDE browser, the
+  mail program).  Whatever else leads elsewhere (a script, a form, a
+  refresh, a redirect) is stopped at the main frame's final response:
+  the main frame shows only http(s) documents of these sites (their
+  `blob:` too), never `data:`, `file:` or another site.  What the main
+  frame commits without such a response (an `about:blank` a frame of
+  another site sent it to, a page from the back/forward list) is not
+  trusted: the application's page is loaded again; only these sites can ask for permissions or get dropped files.
+  A new window of a `blob:` or `data:` URL is downloaded,
+  so is what the view cannot show (PDF too).  Downloads, uploads, the
+  page's dialogs and HTTP authentication work as in Konqueror.
+* **Notifications:** the page's Notification API reaches the host as
+  `notificationShown(id, title, body)` and, right after it, the same with
+  the notification's picture, `notificationShown(id, title, body, QImage)`
+  (kwhatsapp shows it in its balloon); `activateNotification(id)` gives the
+  page its click.  WebKit's notification has no icon: a script in the
+  page's world (top frame) wraps the `Notification` constructor and
+  announces each notification to a script in a world of its own (the
+  only one with the message handler), which draws `options.icon` into a
+  canvas of at most 96 pixels in the web process and sends its RGBA
+  pixels: only a picture of the page's own origin, a `data:`/`blob:` URL
+  or of the origins in `pictureOrigins=https://HOST,https://*.DOMAIN,...`
+  (fetched with CORS, no credentials and no redirect: a server that does
+  not allow CORS, or sends the picture elsewhere, gives no picture).
+  The host decodes no image format and fetches nothing.  A notification
+  waits for its picture at most 2 seconds; two alike in one document get
+  none (nor do any more of that document once too many announcements
+  were dropped to tell them apart).  `debug=true`: why a picture was not taken, on stderr, with only
+  the scheme and host of its URL.
+* **Permissions:** every request (notifications, microphone, camera,
+  screen, geolocation, others) is `permissionRequested(kind, origin,
+  bool& allow)` for the host, outside WebKit's signal.  Only
+  notifications are the host's to decide (WebKit refuses them to frames
+  of another origin, so the requester is the main frame's origin): for
+  the other kinds WebKit does not say which frame asks, so the part
+  refuses them and the host only learns of it (empty origin).  The answer for
+  notifications is kept in `DIR/kwpepart-permissions` and given to every
+  new web process (`initialize-notification-permissions`, also for
+  `navigator.permissions.query()`): `Notification.permission` is
+  `"granted"` at once after a restart.  The file's origins are canonicalized
+  (http/https only, each once); one listed as both allowed and denied is
+  denied, as WebKit does.
+* **Dropped files:** WPE has no drag and drop.  Local files dropped on the
+  view reach the page as a drop: `dragenter`, `dragover` and `drop`
+  events at that point with a `DataTransfer` of `File` objects, made in
+  the part's script world (the page's listeners see them like any drop;
+  `isTrusted` is false).  The bytes travel as base64 in the script's
+  arguments: 64 MB at most per drop (counted on the opened files, read
+  with that bound; a short or failed read refuses the drop) (the page's own file chooser has no
+  limit).
+* **Signals and slots for the host:** `pageTitleChanged()`,
+  `statusMessage()` (a dropped file the page did not take, a crash), the
+  browser extension's `setIconURL()` (the page's icon); `reload()`; the
+  part's GUI (`kwpeapppart.rc`): find, zoom, reload.  The property
+  `appMode` tells an older part (without the app mode) apart.
+
 ## Building
 
 Needs kde3-qt and kdelibs (CMake port), WPE WebKit ≥ 2.50 with the

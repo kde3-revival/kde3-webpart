@@ -22,6 +22,7 @@ class KAboutData;
 class KAction;
 class KFindDialog;
 class KToggleAction;
+class QImage;
 class QLabel;
 namespace KParts { class StatusBarExtension; }
 class KWPEWidget;
@@ -54,6 +55,8 @@ class KWPEPart : public KParts::ReadOnlyPart
     Q_PROPERTY( bool mailAtBottom READ mailAtBottom )
     /** Mail mode: the selected text, also in a frame of the message. */
     Q_PROPERTY( QString mailSelectedText READ mailSelectedText )
+    /** The part was made in app mode (an older part has no such property). */
+    Q_PROPERTY( bool appMode READ isAppMode )
 
 public:
     KWPEPart( QWidget* parentWidget, const char* widgetName,
@@ -80,17 +83,74 @@ public:
     bool mailAtBottom() const;
     QString mailSelectedText() const;
 
+    /**
+     * App mode (arguments "mode=app" and "appName=NAME" at creation, for
+     * an application around one web site, e.g. kwhatsapp): a WebKit
+     * context and a persistent network session of the application's own
+     * (cookies, website data, permissions in "storage=DIR", by default
+     * $KDEHOME/share/apps/NAME/webkit/; HTTP cache in KDE's cache
+     * directory), optional "userAgent=STRING" and "sites=HOST,HOST" (the
+     * hosts shown in the part; default: the host of the first URL
+     * opened).  Links to other sites, new windows, mailto: and other
+     * schemes go to the host through the browser extension's
+     * openURLRequest(); downloads, uploads, the page's dialogs as in
+     * Konqueror; notifications and permission requests are signals for
+     * the host.  No history, no ad blocker.
+     */
+    bool isAppMode() const { return m_app; }
+
 public slots:
     /** Scroll the page by @p dx, @p dy pixels (the host's scroll keys). */
     void scrollBy( int dx, int dy );
     /** Select the whole page. */
     void selectAll();
+    /** App mode: the user clicked the notification @p id. */
+    void activateNotification( int id );
+    /** Load the page again. */
+    void reload();
 
 signals:
     /** Mail mode: the pointer is over a link to @p url (empty: none). */
     void onURL( const QString& url );
     /** Mail mode: a right click at @p point, on a link to @p url or not. */
     void popupMenu( const QString& url, const QPoint& point );
+
+    /** App mode: the page's title changed (empty: it has none). */
+    void pageTitleChanged( const QString& title );
+    /**
+     * App mode: the page shows a notification (the Notification API,
+     * once allowed: see permissionRequested()); activateNotification()
+     * with @p id when the user clicks it.  No event loop in a slot.
+     */
+    void notificationShown( int id, const QString& title, const QString& body );
+    /**
+     * App mode: the same with the notification's picture (a null image
+     * without one), emitted right after the one above: connect one of
+     * them.  Only a picture of the page's own origin or a data:/blob:
+     * URL, drawn by the page's web process (at most 96 pixels).
+     */
+    void notificationShown( int id, const QString& title, const QString& body, const QImage& icon );
+    /**
+     * App mode: the page closed the notification @p id, or it was
+     * dropped (at most 100 are kept: the oldest goes).
+     */
+    void notificationClosed( int id );
+    /**
+     * App mode: the page at @p origin asks for @p kind: "notifications",
+     * "microphone", "camera", "screen", "geolocation" or "other".  Set
+     * @p allow to grant it (false: denied).  The answer for notifications
+     * is kept in the storage directory: the page is not asked again.
+     * Only notifications are decided by the host: for the other kinds
+     * WebKit does not say which frame asks (a frame of another site can),
+     * the part refuses them, @p origin is empty and @p allow is not used.
+     */
+    void permissionRequested( const QString& kind, const QString& origin, bool& allow );
+    /**
+     * App mode: a message for the user (files dropped on the page that it
+     * did not take, the page crashed, ...); setStatusBarText() has the
+     * passing ones (hovered links, zoom, find).
+     */
+    void statusMessage( const QString& text );
 
 protected:
     virtual bool openFile();
@@ -136,10 +196,12 @@ private:
     friend class KWPEAdBlockLabel;
     void restore( const KURL& url, int token );
     void showAdBlockMenu( const QPoint& globalPos );
+    void showAppContextMenu( const KURL& link, const KURL& image, bool onSelection, const QPoint& globalPos );
 
     KWPEWidget* m_view;
     KWPEBrowserExtension* m_ext;
     bool m_mail;
+    bool m_app;
     bool m_mailLoadExternal;
     bool m_ownNavigation;   // openURL()/restore() started what commits next
     int m_historyToken;     // WebKit's back/forward item of m_url

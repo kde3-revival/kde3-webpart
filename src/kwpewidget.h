@@ -12,10 +12,43 @@
 #ifndef KWPEWIDGET_H
 #define KWPEWIDGET_H
 
+#include <qstringlist.h>
 #include <qwidget.h>
 
+class QImage;
 class QTimer;
 class KWPEWidgetPrivate;
+
+/**
+ * App mode: what an application around one web site gives the widget
+ * (see KWPEWidget's App mode).
+ */
+struct KWPEAppOptions
+{
+    /** Website data (cookies, local storage, IndexedDB, service workers)
+        and the permissions the user gave; kept across restarts. */
+    QString dataDir;
+    /** WebKit's HTTP cache. */
+    QString cacheDir;
+    /** The User-Agent header and navigator.userAgent; empty: WebKit's. */
+    QString userAgent;
+    /** The hosts whose pages the view shows itself; a link to any other
+        goes to the host (linkActivated()).  Empty: the host of the first
+        URL loaded. */
+    QStringList sites;
+    /** Origins of the notifications' pictures besides the page's own,
+        data: and blob:: "https://HOST" or "https://" followed by
+        "*.DOMAIN" (any subdomain; http too, a port too).  Loaded by the web process
+        with CORS (crossOrigin "anonymous"): a server that does not allow
+        it gives no picture.  The host fetches nothing. */
+    QStringList pictureOrigins;
+    /** On stderr: why a notification's picture was not taken, with only
+        the scheme and host of its URL (refused: not an origin allowed;
+        failed: not loaded, or CORS refused; timed out). */
+    bool debug;
+
+    KWPEAppOptions() : debug( false ) {}
+};
 
 /**
  * A widget showing a WebKitWebView (WPE WebKit) through the X11 WPE
@@ -34,11 +67,21 @@ public:
      * Browser: Konqueror's web browser.  Mail: a message viewer (KMail):
      * a WebKit context, network session and settings of its own, no page
      * scripts, no remote content unless allowed, every navigation handed
-     * to the host (see loadMailFile()).
+     * to the host (see loadMailFile()).  App: the web application of an
+     * application of its own (a "site-specific browser"): a WebKit
+     * context, a persistent network session and settings of its own (see
+     * KWPEAppOptions), links to other sites, new windows and other
+     * schemes handed to the host (linkActivated()), the page's
+     * notifications and permission requests too; downloads, uploads and
+     * the page's dialogs as in Browser mode; local files dropped on the
+     * view go to the page as a drop.  No ad blocker, no history for the
+     * host.
      */
-    enum Mode { Browser, Mail };
+    enum Mode { Browser, Mail, App };
 
     KWPEWidget( QWidget* parent = 0, const char* name = 0, Mode mode = Browser );
+    /** App mode with @p options. */
+    KWPEWidget( QWidget* parent, const char* name, const KWPEAppOptions& options );
     virtual ~KWPEWidget();
 
     /** False if WebKit could not be set up (no X11, no WPE platform). */
@@ -95,6 +138,17 @@ public:
 
     /** The selected text (in the page or in a field) into the clipboard. */
     void copySelection();
+    /** WebKit's editing commands (a text field has the focus). */
+    void cut();
+    void paste();
+    /** The last context menu was asked for over a text field. */
+    bool contextMenuOnEditable() const;
+
+    /**
+     * App mode: the user clicked the notification @p id (see
+     * notificationShown()): the page gets its click event.
+     */
+    void activateNotification( int id );
 
     /**
      * Fetch the main resource's data as WebKit has it (no new request,
@@ -186,6 +240,38 @@ signals:
     void iconURLChanged( const QString& url );
     /** The answer to requestSource(): the bytes of @p url. */
     void sourceReady( const QString& url, const QByteArray& data );
+    /**
+     * App mode: the page shows a notification (the Notification API,
+     * after the user allowed it): @p id for activateNotification().
+     * Emitted outside WebKit's signal.
+     */
+    void notificationShown( int id, const QString& title, const QString& body );
+    /**
+     * App mode: the same, with the notification's picture (its icon, at
+     * most 96 pixels; a null image without one).  Emitted right after
+     * the one above: connect one of them.  The picture is only of the
+     * page's own origin or a data:/blob: URL, drawn by the page's web
+     * process: nothing is fetched for it.
+     */
+    void notificationShown( int id, const QString& title, const QString& body, const QImage& icon );
+    /**
+     * App mode: the page (or WebKit) closed the notification @p id, or
+     * it was dropped (at most 100 are kept: the oldest goes).
+     */
+    void notificationClosed( int id );
+    /**
+     * App mode: the page asks for @p kind ("notifications", "microphone",
+     * "camera", "screen", "geolocation", "other") for @p origin; @p allow
+     * is false unless set.  Emitted outside WebKit's signal; the answer
+     * for notifications is kept in the data directory (and the page is
+     * not asked again).  Only notifications are the host's to decide:
+     * WebKit does not tell which frame asks for the others (a frame of
+     * another site can), so they are refused, @p origin is empty and
+     * @p allow is not used.
+     */
+    void permissionRequested( const QString& kind, const QString& origin, bool& allow );
+    /** Something the user should know (a drop the page did not take, ...). */
+    void statusMessage( const QString& text );
 
 protected:
     virtual bool event( QEvent* e );
@@ -206,6 +292,9 @@ protected:
     virtual void enterEvent( QEvent* e );
     virtual void leaveEvent( QEvent* e );
     virtual void windowActivationChange( bool oldActive );
+    virtual void dragEnterEvent( QDragEnterEvent* e );
+    virtual void dragMoveEvent( QDragMoveEvent* e );
+    virtual void dropEvent( QDropEvent* e );
 
 private slots:
     void printFrameStats();
@@ -220,6 +309,11 @@ private slots:
     void reloadForFilters();
     void loadDeferred();
     void loadPendingMail();
+    void askPermissions();
+    void emitNotifications();
+    void startDownloads();
+    void reportBlocked();
+    void returnToApp();
 
 private:
     friend class KWPEWidgetPrivate;
