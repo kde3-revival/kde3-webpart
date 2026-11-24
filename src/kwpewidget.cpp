@@ -961,7 +961,7 @@ class KWPEWidgetPrivate : public KWPE::ViewHost
 public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
-          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
+          mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationGeneration( 0 ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
           menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
@@ -1052,6 +1052,9 @@ public:
     // When WebKit showed each of these: it waits for its picture until
     // 2 seconds after that, whatever is announced meanwhile.
     QMap<int, gint64> notificationShownAt;
+    // The document generation each was shown in (notificationGeneration):
+    // only an announcement of the same one is given to it.
+    QMap<int, int> notificationShownIn;
     QValueList<int> notificationsEvicted;   // dropped by the limit: closed for the host
     // The pictures our script announced (appNotificationBridge), oldest
     // first (at most 20): a notification waits for its picture (see
@@ -1066,12 +1069,16 @@ public:
         bool done;       // the picture came (or none will)
         QImage image;
         gint64 announced;   // g_get_monotonic_time()
+        int generation;     // the document's (notificationGeneration)
     };
     QValueList<NotificationIcon> notificationIcons;
     // The document whose bridge's messages are taken: its token (its
     // "hello"); a commit without a hello since the load started ends it.
     QString notificationToken;
     bool notificationHello;
+    // One more each time a document ends (endNotificationDocument()):
+    // notifications and announcements of different ones never match.
+    int notificationGeneration;
     void endNotificationDocument();
     int notificationSerial;
     QStringList pendingDownloads;   // new windows of blob: and data: URLs
@@ -1853,6 +1860,7 @@ gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotificati
         webkit_notification_close( evicted );
         g_object_unref( evicted );
         d->notificationShownAt.remove( old );
+        d->notificationShownIn.remove( old );
         d->notificationsToShow.remove( old );
         for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
             if ( ( *icon ).id == old ) {
@@ -1866,6 +1874,7 @@ gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotificati
     g_object_ref( notification );
     d->notifications.insert( id, notification );
     d->notificationShownAt.insert( id, g_get_monotonic_time() );
+    d->notificationShownIn.insert( id, d->notificationGeneration );
     g_signal_connect( notification, "closed", G_CALLBACK( onNotificationClosed ), d );
     d->notificationsToShow.append( id );
     QTimer::singleShot( 0, d->q, SLOT( emitNotifications() ) );
@@ -1884,6 +1893,7 @@ void KWPEWidgetPrivate::onNotificationClosed( WebKitNotification* notification, 
         g_object_unref( notification );
         d->notificationsToShow.remove( id );
         d->notificationShownAt.remove( id );
+        d->notificationShownIn.remove( id );
         for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
             if ( ( *icon ).id == id ) {
                 d->notificationIcons.remove( icon );
@@ -1903,15 +1913,19 @@ void KWPEWidgetPrivate::forgetNotifications()
     notifications.clear();
     notificationsToShow.clear();
     notificationShownAt.clear();
+    notificationShownIn.clear();
     notificationsEvicted.clear();
     notificationIcons.clear();
     notificationToken = QString::null;
 }
 
 // The bridge's document is gone: its announcements too; a notification
-// waiting for its picture waits no more.
+// waiting for its picture waits no more; the notifications still queued
+// are of the old generation: no announcement of the new document is
+// given to them.
 void KWPEWidgetPrivate::endNotificationDocument()
 {
+    ++notificationGeneration;
     bool waiting = false;
     for ( QValueList<NotificationIcon>::Iterator it = notificationIcons.begin(); it != notificationIcons.end(); ) {
         if ( ( *it ).id ) {
@@ -1979,6 +1993,7 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
         icon.id = 0;
         icon.done = false;
         icon.announced = g_get_monotonic_time();
+        icon.generation = d->notificationGeneration;
         if ( icon.title.length() > 4096 || icon.body.length() > 4096 || icon.tag.length() > 4096 )
             return;
         // At most 20: the oldest not yet given to a notification goes
@@ -2859,10 +2874,12 @@ void KWPEWidget::emitNotifications()
         QString title = QString::fromUtf8( webkit_notification_get_title( it.data() ) );
         QString body = QString::fromUtf8( webkit_notification_get_body( it.data() ) );
         QString tag = QString::fromUtf8( webkit_notification_get_tag( it.data() ) );
+        int generation = d->notificationShownIn.contains( id ) ? d->notificationShownIn[id] : -1;
         QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
         for ( ; icon != d->notificationIcons.end(); ++icon )
             if ( ( *icon ).id == id
-                 || ( ( *icon ).id == 0 && ( *icon ).title == title && ( *icon ).body == body && ( *icon ).tag == tag ) )
+                 || ( ( *icon ).id == 0 && ( *icon ).generation == generation
+                      && ( *icon ).title == title && ( *icon ).body == body && ( *icon ).tag == tag ) )
                 break;
         QImage image;
         if ( icon != d->notificationIcons.end() ) {
@@ -2881,6 +2898,7 @@ void KWPEWidget::emitNotifications()
         }
         d->notificationsToShow.remove( d->notificationsToShow.begin() );
         d->notificationShownAt.remove( id );
+        d->notificationShownIn.remove( id );
         emit notificationShown( id, title, body );
         if ( self )
             emit notificationShown( id, title, body, image );
