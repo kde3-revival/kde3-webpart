@@ -3018,6 +3018,14 @@ void KWPEWidget::activateNotification( int id )
         webkit_notification_clicked( it.data() );
 }
 
+// The same text of a notification and of its announcement: WebKit gives
+// no tag (or body) as a null string, the bridge as an empty one (Qt's ==
+// tells them apart).
+static bool sameNotificationText( const QString& a, const QString& b )
+{
+    return a.isEmpty() ? b.isEmpty() : a == b;
+}
+
 // In the page's order; one waiting for its picture holds the later ones.
 void KWPEWidget::emitNotifications()
 {
@@ -3063,7 +3071,8 @@ void KWPEWidget::emitNotifications()
             for ( QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator it = d->notificationIcons.begin();
                   it != d->notificationIcons.end(); ++it )
                 if ( ( *it ).id == 0 && ( *it ).generation == generation
-                     && ( *it ).title == title && ( *it ).body == body && ( *it ).tag == tag ) {
+                     && sameNotificationText( ( *it ).title, title ) && sameNotificationText( ( *it ).body, body )
+                     && sameNotificationText( ( *it ).tag, tag ) ) {
                     if ( !alike++ )
                         icon = it;
                     else
