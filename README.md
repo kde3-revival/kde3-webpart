@@ -443,7 +443,8 @@ of its own:
   canvas of at most 96 pixels in the web process and sends its RGBA
   pixels: only a picture of the page's own origin, a `data:`/`blob:` URL
   or of the origins in `pictureOrigins=https://HOST,https://*.DOMAIN,...`
-  (loaded with CORS: a server that does not allow it gives no picture).
+  (fetched with CORS, no credentials and no redirect: a server that does
+  not allow CORS, or sends the picture elsewhere, gives no picture).
   The host decodes no image format and fetches nothing.  A notification
   waits for its picture at most 2 seconds; two alike in one document get
   none (nor do any more of that document once too many announcements

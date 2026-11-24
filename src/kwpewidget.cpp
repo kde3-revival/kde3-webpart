@@ -216,9 +216,15 @@ static const char mailStateHandler[] = "kwpeMailState";
 // handler exists only there), passes every announcement on ("pending",
 // with or without a picture) and turns one with an icon of the page's
 // own origin, data: or blob:, or of an origin the application lists
-// (KWPEAppOptions::pictureOrigins: loaded with CORS, crossOrigin
-// "anonymous", so the canvas can be read only if that server allows
-// it), nothing of any other site, into the picture's pixels: drawn into a canvas of at most 96 pixels in the web
+// (KWPEAppOptions::pictureOrigins), nothing of any other site, into the
+// picture's pixels.  An http(s) picture is fetched first (at most 4 MiB),
+// then decoded from its blob: one of the page's origin in "same-origin"
+// mode (a redirect to another origin fails), one of a listed origin with
+// CORS, no credentials and no redirect at all (a listed server could send
+// it anywhere; the server must allow CORS, or there is no picture); two
+// fetches at a time (a flood of announcements is not a flood of
+// requests: the others wait, or time out).  The
+// picture is drawn into a canvas of at most 96 pixels in the web
 // process, sent as RGBA (width x height x 4 bytes, base64); the host
 // fetches nothing and decodes no image format.  Title, body and tag
 // are taken up to 4096 characters, the icon's URL up to 512 KiB (a
@@ -296,13 +302,15 @@ static const char appNotificationBridge[] =
     "  if (!handler) return;\n"
     "  var apply = Reflect.apply, postMessage = handler.postMessage, parse = JSON.parse, isArray = Array.isArray,\n"
     "      URL_ = URL, Image_ = Image, setTimeout_ = setTimeout, min = Math.min, max = Math.max, round = Math.round,\n"
+    "      fetch_ = fetch, AbortController_ = AbortController, create = Object.create,\n"
+    "      createObjectURL = URL.createObjectURL, revokeObjectURL = URL.revokeObjectURL,\n"
     "      fromCharCode = String.fromCharCode, btoa_ = btoa, doc = document,\n"
     "      createElement = Document.prototype.createElement,\n"
     "      getContext = HTMLCanvasElement.prototype.getContext,\n"
     "      drawImage = CanvasRenderingContext2D.prototype.drawImage,\n"
     "      getImageData = CanvasRenderingContext2D.prototype.getImageData,\n"
     "      subarray = Uint8ClampedArray.prototype.subarray,\n"
-    "      origin = location.origin, size = 96, serial = 0, random = new Uint32Array(4);\n"
+    "      origin = location.origin, size = 96, maxBytes = 4194304, fetching = 0, queue = [], serial = 0, random = new Uint32Array(4);\n"
     "  crypto.getRandomValues(random);\n"
     "  var token = '';\n"
     "  for (var r = 0; r < random.length; ++r) token += ('0000000' + random[r].toString(16)).slice(-8);\n"
@@ -323,9 +331,10 @@ static const char appNotificationBridge[] =
     "  function source(icon) {\n"
     "    try {\n"
     "      var url = new URL_(icon, doc.baseURI);\n"
-    "      if (url.protocol === 'data:' || url.protocol === 'blob:' || url.origin === origin)\n"
-    "        return { href: url.href, url: url, cors: false };\n"
-    "      if (listed(url)) return { href: url.href, url: url, cors: true };\n"
+    "      if (url.protocol === 'data:' || url.protocol === 'blob:')\n"
+    "        return { href: url.href, url: url, fetch: false, cors: false };\n"
+    "      if (url.origin === origin) return { href: url.href, url: url, fetch: true, cors: false };\n"
+    "      if (listed(url)) return { href: url.href, url: url, fetch: true, cors: true };\n"
     "      report('refused', url);\n"
     "    } catch (e) {}\n"
     "    return null;\n"
@@ -334,10 +343,13 @@ static const char appNotificationBridge[] =
     "    var src = icon ? source(icon) : null, s = ++serial;\n"
     "    post({ kind: 'pending', serial: s, title: title, body: body, tag: tag, picture: !!src });\n"
     "    if (!src) return;\n"
-    "    var done = false, img = new Image_();\n"
+    "    var done = false, started = false, img = new Image_(), abort = new AbortController_(), blobURL = null;\n"
     "    function finish(w, h, pixels, failure) {\n"
     "      if (done) return;\n"
     "      done = true;\n"
+    "      try { abort.abort(); } catch (e) {}\n"
+    "      if (blobURL) { try { apply(revokeObjectURL, URL_, [blobURL]); } catch (e) {} blobURL = null; }\n"
+    "      if (started) { started = false; --fetching; fetchNext(); }\n"
     "      if (failure) report(failure, src.url);\n"
     "      post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels });\n"
     "    }\n"
@@ -358,8 +370,41 @@ static const char appNotificationBridge[] =
     "    };\n"
     "    img.onerror = function () { finish(0, 0, '', 'failed'); };\n"
     "    setTimeout_(function () { finish(0, 0, '', 'timed out'); }, 1500);\n"
-    "    if (src.cors) img.crossOrigin = 'anonymous';\n"
-    "    img.src = src.href;\n"
+    "    if (!src.fetch) { img.src = src.href; return; }\n"
+    "    var init = create(null);\n"
+    "    init.mode = src.cors ? 'cors' : 'same-origin';\n"
+    "    init.credentials = src.cors ? 'omit' : 'same-origin';\n"
+    "    init.redirect = src.cors ? 'error' : 'follow';\n"
+    "    init.signal = abort.signal;\n"
+    "    var job = create(null);\n"
+    "    job.waits = function () { return !done; };\n"
+    "    job.start = function () { started = true; ++fetching; start(); };\n"
+    "    queue.push(job);\n"
+    "    fetchNext();\n"
+    "    function start() {\n"
+    "      fetch_(src.href, init).then(function (response) {\n"
+    "        if (done) return null;\n"
+    "        var to = new URL_(response.url);\n"
+    "        if (!response.ok || (src.cors ? response.redirected || response.type !== 'cors' || !listed(to)\n"
+    "                                      : response.type !== 'basic' || to.origin !== origin)) {\n"
+    "          finish(0, 0, '', 'failed');\n"
+    "          return null;\n"
+    "        }\n"
+    "        return response.blob();\n"
+    "      }).then(function (blob) {\n"
+    "        if (done || !blob) return;\n"
+    "        if (blob.size > maxBytes) { finish(0, 0, '', 'failed'); return; }\n"
+    "        blobURL = apply(createObjectURL, URL_, [blob]);\n"
+    "        img.src = blobURL;\n"
+    "      }).catch(function () { finish(0, 0, '', 'failed'); });\n"
+    "    }\n"
+    "  }\n"
+    "  // (at most 2 fetches at a time, the others wait their turn or time out)\n"
+    "  function fetchNext() {\n"
+    "    while (fetching < 2 && queue.length) {\n"
+    "      var job = queue.shift();\n"
+    "      if (job.waits()) job.start();\n"
+    "    }\n"
     "  }\n"
     "  doc.addEventListener('kwpe-notification', function (e) {\n"
     "    try {\n"
