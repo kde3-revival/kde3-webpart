@@ -30,6 +30,7 @@
 #include <qtimer.h>
 #include <qevent.h>
 
+#include <kdeversion.h>
 #include <kglobal.h>
 #include <kio/passdlg.h>
 #include <klocale.h>
@@ -143,6 +144,17 @@ static bool ensureWebKit()
     s_settings = webkit_settings_new();
     KWPEWidget::applySettings();
     webkit_settings_set_enable_developer_extras( s_settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
+    // WebKit's user agent with "Konqueror/<KDE version>" after it.  WebKit's
+    // own, alone or as another Safari's, gets a Cloudflare challenge on
+    // some sites' WebSocket handshakes (claude.ai: 403 "Cf-Mitigated:
+    // challenge", the page loses its connection); with the application
+    // named it is accepted.  KWPE_USER_AGENT: one of one's choice, for
+    // diagnosis.
+    const char* userAgent = getenv( "KWPE_USER_AGENT" );
+    if ( userAgent && *userAgent )
+        webkit_settings_set_user_agent( s_settings, userAgent );
+    else
+        webkit_settings_set_user_agent_with_application_details( s_settings, "Konqueror", KDE_VERSION_STRING );
     // Explicit, whatever WebKit's defaults: file: pages read no other
     // files, scripts open no windows by themselves.
     webkit_settings_set_allow_file_access_from_file_urls( s_settings, FALSE );
