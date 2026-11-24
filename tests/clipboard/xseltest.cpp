@@ -22,6 +22,9 @@
 //   too large      one property / INCR announcing more than the limit
 //   slow pieces    INCR pieces 100 ms apart: Ok (progress keeps it going)
 //   total          INCR pieces 300 ms apart, total limit 1 s: Timeout
+//   endless        pieces every 5 ms that never end: the total limit
+//   own INCR       while we read PRIMARY (slowly), another client reads our
+//                  CLIPBOARD by INCR: served through the Service hook
 
 #include "kwpexselection.h"
 
@@ -42,7 +45,7 @@
 namespace
 {
 
-enum Mode { Serve, Silent, IncrStall, Huge, SlowPieces };
+enum Mode { Serve, Silent, IncrStall, Huge, SlowPieces, Endless };
 
 long long nowMs()
 {
@@ -65,13 +68,15 @@ std::string payload( size_t size )
 }
 
 // The owner: owns CLIPBOARD, writes "1" to the pipe, serves until killed.
+const char* s_selection = "CLIPBOARD";   // what the owner children own
+
 void owner( const char* name, Mode mode, size_t size, int pieceDelayMs, int ready )
 {
     Display* dpy = XOpenDisplay( name );
     if ( !dpy )
         _exit( 2 );
     Window w = XCreateSimpleWindow( dpy, DefaultRootWindow( dpy ), 0, 0, 1, 1, 0, 0, 0 );
-    Atom clipboard = XInternAtom( dpy, "CLIPBOARD", False );
+    Atom clipboard = XInternAtom( dpy, s_selection, False );
     Atom png = XInternAtom( dpy, "image/png", False );
     Atom targets = XInternAtom( dpy, "TARGETS", False );
     Atom incr = XInternAtom( dpy, "INCR", False );
@@ -131,6 +136,8 @@ void owner( const char* name, Mode mode, size_t size, int pieceDelayMs, int read
                 continue;   // stop sending
             if ( pieceDelayMs )
                 usleep( pieceDelayMs * 1000 );
+            if ( mode == Endless && offset >= data.size() )
+                offset = 0;   // never ends
             size_t n = offset < data.size() ? std::min( piece, data.size() - offset ) : 0;
             XChangeProperty( dpy, requestor, property, png, 8, PropModeReplace,
                              reinterpret_cast<const unsigned char*>( data.data() + offset ), int( n ) );
@@ -140,6 +147,119 @@ void owner( const char* name, Mode mode, size_t size, int pieceDelayMs, int read
                 done = true;
         }
     }
+}
+
+
+// ---- our own CLIPBOARD served (INCR) while we read PRIMARY ----------------
+// The reader's Service hands us the requests and the requestor's
+// PropertyDelete events; we answer like Qt 3 does.
+struct OwnServer
+{
+    Display* dpy;
+    Window window;
+    Atom clipboard, png, targets, incr;
+    std::string data;
+    size_t piece;
+    Window requestor;
+    Atom property;
+    size_t offset;
+    bool active;
+    int handled;
+};
+
+bool ownWants( const XEvent* e, void* data )
+{
+    const OwnServer* o = static_cast<const OwnServer*>( data );
+    if ( e->type == SelectionRequest )
+        return e->xselectionrequest.owner == o->window;
+    return e->type == PropertyNotify && e->xproperty.state == PropertyDelete && e->xproperty.window != o->window;
+}
+
+void ownHandle( XEvent* e, void* data )
+{
+    OwnServer* o = static_cast<OwnServer*>( data );
+    o->handled++;
+    if ( e->type == SelectionRequest ) {
+        XSelectionRequestEvent& r = e->xselectionrequest;
+        XEvent reply;
+        memset( &reply, 0, sizeof( reply ) );
+        reply.xselection.type = SelectionNotify;
+        reply.xselection.requestor = r.requestor;
+        reply.xselection.selection = r.selection;
+        reply.xselection.target = r.target;
+        reply.xselection.time = r.time;
+        reply.xselection.property = None;
+        if ( r.target == o->png ) {
+            long announced = long( o->data.size() );
+            XSelectInput( o->dpy, r.requestor, PropertyChangeMask );
+            XChangeProperty( o->dpy, r.requestor, r.property, o->incr, 32, PropModeReplace,
+                             reinterpret_cast<unsigned char*>( &announced ), 1 );
+            o->requestor = r.requestor;
+            o->property = r.property;
+            o->offset = 0;
+            o->active = true;
+            reply.xselection.property = r.property;
+        }
+        XSendEvent( o->dpy, r.requestor, False, 0, &reply );
+    } else if ( o->active && e->xproperty.window == o->requestor && e->xproperty.atom == o->property ) {
+        size_t n = o->offset < o->data.size() ? std::min( o->piece, o->data.size() - o->offset ) : 0;
+        XChangeProperty( o->dpy, o->requestor, o->property, o->png, 8, PropModeReplace,
+                         reinterpret_cast<const unsigned char*>( o->data.data() + o->offset ), int( n ) );
+        o->offset += n;
+        if ( !n )
+            o->active = false;
+    }
+}
+
+// A client that reads our CLIPBOARD (INCR) and writes "bytes ms-at-end" to fd.
+void requester( const char* name, int fd )
+{
+    Display* dpy = XOpenDisplay( name );
+    if ( !dpy )
+        _exit( 2 );
+    XSetWindowAttributes a;
+    a.event_mask = PropertyChangeMask;
+    Window w = XCreateWindow( dpy, DefaultRootWindow( dpy ), 0, 0, 1, 1, 0, 0, InputOnly, CopyFromParent, CWEventMask, &a );
+    Atom prop = XInternAtom( dpy, "XSELTEST_IN", False );
+    XConvertSelection( dpy, XInternAtom( dpy, "CLIPBOARD", False ), XInternAtom( dpy, "image/png", False ), prop, w, CurrentTime );
+    XFlush( dpy );
+    std::string got;
+    bool incr = false;
+    long long end = nowMs() + 8000;
+    while ( nowMs() < end ) {
+        if ( !XPending( dpy ) ) {
+            usleep( 1000 );
+            continue;
+        }
+        XEvent e;
+        XNextEvent( dpy, &e );
+        Atom type;
+        int format;
+        unsigned long n, after;
+        unsigned char* v = 0;
+        if ( e.type == SelectionNotify ) {
+            XGetWindowProperty( dpy, w, prop, 0, 0x1000000, True, AnyPropertyType, &type, &format, &n, &after, &v );
+            if ( v )
+                XFree( v );
+            incr = true;
+        } else if ( incr && e.type == PropertyNotify && e.xproperty.state == PropertyNewValue && e.xproperty.atom == prop ) {
+            XGetWindowProperty( dpy, w, prop, 0, 0x1000000, True, AnyPropertyType, &type, &format, &n, &after, &v );
+            if ( v ) {
+                got.append( reinterpret_cast<char*>( v ), n );
+                XFree( v );
+            }
+            if ( !n ) {
+                char line[64];
+                int len = snprintf( line, sizeof( line ), "%u %lld\n", unsigned( got.size() ), nowMs() );
+                if ( write( fd, line, len ) != len )
+                    _exit( 2 );
+                _exit( 0 );
+            }
+        }
+    }
+    if ( write( fd, "0 0\n", 4 ) != 4 )
+        _exit( 2 );
+    _exit( 1 );
 }
 
 int failures = 0;
@@ -185,12 +305,13 @@ struct Run
     long long ms;
 };
 
-Run readPng( Display* dpy, const KWPEXSelection::Limits& limits, const char* target = "image/png" )
+Run readPng( Display* dpy, const KWPEXSelection::Limits& limits, const char* target = "image/png",
+             const KWPEXSelection::Service* service = 0, const char* selection = "CLIPBOARD" )
 {
     Run run;
     long long start = nowMs();
-    run.result = KWPEXSelection::read( dpy, XInternAtom( dpy, "CLIPBOARD", False ), XInternAtom( dpy, target, False ),
-                                       CurrentTime, limits, run.data );
+    run.result = KWPEXSelection::read( dpy, XInternAtom( dpy, selection, False ), XInternAtom( dpy, target, False ),
+                                       CurrentTime, limits, run.data, 0, 0, service );
     run.ms = nowMs() - start;
     return run;
 }
@@ -292,6 +413,67 @@ int main( int argc, char** argv )
     snprintf( detail, sizeof( detail ), "%s, %lld ms", KWPEXSelection::resultName( run.result ), run.ms );
     check( run.result == KWPEXSelection::Timeout && run.ms < 1400, "total limit", detail );
     stopOwner( pid );
+
+    // pieces keep coming (progress all the time): the total limit still ends it
+    {
+        const KWPEXSelection::Limits endless = { 1000, 1000, 1024u * 1024 * 1024 };
+        pid = startOwner( argv[1], Endless, 1024 * 1024, 5 );
+        run = readPng( dpy, endless );
+        snprintf( detail, sizeof( detail ), "%s, %lld ms", KWPEXSelection::resultName( run.result ), run.ms );
+        check( run.result == KWPEXSelection::Timeout && run.ms < 1300, "total limit, endless pieces", detail );
+        stopOwner( pid );
+    }
+
+    // Our own CLIPBOARD (1 MB, INCR) asked for by another client while we
+    // read PRIMARY from a slow owner: the other transfer must not wait for
+    // the end of ours.
+    {
+        OwnServer own;
+        own.dpy = dpy;
+        own.window = XCreateSimpleWindow( dpy, DefaultRootWindow( dpy ), 0, 0, 1, 1, 0, 0, 0 );
+        own.clipboard = XInternAtom( dpy, "CLIPBOARD", False );
+        own.png = XInternAtom( dpy, "image/png", False );
+        own.targets = XInternAtom( dpy, "TARGETS", False );
+        own.incr = XInternAtom( dpy, "INCR", False );
+        own.data = payload( 1024 * 1024 + 7 );
+        own.piece = 64 * 1024;
+        own.requestor = 0;
+        own.property = None;
+        own.offset = 0;
+        own.active = false;
+        own.handled = 0;
+        XSetSelectionOwner( dpy, own.clipboard, own.window, CurrentTime );
+        XSync( dpy, False );
+        s_selection = "PRIMARY";
+        pid = startOwner( argv[1], Serve, 2 * 1024 * 1024, 100 );   // about 1 s
+        s_selection = "CLIPBOARD";
+        int fds[2];
+        if ( pipe( fds ) )
+            return 2;
+        pid_t req = fork();
+        if ( req == 0 ) {
+            close( fds[0] );
+            requester( argv[1], fds[1] );
+        }
+        close( fds[1] );
+        KWPEXSelection::Service service = { ownWants, ownHandle, &own };
+        run = readPng( dpy, limits, "image/png", &service, "PRIMARY" );
+        long long readEnd = nowMs();
+        char line[64] = { 0 };
+        ssize_t got = read( fds[0], line, sizeof( line ) - 1 );
+        close( fds[0] );
+        waitpid( req, 0, 0 );
+        stopOwner( pid );
+        unsigned bytes = 0;
+        long long doneAt = 0;
+        if ( got > 0 )
+            sscanf( line, "%u %lld", &bytes, &doneAt );
+        snprintf( detail, sizeof( detail ), "our read %s %u bytes in %lld ms; theirs %u bytes, done %lld ms before ours",
+                  KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ), run.ms, bytes, readEnd - doneAt );
+        check( run.result == KWPEXSelection::Ok && bytes == own.data.size() && doneAt && doneAt < readEnd,
+               "own INCR served during a read", detail );
+        XDestroyWindow( dpy, own.window );
+    }
 
     printf( failures ? "%d FAILED\n" : "all passed\n", failures );
     return failures ? 1 : 0;

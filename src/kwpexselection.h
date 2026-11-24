@@ -40,8 +40,18 @@ enum Result
     Failed        // a protocol error (the property vanished, ...)
 };
 
-/** Events that must not wait while we do (requests to our own selections). */
-typedef void ( *ServiceFunction )( XEvent* event );
+/**
+ * Events that must not wait while we do: requests to this program's own
+ * selections, the steps of its own outgoing INCR transfers.  wants() is
+ * called inside Xlib's queue scan (no Xlib calls there); handle() gets the
+ * event taken off the queue.  The reader's own window never gets here.
+ */
+struct Service
+{
+    bool ( *wants )( const XEvent* event, void* data );
+    void ( *handle )( XEvent* event, void* data );
+    void* data;
+};
 
 struct Limits
 {
@@ -54,12 +64,12 @@ struct Limits
  * Converts @p selection to @p target and reads it into @p data (format 8
  * data as bytes; format 32 items as 32-bit values in host order, e.g.
  * TARGETS).  @p time is the time of the user's request (ICCCM).
- * @p service, if given, gets the SelectionRequest events for PRIMARY and
- * CLIPBOARD (owned by this program) that arrive meanwhile.  One read at a
- * time: a nested call fails.
+ * @p service, if given, gets the events it wants that arrive meanwhile.
+ * The total time is checked every round; the idle time restarts only on
+ * progress.  One read at a time: a nested call fails.
  */
 Result read( Display* dpy, Atom selection, Atom target, Time time, const Limits& limits,
-             std::string& data, Atom* type = 0, int* format = 0, ServiceFunction service = 0 );
+             std::string& data, Atom* type = 0, int* format = 0, const Service* service = 0 );
 
 /** Text for logs: "ok", "refused", ... */
 const char* resultName( Result result );

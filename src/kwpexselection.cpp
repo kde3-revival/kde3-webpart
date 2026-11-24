@@ -86,36 +86,34 @@ Bool isNoise( Display*, XEvent* e, XPointer arg )
            && ( e->xproperty.state == PropertyDelete || m->type != PropertyNotify );
 }
 
-// Requests for our own PRIMARY/CLIPBOARD (another view's copy): whoever asks
-// may be waiting for us.  SelectionClear and the rest wait for the event
-// loop (handling them here would run Qt's dataChanged() slots, which read
-// the clipboard themselves, inside WebKit's read).
-struct Service
+struct ServiceMatch
 {
-    Atom primary;
-    Atom clipboard;
+    const KWPEXSelection::Service* service;
+    Window requestor;
 };
 
-Bool isSelectionRequest( Display*, XEvent* e, XPointer arg )
+Bool isServiced( Display*, XEvent* e, XPointer arg )
 {
-    const Service* s = reinterpret_cast<const Service*>( arg );
-    return e->type == SelectionRequest
-           && ( e->xselectionrequest.selection == s->primary || e->xselectionrequest.selection == s->clipboard );
+    const ServiceMatch* m = reinterpret_cast<const ServiceMatch*>( arg );
+    return e->xany.window != m->requestor && m->service->wants( e, m->service->data );
 }
 
-// Waits for an event of m; false at the deadline.
-bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, KWPEXSelection::ServiceFunction service )
+// Waits for an event of m; false at the deadline (checked every round, so
+// a stream of other work cannot hold it off).
+bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, const KWPEXSelection::Service* service )
 {
     XFlush( dpy );
-    Service selections = { XA_PRIMARY, XInternAtom( dpy, "CLIPBOARD", False ) };
+    ServiceMatch serviced = { service, m.window };
     for ( ;; ) {
+        if ( nowMs() >= deadline )
+            return false;
         XEvent other;
         while ( XCheckIfEvent( dpy, &other, isNoise, reinterpret_cast<XPointer>( &m ) ) )
             ;
         if ( XCheckIfEvent( dpy, event, matches, reinterpret_cast<XPointer>( &m ) ) )
             return true;
-        if ( service && XCheckIfEvent( dpy, &other, isSelectionRequest, reinterpret_cast<XPointer>( &selections ) ) ) {
-            service( &other );
+        if ( service && XCheckIfEvent( dpy, &other, isServiced, reinterpret_cast<XPointer>( &serviced ) ) ) {
+            service->handle( &other, service->data );
             XFlush( dpy );
             continue;
         }
@@ -206,7 +204,7 @@ bool takeProperty( Display* dpy, Window w, Atom property, std::string& data, Ato
 }
 
 KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom target, Time time, const Limits& limits,
-                                             std::string& data, Atom* type, int* format, ServiceFunction service )
+                                             std::string& data, Atom* type, int* format, const Service* service )
 {
     data.clear();
     if ( type )
@@ -234,10 +232,9 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
 
     Match notify = { w, SelectionNotify, None };
     XEvent event;
+    // The idle deadline moves only on progress (an answer, a piece).
+    long long deadline = start + limits.idleMs < end ? start + limits.idleMs : end;
     for ( ;; ) {
-        long long deadline = nowMs() + limits.idleMs;
-        if ( deadline > end )
-            deadline = end;
         if ( !waitFor( dpy, notify, &event, deadline, service ) ) {
             dropRequestor( dpy );
             return Timeout;
@@ -279,10 +276,8 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
         data.reserve( announced );
     }
     Match piece = { w, PropertyNotify, property };
+    deadline = nowMs() + limits.idleMs < end ? nowMs() + limits.idleMs : end;
     for ( ;; ) {
-        long long deadline = nowMs() + limits.idleMs;
-        if ( deadline > end )
-            deadline = end;
         if ( !waitFor( dpy, piece, &event, deadline, service ) ) {
             dropRequestor( dpy );
             data.clear();
@@ -304,6 +299,7 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
                 *format = actualFormat;
             return Ok;
         }
+        deadline = nowMs() + limits.idleMs < end ? nowMs() + limits.idleMs : end;
     }
 }
 

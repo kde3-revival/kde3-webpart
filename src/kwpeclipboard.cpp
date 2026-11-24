@@ -17,7 +17,12 @@
 #include <string.h>
 
 #include <qapplication.h>
+#include <qbitmap.h>
+#include <qbuffer.h>
 #include <qclipboard.h>
+#include <qimage.h>
+#include <qpixmap.h>
+#include <qwidget.h>
 #include <qcstring.h>
 #include <qmime.h>
 #include <qstrlist.h>
@@ -28,6 +33,7 @@
 #include "wpex11platform.h"
 
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 
 extern Time qt_x_time;
 
@@ -115,6 +121,7 @@ static QClipboard::Mode s_pasteMode = QClipboard::Clipboard;
 static gint64 s_pasteUntil = 0;                 // reads allowed until then (a user paste)
 static gint64 s_pasteStart = 0;
 static Window s_pasteOwner = None;              // the selection's owner at the key
+static Time s_pasteTime = CurrentTime;          // the key's (click's) time: every request of this paste
 static bool s_pasteExtended = false;            // the window was extended once (a slow read)
 static guint s_cacheTimer = 0;
 static bool s_updating = false;                 // our own changed() call
@@ -158,12 +165,51 @@ static Atom selectionAtom( QClipboard::Mode mode )
     return mode == QClipboard::Selection ? XA_PRIMARY : XInternAtom( qt_xdisplay(), "CLIPBOARD", False );
 }
 
-// Requests to our own selections (e.g. another tab's copy, still in the
-// CLIPBOARD) while we wait: Qt answers them.
-static void serviceEvent( XEvent* event )
+// While we wait, Qt keeps serving this program's own selections: requests
+// for PRIMARY/CLIPBOARD (another view's copy) and the steps of its outgoing
+// INCR transfers (the other client deletes the property on its own window:
+// a PropertyDelete on a window that is not ours).  SelectionClear and
+// everything else wait for the event loop (Qt's dataChanged() slots would
+// read the clipboard themselves inside WebKit's read).
+struct ServiceAtoms
+{
+    Atom primary;
+    Atom clipboard;
+};
+
+static bool serviceWants( const XEvent* e, void* data )
+{
+    const ServiceAtoms* atoms = static_cast<const ServiceAtoms*>( data );
+    if ( e->type == SelectionRequest )
+        return e->xselectionrequest.selection == atoms->primary || e->xselectionrequest.selection == atoms->clipboard;
+    return e->type == PropertyNotify && e->xproperty.state == PropertyDelete && !QWidget::find( e->xproperty.window );
+}
+
+static void serviceHandle( XEvent* event, void* )
 {
     if ( qApp )
         qApp->x11ProcessEvent( event );
+}
+
+static const KWPEXSelection::Service* service()
+{
+    static ServiceAtoms atoms = { XA_PRIMARY, None };
+    static KWPEXSelection::Service s = { serviceWants, serviceHandle, &atoms };
+    if ( atoms.clipboard == None )
+        atoms.clipboard = XInternAtom( qt_xdisplay(), "CLIPBOARD", False );
+    return &s;
+}
+
+// Another program's names (atom names, formats) in a log line.
+static QCString printable( const char* text )
+{
+    QCString out( text ? text : "" );
+    if ( out.length() > 64 )
+        out = out.left( 60 ) + "...";
+    for ( uint i = 0; i < out.length(); ++i )
+        if ( (unsigned char) out[i] < 0x20 || (unsigned char) out[i] >= 0x7f )
+            out[i] = '?';
+    return out;
 }
 
 static bool ownsSelection( QClipboard::Mode mode )
@@ -188,7 +234,7 @@ static bool readTargets( QClipboard::Mode mode, QValueList<QCString>& names )
     int format = 0;
     gint64 start = g_get_monotonic_time();
     KWPEXSelection::Result result = KWPEXSelection::read( dpy, selectionAtom( mode ), XInternAtom( dpy, "TARGETS", False ),
-                                                          qt_x_time, targetsLimits, data, 0, &format, serviceEvent );
+                                                          s_pasteTime, targetsLimits, data, 0, &format, service() );
     if ( debugging() )
         fprintf( stderr, "kwpe: clipboard targets: %s, %u byte(s) in %d ms\n", KWPEXSelection::resultName( result ),
                  unsigned( data.size() ), int( ( g_get_monotonic_time() - start ) / 1000 ) );
@@ -234,6 +280,202 @@ static const char* offeredName( const char* format )
     return 0;
 }
 
+
+static bool offered( const char* format )
+{
+    return offeredName( format ) != 0;
+}
+
+// One read of another program's selection in @p target (bounded).
+static bool readForeign( const char* target, std::string& bytes, Atom* type = 0 )
+{
+    Display* dpy = qt_xdisplay();
+    gint64 start = g_get_monotonic_time();
+    KWPEXSelection::Result result = KWPEXSelection::read( dpy, selectionAtom( s_pasteMode ), XInternAtom( dpy, target, False ),
+                                                          s_pasteTime, dataLimits, bytes, type, 0, service() );
+    if ( debugging() )
+        fprintf( stderr, "kwpe: clipboard %s: %s, %u byte(s) in %d ms\n", printable( target ).data(), KWPEXSelection::resultName( result ),
+                 unsigned( bytes.size() ), int( ( g_get_monotonic_time() - start ) / 1000 ) );
+    return result == KWPEXSelection::Ok;
+}
+
+static void stripNuls( std::string& s )
+{
+    while ( !s.empty() && s[s.size() - 1] == '\0' )
+        s.erase( s.size() - 1 );
+}
+
+// Bytes in a known encoding -> UTF-8 (invalid sequences replaced).
+static std::string toUtf8( const std::string& in, const char* encoding )
+{
+    std::string out;
+    gsize written = 0;
+    gchar* converted = g_convert_with_fallback( in.data(), gssize( in.size() ), "UTF-8", encoding, "?", 0, &written, 0 );
+    if ( converted ) {
+        out.assign( converted, written );
+        g_free( converted );
+    }
+    return out;
+}
+
+static std::string validUtf8( const std::string& in )
+{
+    gchar* valid = g_utf8_make_valid( in.data(), gssize( in.size() ) );
+    std::string out( valid );
+    g_free( valid );
+    return out;
+}
+
+// Plain text of another program, as UTF-8: UTF8_STRING (or a MIME UTF-8
+// type), else COMPOUND_TEXT, STRING (Latin-1), TEXT, text/plain.
+static bool readForeignText( std::string& utf8 )
+{
+    static const char* const targets[] = { "UTF8_STRING", "text/plain;charset=utf-8", "COMPOUND_TEXT", "STRING", "TEXT", "text/plain", 0 };
+    Display* dpy = qt_xdisplay();
+    for ( const char* const* t = targets; *t; ++t ) {
+        const char* name = offeredName( *t );
+        if ( !name )
+            continue;
+        std::string bytes;
+        Atom type = None;
+        if ( !readForeign( name, bytes, &type ) )
+            return false;   // the owner offered it: no point in trying the others for seconds
+        stripNuls( bytes );
+        if ( type == XInternAtom( dpy, "COMPOUND_TEXT", False ) ) {
+            XTextProperty property;
+            property.value = reinterpret_cast<unsigned char*>( const_cast<char*>( bytes.data() ) );
+            property.encoding = type;
+            property.format = 8;
+            property.nitems = bytes.size();
+            char** list = 0;
+            int count = 0;
+            utf8.clear();
+            if ( Xutf8TextPropertyToTextList( dpy, &property, &list, &count ) >= 0 && list ) {
+                for ( int i = 0; i < count; ++i )
+                    utf8 += list[i];
+                XFreeStringList( list );
+            }
+        } else if ( type == XA_STRING ) {
+            utf8 = toUtf8( bytes, "ISO-8859-1" );
+        } else if ( g_utf8_validate( bytes.data(), gssize( bytes.size() ), 0 ) ) {
+            utf8 = bytes;
+        } else if ( qstricmp( name, "text/plain" ) == 0 ) {
+            utf8 = toUtf8( bytes, "ISO-8859-1" );   // an old MIME owner: Latin-1
+        } else {
+            utf8 = validUtf8( bytes );
+        }
+        return true;
+    }
+    return false;
+}
+
+// HTML of another program as UTF-8: Mozilla and Chrome send UTF-16 (with or
+// without a byte order mark), most others UTF-8.
+static bool readForeignHtml( std::string& utf8 )
+{
+    const char* name = offeredName( "text/html" );
+    std::string bytes;
+    if ( !name || !readForeign( name, bytes ) )
+        return false;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>( bytes.data() );
+    if ( bytes.size() >= 2 && b[0] == 0xff && b[1] == 0xfe )
+        utf8 = toUtf8( bytes.substr( 2 ), "UTF-16LE" );
+    else if ( bytes.size() >= 2 && b[0] == 0xfe && b[1] == 0xff )
+        utf8 = toUtf8( bytes.substr( 2 ), "UTF-16BE" );
+    else if ( bytes.size() >= 2 && bytes.size() % 2 == 0 && b[0] && !b[1] )
+        utf8 = toUtf8( bytes, "UTF-16LE" );
+    else if ( g_utf8_validate( bytes.data(), gssize( bytes.size() ), 0 ) )
+        utf8 = bytes;
+    else
+        utf8 = toUtf8( bytes, "ISO-8859-1" );
+    stripNuls( utf8 );
+    return true;
+}
+
+// An old program that offers only a PIXMAP (a server-side drawable) as its
+// image: copied and encoded as PNG here, as Qt 3 did (as PPM), within size
+// limits; a drawable that is gone or does not fit gives nothing.
+static const unsigned maxPixmapSide = 16384;
+static const unsigned long maxPixmapPixels = 32UL * 1024 * 1024;
+static bool s_drawableError = false;
+
+static int drawableErrors( Display*, XErrorEvent* )
+{
+    s_drawableError = true;
+    return 0;
+}
+
+static bool readForeignPixmap( std::string& png )
+{
+    const char* name = offeredName( "PIXMAP" );
+    std::string bytes;
+    Atom type = None;
+    if ( !name || !readForeign( name, bytes, &type ) || bytes.size() < 4 )
+        return false;
+    uint32_t id;
+    memcpy( &id, bytes.data(), sizeof( id ) );
+    Display* dpy = qt_xdisplay();
+    XSync( dpy, False );
+    s_drawableError = false;
+    XErrorHandler previous = XSetErrorHandler( drawableErrors );
+    Window root;
+    int x, y;
+    unsigned w = 0, h = 0, border, depth = 0;
+    bool ok = id && XGetGeometry( dpy, Pixmap( id ), &root, &x, &y, &w, &h, &border, &depth );
+    XSync( dpy, False );
+    ok = ok && !s_drawableError && w && h && w <= maxPixmapSide && h <= maxPixmapSide
+         && (unsigned long) w * h <= maxPixmapPixels && ( depth == 1 || int( depth ) == QPixmap::defaultDepth() );
+    QImage image;
+    if ( ok ) {
+        GC gc = XCreateGC( dpy, Pixmap( id ), 0, 0 );
+        if ( depth == 1 ) {
+            QBitmap bitmap( w, h );
+            XCopyArea( dpy, Pixmap( id ), bitmap.handle(), gc, 0, 0, w, h, 0, 0 );
+            XSync( dpy, False );
+            if ( !s_drawableError )
+                image = bitmap.convertToImage();
+        } else {
+            QPixmap pixmap( w, h );
+            XCopyArea( dpy, Pixmap( id ), pixmap.handle(), gc, 0, 0, w, h, 0, 0 );
+            XSync( dpy, False );
+            if ( !s_drawableError )
+                image = pixmap.convertToImage();
+        }
+        XFreeGC( dpy, gc );
+        XSync( dpy, False );
+    }
+    XSetErrorHandler( previous );
+    if ( debugging() )
+        fprintf( stderr, "kwpe: clipboard PIXMAP %ux%u depth %u: %s\n", w, h, depth, image.isNull() ? "refused" : "converted" );
+    if ( image.isNull() )
+        return false;
+    QByteArray encoded;
+    QBuffer buffer( encoded );
+    buffer.open( IO_WriteOnly );
+    QImageIO io( &buffer, "PNG" );
+    io.setImage( image );
+    if ( !io.write() )
+        return false;
+    buffer.close();
+    png.assign( encoded.data(), encoded.size() );
+    return true;
+}
+
+// The paste's data in the format WebKit asks for, from another program.
+static bool readForeignFormat( const char* format, std::string& bytes )
+{
+    if ( qstrnicmp( format, "text/plain", 10 ) == 0 )
+        return readForeignText( bytes );
+    if ( qstricmp( format, "text/html" ) == 0 )
+        return readForeignHtml( bytes );
+    if ( qstricmp( format, "image/png" ) == 0 && !offered( "image/png" ) && offered( "PIXMAP" ) )
+        return readForeignPixmap( bytes );
+    // Only what the owner offers: a target it does not know costs a round
+    // trip, or the whole wait if it does not answer.
+    const char* name = offeredName( format );
+    return name && readForeign( name, bytes );
+}
+
 // WebKit's own copies (is_local) go to the X CLIPBOARD.
 static void kwpeClipboardChanged( WPEClipboard* clipboard, GPtrArray* formats, gboolean isLocal, WPEClipboardContent* content )
 {
@@ -276,7 +518,7 @@ static void kwpeClipboardChanged( WPEClipboard* clipboard, GPtrArray* formats, g
 static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
 {
     if ( debugging() )
-        fprintf( stderr, "kwpe: clipboard read %s: %s\n", format, g_get_monotonic_time() > s_pasteUntil ? "refused" : "allowed" );
+        fprintf( stderr, "kwpe: clipboard read %s: %s\n", printable( format ).data(), g_get_monotonic_time() > s_pasteUntil ? "refused" : "allowed" );
     if ( !qApp || g_get_monotonic_time() > s_pasteUntil || !format ) {
         dropCache();   // that paste is over
         return 0;
@@ -285,61 +527,61 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
     // password manager put there meanwhile).
     if ( XGetSelectionOwner( qt_xdisplay(), selectionAtom( s_pasteMode ) ) != s_pasteOwner ) {
         if ( debugging() )
-            fprintf( stderr, "kwpe: clipboard read %s: refused, the selection changed hands\n", format );
+            fprintf( stderr, "kwpe: clipboard read %s: refused, the selection changed hands\n", printable( format ).data() );
         s_pasteUntil = 0;
         dropCache();
         return 0;
     }
-    QClipboard* cb = QApplication::clipboard();
-    QCString data;
-    if ( qstrnicmp( format, "text/plain", 10 ) == 0 ) {
-        data = cb->text( s_pasteMode ).utf8();
-    } else if ( qstricmp( format, "text/html" ) == 0 ) {
-        QCString subtype = "html";
-        data = cb->text( subtype, s_pasteMode ).utf8();
-    } else if ( s_pasteOwn ) {
-        QMimeSource* source = cb->data( s_pasteMode );
-        QByteArray bytes = source ? source->encodedData( format ) : QByteArray();
-        if ( bytes.isEmpty() )
-            return 0;
-        return g_bytes_new( bytes.data(), bytes.size() );
-    } else {
-        // Only what the owner offers (WebKit also asks for its own private
-        // type): a target it does not know costs a round trip, or the whole
-        // wait if it does not answer.
-        const char* name = offeredName( format );
-        if ( !name )
-            return 0;
-        if ( s_cachedBytes && s_cachedFormat == name )
-            return g_bytes_ref( s_cachedBytes );
-        Display* dpy = qt_xdisplay();
-        std::string bytes;
-        gint64 start = g_get_monotonic_time();
-        KWPEXSelection::Result result = KWPEXSelection::read( dpy, selectionAtom( s_pasteMode ), XInternAtom( dpy, name, False ),
-                                                              qt_x_time, dataLimits, bytes, 0, 0, serviceEvent );
-        if ( debugging() )
-            fprintf( stderr, "kwpe: clipboard %s: %s, %u byte(s) in %d ms\n", name, KWPEXSelection::resultName( result ),
-                     unsigned( bytes.size() ), int( ( g_get_monotonic_time() - start ) / 1000 ) );
-        if ( result != KWPEXSelection::Ok || bytes.empty() )
-            return 0;
-        dropCache();
-        s_cachedFormat = name;
-        s_cachedBytes = g_bytes_new( bytes.data(), bytes.size() );
-        // A slow owner (KSnapshot encodes a big screenshot, a pieces
-        // transfer) used up the window: WebKit's further reads of this
-        // paste come right after.  Once per paste.
-        gint64 now = g_get_monotonic_time();
-        if ( !s_pasteExtended && now - start > 300000 && now + G_USEC_PER_SEC > s_pasteUntil
-             && now < s_pasteStart + 15 * G_USEC_PER_SEC ) {
-            s_pasteUntil = now + G_USEC_PER_SEC;
-            s_pasteExtended = true;
+    if ( s_pasteOwn ) {
+        // Our own selection (another view's copy, the location bar): Qt has
+        // the data, no X traffic.
+        QClipboard* cb = QApplication::clipboard();
+        QCString data;
+        if ( qstrnicmp( format, "text/plain", 10 ) == 0 ) {
+            data = cb->text( s_pasteMode ).utf8();
+        } else if ( qstricmp( format, "text/html" ) == 0 ) {
+            QCString subtype = "html";
+            data = cb->text( subtype, s_pasteMode ).utf8();
+        } else {
+            QMimeSource* source = cb->data( s_pasteMode );
+            QByteArray bytes = source ? source->encodedData( format ) : QByteArray();
+            if ( bytes.isEmpty() )
+                return 0;
+            return g_bytes_new( bytes.data(), bytes.size() );
         }
-        s_cacheTimer = g_timeout_add( guint( ( s_pasteUntil - now ) / 1000 ) + 50, cacheExpired, 0 );
-        return g_bytes_ref( s_cachedBytes );
+        if ( data.isNull() )
+            return 0;
+        return g_bytes_new( data.data(), data.length() );
     }
-    if ( data.isNull() )
+
+    // Another program's: read with KWPEXSelection; WebKit asks for the same
+    // data more than once per paste, the last answer is kept for that.
+    QCString key = QCString( format ).lower();
+    if ( key.left( 10 ) == "text/plain" )
+        key = "text/plain";   // both of WebKit's names are the same UTF-8 text
+    if ( s_cachedBytes && s_cachedFormat == key )
+        return g_bytes_ref( s_cachedBytes );
+    gint64 start = g_get_monotonic_time();
+    std::string bytes;
+    if ( !readForeignFormat( format, bytes ) || bytes.empty() )
         return 0;
-    return g_bytes_new( data.data(), data.length() );
+    dropCache();
+    s_cachedFormat = key;
+    s_cachedBytes = g_bytes_new( bytes.data(), bytes.size() );
+    // A slow owner (KSnapshot encodes a big screenshot, a pieces transfer)
+    // used up the window: WebKit's further reads of this paste come right
+    // after.  Once per paste.
+    gint64 now = g_get_monotonic_time();
+    if ( !s_pasteExtended && now - start > 300000 && now + G_USEC_PER_SEC > s_pasteUntil
+         && now < s_pasteStart + 15 * G_USEC_PER_SEC ) {
+        s_pasteUntil = now + G_USEC_PER_SEC;
+        s_pasteExtended = true;
+    }
+    if ( now < s_pasteUntil )
+        s_cacheTimer = g_timeout_add( guint( ( s_pasteUntil - now ) / 1000 ) + 50, cacheExpired, 0 );
+    else
+        dropCache();   // (the bytes are returned below)
+    return g_bytes_new( bytes.data(), bytes.size() );
 }
 
 static void kwpeClipboardDispose( GObject* object )
@@ -399,6 +641,11 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
     // lists and images; not every private format of other programs.
     // Another program's targets are read here directly (Qt 3 would wait 5 s
     // for an owner that does not answer, and claim text then).
+    // The paste is of what the owner at the key had, asked for with the
+    // key's time (ICCCM); an owner change meanwhile ends it.
+    s_pasteTime = qt_x_time;
+    s_pasteMode = mode;
+    s_pasteOwner = XGetSelectionOwner( qt_xdisplay(), selectionAtom( mode ) );
     s_pasteOwn = ownsSelection( mode );
     s_offered.clear();
     if ( s_pasteOwn ) {
@@ -407,8 +654,14 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
     } else if ( !readTargets( mode, s_offered ) ) {
         s_offered.clear();   // no owner, or it does not answer: nothing to paste
     } else if ( s_offered.isEmpty() ) {
-        s_offered.append( "text/plain" );
+        s_offered.append( "TEXT" );   // no TARGETS (an old program): text is tried
     }
+    if ( !s_pasteOwn && XGetSelectionOwner( qt_xdisplay(), selectionAtom( mode ) ) != s_pasteOwner ) {
+        if ( debugging() )
+            fprintf( stderr, "kwpe: paste: the selection changed hands while asking for its formats\n" );
+        s_offered.clear();
+    }
+    bool image = false, pixmap = false;
     GPtrArray* formats = g_ptr_array_new();
     bool text = false;
     for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); it != s_offered.end(); ++it ) {
@@ -416,10 +669,16 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
         if ( qstrnicmp( format, "text/plain", 10 ) == 0 || qstrcmp( format, "UTF8_STRING" ) == 0
              || qstrcmp( format, "STRING" ) == 0 || qstrcmp( format, "TEXT" ) == 0 || qstrcmp( format, "COMPOUND_TEXT" ) == 0 )
             text = true;
+        else if ( !s_pasteOwn && qstrcmp( format, "PIXMAP" ) == 0 )
+            pixmap = true;
         else if ( ( qstricmp( format, "text/html" ) == 0 || qstricmp( format, "text/uri-list" ) == 0
-                    || qstrnicmp( format, "image/", 6 ) == 0 ) )
+                    || qstrnicmp( format, "image/", 6 ) == 0 ) ) {
+            image = image || qstrnicmp( format, "image/", 6 ) == 0;
             g_ptr_array_add( formats, const_cast<char*>( g_intern_string( QCString( format ).lower().data() ) ) );
+        }
     }
+    if ( pixmap && !image )   // converted from the drawable (readForeignPixmap)
+        g_ptr_array_add( formats, const_cast<char*>( g_intern_static_string( "image/png" ) ) );
     if ( text ) {
         g_ptr_array_add( formats, const_cast<char*>( g_intern_static_string( "text/plain" ) ) );
         g_ptr_array_add( formats, const_cast<char*>( g_intern_static_string( "text/plain;charset=utf-8" ) ) );
@@ -430,11 +689,9 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
 
     if ( debugging() )
         fprintf( stderr, "kwpe: paste from %s, %u format(s)\n", mode == QClipboard::Selection ? "PRIMARY" : "CLIPBOARD", formats->len );
-    s_pasteMode = mode;
     s_pasteStart = g_get_monotonic_time();
     s_pasteUntil = empty ? 0 : s_pasteStart + G_USEC_PER_SEC;
     s_pasteExtended = false;
-    s_pasteOwner = XGetSelectionOwner( qt_xdisplay(), selectionAtom( mode ) );
     s_updating = true;
     WPE_CLIPBOARD_GET_CLASS( s_clipboard )->changed( s_clipboard, formats, FALSE, 0 );
     s_updating = false;
