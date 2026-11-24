@@ -1036,8 +1036,12 @@ public:
     QValueList<PendingPermission> pendingPermissions;   // for the host, outside WebKit's signal
     QMap<int, WebKitNotification*> notifications;   // shown by the page, not closed yet (ref)
     QValueList<int> notificationsToShow;   // for the host, outside WebKit's signal
+    // When WebKit showed each of these: it waits for its picture until
+    // 2 seconds after that, whatever is announced meanwhile.
+    QMap<int, gint64> notificationShownAt;
     // The pictures our script announced (appNotificationBridge), oldest
-    // first: a notification waits for its picture (at most 2 seconds).
+    // first (at most 20): a notification waits for its picture (see
+    // notificationShownAt).
     struct NotificationIcon
     {
         int serial;      // the script's
@@ -1047,7 +1051,7 @@ public:
         int id;          // ... once it is shown (0: not yet)
         bool done;       // the picture came (or none will)
         QImage image;
-        QTime announced;
+        gint64 announced;   // g_get_monotonic_time()
     };
     QValueList<NotificationIcon> notificationIcons;
     // The document whose bridge's messages are taken: its token (its
@@ -1828,11 +1832,13 @@ gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotificati
         QMap<int, WebKitNotification*>::Iterator oldest = d->notifications.begin();
         g_signal_handlers_disconnect_by_data( oldest.data(), d );
         g_object_unref( oldest.data() );
+        d->notificationShownAt.remove( oldest.key() );
         d->notifications.remove( oldest );
     }
     int id = ++d->notificationSerial;
     g_object_ref( notification );
     d->notifications.insert( id, notification );
+    d->notificationShownAt.insert( id, g_get_monotonic_time() );
     g_signal_connect( notification, "closed", G_CALLBACK( onNotificationClosed ), d );
     d->notificationsToShow.append( id );
     QTimer::singleShot( 0, d->q, SLOT( emitNotifications() ) );
@@ -1850,6 +1856,7 @@ void KWPEWidgetPrivate::onNotificationClosed( WebKitNotification* notification, 
         d->notifications.remove( it );
         g_object_unref( notification );
         d->notificationsToShow.remove( id );
+        d->notificationShownAt.remove( id );
         for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
             if ( ( *icon ).id == id ) {
                 d->notificationIcons.remove( icon );
@@ -1868,6 +1875,7 @@ void KWPEWidgetPrivate::forgetNotifications()
     }
     notifications.clear();
     notificationsToShow.clear();
+    notificationShownAt.clear();
     notificationIcons.clear();
     notificationToken = QString::null;
 }
@@ -1935,8 +1943,6 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
     int serial = jsc_value_is_number( serialValue ) ? jsc_value_to_int32( serialValue ) : 0;
     g_object_unref( serialValue );
     if ( kind == "pending" ) {
-        while ( d->notificationIcons.count() >= 20 )
-            d->notificationIcons.remove( d->notificationIcons.begin() );
         NotificationIcon icon;
         icon.serial = serial;
         icon.title = jsString( value, "title" );
@@ -1944,7 +1950,20 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
         icon.tag = jsString( value, "tag" );
         icon.id = 0;
         icon.done = false;
-        icon.announced.start();
+        icon.announced = g_get_monotonic_time();
+        if ( icon.title.length() > 4096 || icon.body.length() > 4096 || icon.tag.length() > 4096 )
+            return;
+        // At most 20: the oldest not yet given to a notification goes
+        // (the one a notification waits for stays: no announcement makes
+        // it wait longer, see emitNotifications()).
+        if ( d->notificationIcons.count() >= 20 ) {
+            QValueList<NotificationIcon>::Iterator it = d->notificationIcons.begin();
+            while ( it != d->notificationIcons.end() && ( *it ).id )
+                ++it;
+            if ( it == d->notificationIcons.end() )
+                return;
+            d->notificationIcons.remove( it );
+        }
         d->notificationIcons.append( icon );
     } else if ( kind == "icon" ) {
         for ( QValueList<NotificationIcon>::Iterator it = d->notificationIcons.begin(); it != d->notificationIcons.end(); ++it ) {
@@ -2788,10 +2807,10 @@ void KWPEWidget::activateNotification( int id )
 void KWPEWidget::emitNotifications()
 {
     // Pictures of notifications WebKit did not show (denied): gone.
+    gint64 now = g_get_monotonic_time();
     for ( QValueList<KWPEWidgetPrivate::NotificationIcon>::Iterator icon = d->notificationIcons.begin();
           icon != d->notificationIcons.end(); ) {
-        int age = ( *icon ).announced.elapsed();
-        if ( ( *icon ).id == 0 && ( age < 0 || age > 10000 ) )
+        if ( ( *icon ).id == 0 && now - ( *icon ).announced > 10 * G_USEC_PER_SEC )
             icon = d->notificationIcons.remove( icon );
         else
             ++icon;
@@ -2816,9 +2835,11 @@ void KWPEWidget::emitNotifications()
         if ( icon != d->notificationIcons.end() ) {
             ( *icon ).id = id;
             if ( !( *icon ).done ) {
-                int waited = ( *icon ).announced.elapsed();
-                if ( waited >= 0 && waited < 2000 ) {
-                    QTimer::singleShot( 2000 - waited + 10, this, SLOT( emitNotifications() ) );
+                // 2 seconds after WebKit showed it, fixed then.
+                gint64 shown = d->notificationShownAt.contains( id ) ? d->notificationShownAt[id] : now;
+                gint64 left = shown + 2 * G_USEC_PER_SEC - now;
+                if ( left > 0 ) {
+                    QTimer::singleShot( int( left / 1000 ) + 10, this, SLOT( emitNotifications() ) );
                     return;
                 }
             }
@@ -2826,6 +2847,7 @@ void KWPEWidget::emitNotifications()
             d->notificationIcons.remove( icon );
         }
         d->notificationsToShow.remove( d->notificationsToShow.begin() );
+        d->notificationShownAt.remove( id );
         emit notificationShown( id, title, body );
         if ( self )
             emit notificationShown( id, title, body, image );
