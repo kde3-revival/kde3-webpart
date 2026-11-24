@@ -54,8 +54,9 @@ struct Limits
  * Converts @p selection to @p target and reads it into @p data (format 8
  * data as bytes; format 32 items as 32-bit values in host order, e.g.
  * TARGETS).  @p time is the time of the user's request (ICCCM).
- * @p service, if given, gets the SelectionRequest/SelectionClear events of
- * other windows of this connection that arrive meanwhile.
+ * @p service, if given, gets the SelectionRequest events for PRIMARY and
+ * CLIPBOARD (owned by this program) that arrive meanwhile.  One read at a
+ * time: a nested call fails.
  */
 Result read( Display* dpy, Atom selection, Atom target, Time time, const Limits& limits,
              std::string& data, Atom* type = 0, int* format = 0, ServiceFunction service = 0 );

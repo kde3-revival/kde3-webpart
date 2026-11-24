@@ -14,6 +14,7 @@
 #include <X11/Xatom.h>
 
 #include <errno.h>
+#include <string.h>
 #include <poll.h>
 #include <stdint.h>
 #include <time.h>
@@ -75,34 +76,60 @@ Bool matches( Display*, XEvent* e, XPointer arg )
     return True;
 }
 
-Bool isSelectionTraffic( Display*, XEvent* e, XPointer arg )
+// Our own deletions (one per piece) and new values of the property seen
+// while not waiting for them: nobody else wants them, and left in the queue
+// every later scan walks them.
+Bool isNoise( Display*, XEvent* e, XPointer arg )
 {
-    Window own = *reinterpret_cast<Window*>( arg );
-    return ( e->type == SelectionRequest || e->type == SelectionClear ) && e->xany.window != own;
+    const Match* m = reinterpret_cast<const Match*>( arg );
+    return e->type == PropertyNotify && e->xany.window == m->window
+           && ( e->xproperty.state == PropertyDelete || m->type != PropertyNotify );
+}
+
+// Requests for our own PRIMARY/CLIPBOARD (another view's copy): whoever asks
+// may be waiting for us.  SelectionClear and the rest wait for the event
+// loop (handling them here would run Qt's dataChanged() slots, which read
+// the clipboard themselves, inside WebKit's read).
+struct Service
+{
+    Atom primary;
+    Atom clipboard;
+};
+
+Bool isSelectionRequest( Display*, XEvent* e, XPointer arg )
+{
+    const Service* s = reinterpret_cast<const Service*>( arg );
+    return e->type == SelectionRequest
+           && ( e->xselectionrequest.selection == s->primary || e->xselectionrequest.selection == s->clipboard );
 }
 
 // Waits for an event of m; false at the deadline.
 bool waitFor( Display* dpy, Match& m, XEvent* event, long long deadline, KWPEXSelection::ServiceFunction service )
 {
     XFlush( dpy );
+    Service selections = { XA_PRIMARY, XInternAtom( dpy, "CLIPBOARD", False ) };
     for ( ;; ) {
+        XEvent other;
+        while ( XCheckIfEvent( dpy, &other, isNoise, reinterpret_cast<XPointer>( &m ) ) )
+            ;
         if ( XCheckIfEvent( dpy, event, matches, reinterpret_cast<XPointer>( &m ) ) )
             return true;
-        if ( service ) {
-            XEvent other;
-            if ( XCheckIfEvent( dpy, &other, isSelectionTraffic, reinterpret_cast<XPointer>( &m.window ) ) ) {
-                service( &other );
-                XFlush( dpy );
-                continue;
-            }
+        if ( service && XCheckIfEvent( dpy, &other, isSelectionRequest, reinterpret_cast<XPointer>( &selections ) ) ) {
+            service( &other );
+            XFlush( dpy );
+            continue;
         }
         long long left = deadline - nowMs();
         if ( left <= 0 )
             return false;
-        // Wait for more on the socket.  An event that Xlib/XCB already read
-        // (while waiting for a property reply) does not wake poll(): seen
-        // as 3 s stalls with xclip, so the wait is short and looks again.
+        // Wait for more on the socket.  The checks above end with a flush,
+        // during which XCB may read events into its own queue: poll() does
+        // not see those (3 s stalls with xclip), so look again when the
+        // queue grew, and never wait longer than 10 ms at a time.
         // (Events of other windows stay queued for Qt: no busy loop on them.)
+        int queued = XEventsQueued( dpy, QueuedAlready );
+        if ( XEventsQueued( dpy, QueuedAfterReading ) > queued )
+            continue;
         struct pollfd fd;
         fd.fd = ConnectionNumber( dpy );
         fd.events = POLLIN;
@@ -131,8 +158,12 @@ bool takeProperty( Display* dpy, Window w, Atom property, std::string& data, Ato
         int actualFormat = 0;
         unsigned long count = 0, after = 0;
         unsigned char* value = 0;
-        // delete with the last part (Xlib deletes only when nothing is left)
-        if ( XGetWindowProperty( dpy, w, property, offset, 0x400000, True, AnyPropertyType, &actualType, &actualFormat,
+        // At most what may still come (one long more, to see "more than
+        // that" in after without fetching it); delete with the last part
+        // (Xlib deletes only when nothing is left).
+        size_t room = maxBytes > data.size() ? maxBytes - data.size() : 0;
+        long length = long( room / 4 + 1 < 0x400000 ? room / 4 + 1 : 0x400000 );
+        if ( XGetWindowProperty( dpy, w, property, offset, length, True, AnyPropertyType, &actualType, &actualFormat,
                                  &count, &after, &value ) != Success )
             return false;
         if ( actualType == None ) {
@@ -182,6 +213,15 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
         *type = None;
     if ( format )
         *format = 0;
+    // One read at a time: they share the requestor window and property.
+    static bool busy = false;
+    if ( busy )
+        return Failed;
+    struct Guard
+    {
+        Guard() { busy = true; }
+        ~Guard() { busy = false; }
+    } guard;
     if ( XGetSelectionOwner( dpy, selection ) == None )
         return Refused;
 
@@ -215,13 +255,10 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
     int actualFormat = 0;
     unsigned long items = 0;
     bool tooLarge = false;
-    // the INCR property is small: read without the limit, then check the announced size
     std::string first;
-    if ( !takeProperty( dpy, w, property, first, &actualType, &actualFormat, &items, ~size_t( 0 ), &tooLarge ) )
-        return Failed;
+    if ( !takeProperty( dpy, w, property, first, &actualType, &actualFormat, &items, limits.maxBytes, &tooLarge ) )
+        return tooLarge ? TooLarge : Failed;
     if ( actualType != incr ) {
-        if ( first.size() > limits.maxBytes )
-            return TooLarge;
         data.swap( first );
         if ( type )
             *type = actualType;
@@ -232,8 +269,9 @@ KWPEXSelection::Result KWPEXSelection::read( Display* dpy, Atom selection, Atom 
 
     // INCR: deleting the property (done by takeProperty) asks for the first
     // piece; every piece is a new value, an empty one ends the transfer.
-    if ( first.size() >= 4 ) {
-        uint32_t announced = *reinterpret_cast<const uint32_t*>( first.data() );
+    if ( actualFormat == 32 && first.size() >= 4 ) {
+        uint32_t announced;
+        memcpy( &announced, first.data(), sizeof( announced ) );
         if ( announced > limits.maxBytes ) {
             dropRequestor( dpy );
             return TooLarge;

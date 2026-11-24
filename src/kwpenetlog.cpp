@@ -35,21 +35,28 @@ void stamp( char* buffer, size_t size )
     snprintf( buffer, size, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, int( tv.tv_usec / 1000 ) );
 }
 
-// scheme://host/path: no query, no fragment, no user name
+// scheme://host:port/path: no query, no fragment, no user name; the path
+// as sent (percent-encoded, no control characters); data: and blob: only
+// as their scheme (the data, or another URL, is in the "path")
 gchar* shortURI( WebKitWebResource* resource )
 {
     const char* uri = webkit_web_resource_get_uri( resource );
     if ( !uri )
         return g_strdup( "?" );
-    GUri* parsed = g_uri_parse( uri, G_URI_FLAGS_NONE, 0 );
+    if ( g_str_has_prefix( uri, "data:" ) || g_str_has_prefix( uri, "blob:" ) )
+        return g_strndup( uri, 5 );
+    GUri* parsed = g_uri_parse( uri, G_URI_FLAGS_ENCODED, 0 );
     if ( !parsed )
-        return g_strndup( uri, strcspn( uri, "?#" ) );
+        return g_strdup( "(unparsable URL)" );
     const char* host = g_uri_get_host( parsed );
     int port = g_uri_get_port( parsed );
     gchar* portText = port > 0 ? g_strdup_printf( ":%d", port ) : g_strdup( "" );
     gchar* text = g_strdup_printf( "%s://%s%s%s", g_uri_get_scheme( parsed ), host ? host : "", portText, g_uri_get_path( parsed ) );
     g_free( portText );
     g_uri_unref( parsed );
+    for ( char* c = text; *c; ++c )
+        if ( (unsigned char) *c < 0x20 || *c == 0x7f )
+            *c = '?';
     if ( strlen( text ) > 160 )
         strcpy( text + 150, "..." );
     return text;

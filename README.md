@@ -204,7 +204,9 @@ same-document navigation and double every request, so:
   targets and after 3 s without progress / 10 s in all for the data
   (Qt 3 waited 5 s per step), only targets the owner offers are asked for,
   and the last image read is reused within the same paste (WebKit reads
-  it two or three times per paste).
+  it two or three times per paste).  Reads stop when the selection
+  changes hands after the key; a read slower than 300 ms keeps the
+  window open one second more (once).
 * **Page dialogs** are modal to the page only: non-modal windows, the
   page takes no input while one is open, they hide with their tab and
   come back with it, closing the tab answers them (cancel) before the

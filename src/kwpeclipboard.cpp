@@ -114,6 +114,9 @@ static WPEClipboardContent* s_localContent = 0; // WebKit's last copy (ref): pas
 static QClipboard::Mode s_pasteMode = QClipboard::Clipboard;
 static gint64 s_pasteUntil = 0;                 // reads allowed until then (a user paste)
 static gint64 s_pasteStart = 0;
+static Window s_pasteOwner = None;              // the selection's owner at the key
+static bool s_pasteExtended = false;            // the window was extended once (a slow read)
+static guint s_cacheTimer = 0;
 static bool s_updating = false;                 // our own changed() call
 static bool s_pasteOwn = false;                 // that selection is ours (Qt has its data, no X)
 static QValueList<QCString> s_offered;          // another program's targets for that paste
@@ -126,6 +129,22 @@ static void dropCache()
         g_bytes_unref( s_cachedBytes );
     s_cachedBytes = 0;
     s_cachedFormat = QCString();
+    if ( s_cacheTimer )
+        g_source_remove( s_cacheTimer );
+    s_cacheTimer = 0;
+}
+
+// Another program's data (a screenshot) is not kept after its paste.
+static gboolean cacheExpired( gpointer )
+{
+    s_cacheTimer = 0;
+    gint64 left = s_pasteUntil - g_get_monotonic_time();
+    if ( left > 0 ) {
+        s_cacheTimer = g_timeout_add( guint( left / 1000 ) + 50, cacheExpired, 0 );
+        return G_SOURCE_REMOVE;
+    }
+    dropCache();
+    return G_SOURCE_REMOVE;
 }
 
 // Another program's selection: its targets, and the data of a target, read
@@ -153,6 +172,12 @@ static bool ownsSelection( QClipboard::Mode mode )
     return mode == QClipboard::Selection ? cb->ownsSelection() : cb->ownsClipboard();
 }
 
+// (only the atom name requests run under this handler: BadAtom)
+static int ignoreAtomErrors( Display*, XErrorEvent* )
+{
+    return 0;
+}
+
 // The other program's targets; false if it does not answer.
 static bool readTargets( QClipboard::Mode mode, QValueList<QCString>& names )
 {
@@ -175,9 +200,23 @@ static bool readTargets( QClipboard::Mode mode, QValueList<QCString>& names )
     Atom* atoms = new Atom[count];
     for ( int i = 0; i < count; ++i )
         atoms[i] = Atom( reinterpret_cast<const uint32_t*>( data.data() )[i] );
+    // A bogus atom in the list (BadAtom) must not cost the others.
+    XSync( dpy, False );
+    XErrorHandler previous = XSetErrorHandler( ignoreAtomErrors );
     char** atomNames = new char*[count];
-    if ( XGetAtomNames( dpy, atoms, count, atomNames ) ) {
+    for ( int i = 0; i < count; ++i )
+        atomNames[i] = 0;
+    if ( !XGetAtomNames( dpy, atoms, count, atomNames ) ) {
         for ( int i = 0; i < count; ++i ) {
+            if ( atomNames[i] )
+                XFree( atomNames[i] );
+            atomNames[i] = atoms[i] != None ? XGetAtomName( dpy, atoms[i] ) : 0;
+        }
+    }
+    XSync( dpy, False );
+    XSetErrorHandler( previous );
+    for ( int i = 0; i < count; ++i ) {
+        if ( atomNames[i] ) {
             names.append( QCString( atomNames[i] ) );
             XFree( atomNames[i] );
         }
@@ -242,6 +281,15 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
         dropCache();   // that paste is over
         return 0;
     }
+    // What the user pasted, not what was copied after the key (text a
+    // password manager put there meanwhile).
+    if ( XGetSelectionOwner( qt_xdisplay(), selectionAtom( s_pasteMode ) ) != s_pasteOwner ) {
+        if ( debugging() )
+            fprintf( stderr, "kwpe: clipboard read %s: refused, the selection changed hands\n", format );
+        s_pasteUntil = 0;
+        dropCache();
+        return 0;
+    }
     QClipboard* cb = QApplication::clipboard();
     QCString data;
     if ( qstrnicmp( format, "text/plain", 10 ) == 0 ) {
@@ -277,11 +325,16 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
         dropCache();
         s_cachedFormat = name;
         s_cachedBytes = g_bytes_new( bytes.data(), bytes.size() );
-        // A slow owner (xclip sends 10 MB in about 3 s) used up the
-        // window: WebKit's further reads of this paste come right after.
+        // A slow owner (KSnapshot encodes a big screenshot, a pieces
+        // transfer) used up the window: WebKit's further reads of this
+        // paste come right after.  Once per paste.
         gint64 now = g_get_monotonic_time();
-        if ( now + G_USEC_PER_SEC > s_pasteUntil && now < s_pasteStart + 15 * G_USEC_PER_SEC )
+        if ( !s_pasteExtended && now - start > 300000 && now + G_USEC_PER_SEC > s_pasteUntil
+             && now < s_pasteStart + 15 * G_USEC_PER_SEC ) {
             s_pasteUntil = now + G_USEC_PER_SEC;
+            s_pasteExtended = true;
+        }
+        s_cacheTimer = g_timeout_add( guint( ( s_pasteUntil - now ) / 1000 ) + 50, cacheExpired, 0 );
         return g_bytes_ref( s_cachedBytes );
     }
     if ( data.isNull() )
@@ -380,6 +433,8 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
     s_pasteMode = mode;
     s_pasteStart = g_get_monotonic_time();
     s_pasteUntil = empty ? 0 : s_pasteStart + G_USEC_PER_SEC;
+    s_pasteExtended = false;
+    s_pasteOwner = XGetSelectionOwner( qt_xdisplay(), selectionAtom( mode ) );
     s_updating = true;
     WPE_CLIPBOARD_GET_CLASS( s_clipboard )->changed( s_clipboard, formats, FALSE, 0 );
     s_updating = false;

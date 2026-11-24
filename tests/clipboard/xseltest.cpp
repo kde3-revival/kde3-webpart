@@ -19,7 +19,7 @@
 //   silent         no answer at all: Timeout after the idle time
 //   incr stall     INCR, then no more pieces: Timeout, the next read works
 //   refused        an unknown target: Refused at once
-//   too large      INCR announcing more than the limit: TooLarge
+//   too large      one property / INCR announcing more than the limit
 //   slow pieces    INCR pieces 100 ms apart: Ok (progress keeps it going)
 //   total          INCR pieces 300 ms apart, total limit 1 s: Timeout
 
@@ -259,6 +259,19 @@ int main( int argc, char** argv )
     run = readPng( dpy, limits );
     snprintf( detail, sizeof( detail ), "%s, %u bytes, %lld ms", KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ), run.ms );
     check( run.result == KWPEXSelection::Ok && run.data == payload( 300000 ), "read after a stall", detail );
+    stopOwner( pid );
+
+    // one property larger than the limit: refused without fetching it all
+    pid = startOwner( argv[1], Serve, 200000 );
+    {
+        const KWPEXSelection::Limits small = { 1000, 5000, 100000 };
+        run = readPng( dpy, small );
+        snprintf( detail, sizeof( detail ), "%s, %u bytes, %lld ms", KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ), run.ms );
+        check( run.result == KWPEXSelection::TooLarge && run.data.empty(), "too large, one property", detail );
+        run = readPng( dpy, limits );
+        snprintf( detail, sizeof( detail ), "%s, %u bytes", KWPEXSelection::resultName( run.result ), unsigned( run.data.size() ) );
+        check( run.result == KWPEXSelection::Ok && run.data == payload( 200000 ), "next read", detail );
+    }
     stopOwner( pid );
 
     pid = startOwner( argv[1], Huge, 1000000 );
