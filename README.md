@@ -196,7 +196,15 @@ same-document navigation and double every request, so:
   the web process asks, so other programs' data is served only during a
   paste the user started (the key or the click opens a one second
   window); scripts cannot paste (`javascript-can-access-clipboard` off,
-  DOM paste access denied by WPE).
+  DOM paste access denied by WPE).  WebKit waits for every read (and so
+  does the window), so another program's targets and data are read by
+  `kwpexselection.cpp`, not by Qt 3: INCR for large data (a screenshot
+  PNG of several MB arrives in pieces of about 256 KB; Qt 3 slept 50 ms
+  per piece), waits on the X connection, gives up after 2 s for the
+  targets and after 3 s without progress / 10 s in all for the data
+  (Qt 3 waited 5 s per step), only targets the owner offers are asked for,
+  and the last image read is reused within the same paste (WebKit reads
+  it two or three times per paste).
 * **Page dialogs** are modal to the page only: non-modal windows, the
   page takes no input while one is open, they hide with their tab and
   come back with it, closing the tab answers them (cancel) before the
@@ -455,7 +463,11 @@ PDF for `application/pdf`); its log says whether KIO or WebKit asked.
 of the same and of another site, with blocking off for the site, and on a
 site without scriptlets).
 Pages for stage 3: `probe.html` (PDF, archive, attachment, mailto:),
-`paste.html`, `upload.html`, `dialogs.html`.
+`paste.html`, `upload.html`, `dialogs.html`; `pasteimage.html` (a pasted
+screenshot: the file, shown and scaled, while a counter keeps running).
+`tests/clipboard/run.sh DISPLAY BUILD_DIR` runs `xseltest`: the X
+selection reader against owners that behave and that do not (silent,
+stalled INCR, too large).
 
 Xephyr has no DRI3, so it exercises the SHM path.  A rootful Xwayland
 in a headless compositor has DRI3 and Present (glamor) and exercises the

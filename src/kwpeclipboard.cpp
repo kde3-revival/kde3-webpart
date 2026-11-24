@@ -24,7 +24,12 @@
 #include <qvaluelist.h>
 
 #include "kwpeclipboard.h"
+#include "kwpexselection.h"
 #include "wpex11platform.h"
+
+#include <X11/Xatom.h>
+
+extern Time qt_x_time;
 
 // ---------------------------------------------------------------------
 // What WebKit copied, for the X CLIPBOARD
@@ -109,6 +114,85 @@ static WPEClipboardContent* s_localContent = 0; // WebKit's last copy (ref): pas
 static QClipboard::Mode s_pasteMode = QClipboard::Clipboard;
 static gint64 s_pasteUntil = 0;                 // reads allowed until then (a user paste)
 static bool s_updating = false;                 // our own changed() call
+static bool s_pasteOwn = false;                 // that selection is ours (Qt has its data, no X)
+static QValueList<QCString> s_offered;          // another program's targets for that paste
+static QCString s_cachedFormat;                 // WebKit reads an image more than once per paste:
+static GBytes* s_cachedBytes = 0;               // the last one read in this paste (ref)
+
+static void dropCache()
+{
+    if ( s_cachedBytes )
+        g_bytes_unref( s_cachedBytes );
+    s_cachedBytes = 0;
+    s_cachedFormat = QCString();
+}
+
+// Another program's selection: its targets, and the data of a target, read
+// by KWPEXSelection (INCR, bounded waits).  WebKit waits for every read, and
+// so does Konqueror's window.
+static const KWPEXSelection::Limits targetsLimits = { 2000, 2000, 64 * 1024 };
+static const KWPEXSelection::Limits dataLimits = { 3000, 10000, 64 * 1024 * 1024 };
+
+static Atom selectionAtom( QClipboard::Mode mode )
+{
+    return mode == QClipboard::Selection ? XA_PRIMARY : XInternAtom( qt_xdisplay(), "CLIPBOARD", False );
+}
+
+// Requests to our own selections (e.g. another tab's copy, still in the
+// CLIPBOARD) while we wait: Qt answers them.
+static void serviceEvent( XEvent* event )
+{
+    if ( qApp )
+        qApp->x11ProcessEvent( event );
+}
+
+static bool ownsSelection( QClipboard::Mode mode )
+{
+    QClipboard* cb = QApplication::clipboard();
+    return mode == QClipboard::Selection ? cb->ownsSelection() : cb->ownsClipboard();
+}
+
+// The other program's targets; false if it does not answer.
+static bool readTargets( QClipboard::Mode mode, QValueList<QCString>& names )
+{
+    Display* dpy = qt_xdisplay();
+    if ( XGetSelectionOwner( dpy, selectionAtom( mode ) ) == None )
+        return false;
+    std::string data;
+    int format = 0;
+    gint64 start = g_get_monotonic_time();
+    KWPEXSelection::Result result = KWPEXSelection::read( dpy, selectionAtom( mode ), XInternAtom( dpy, "TARGETS", False ),
+                                                          qt_x_time, targetsLimits, data, 0, &format, serviceEvent );
+    if ( debugging() )
+        fprintf( stderr, "kwpe: clipboard targets: %s, %u byte(s) in %d ms\n", KWPEXSelection::resultName( result ),
+                 unsigned( data.size() ), int( ( g_get_monotonic_time() - start ) / 1000 ) );
+    if ( result != KWPEXSelection::Ok || format != 32 )
+        return result == KWPEXSelection::Refused;   // no TARGETS (an old program): text is tried
+    int count = int( data.size() / 4 );
+    if ( count <= 0 )
+        return true;
+    Atom* atoms = new Atom[count];
+    for ( int i = 0; i < count; ++i )
+        atoms[i] = Atom( reinterpret_cast<const uint32_t*>( data.data() )[i] );
+    char** atomNames = new char*[count];
+    if ( XGetAtomNames( dpy, atoms, count, atomNames ) ) {
+        for ( int i = 0; i < count; ++i ) {
+            names.append( QCString( atomNames[i] ) );
+            XFree( atomNames[i] );
+        }
+    }
+    delete[] atomNames;
+    delete[] atoms;
+    return true;
+}
+
+static const char* offeredName( const char* format )
+{
+    for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); it != s_offered.end(); ++it )
+        if ( qstricmp( *it, format ) == 0 )
+            return ( *it ).data();
+    return 0;
+}
 
 // WebKit's own copies (is_local) go to the X CLIPBOARD.
 static void kwpeClipboardChanged( WPEClipboard* clipboard, GPtrArray* formats, gboolean isLocal, WPEClipboardContent* content )
@@ -153,8 +237,10 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
 {
     if ( debugging() )
         fprintf( stderr, "kwpe: clipboard read %s: %s\n", format, g_get_monotonic_time() > s_pasteUntil ? "refused" : "allowed" );
-    if ( !qApp || g_get_monotonic_time() > s_pasteUntil || !format )
+    if ( !qApp || g_get_monotonic_time() > s_pasteUntil || !format ) {
+        dropCache();   // that paste is over
         return 0;
+    }
     QClipboard* cb = QApplication::clipboard();
     QCString data;
     if ( qstrnicmp( format, "text/plain", 10 ) == 0 ) {
@@ -162,12 +248,35 @@ static GBytes* kwpeClipboardRead( WPEClipboard*, const char* format )
     } else if ( qstricmp( format, "text/html" ) == 0 ) {
         QCString subtype = "html";
         data = cb->text( subtype, s_pasteMode ).utf8();
-    } else {
+    } else if ( s_pasteOwn ) {
         QMimeSource* source = cb->data( s_pasteMode );
         QByteArray bytes = source ? source->encodedData( format ) : QByteArray();
         if ( bytes.isEmpty() )
             return 0;
         return g_bytes_new( bytes.data(), bytes.size() );
+    } else {
+        // Only what the owner offers (WebKit also asks for its own private
+        // type): a target it does not know costs a round trip, or the whole
+        // wait if it does not answer.
+        const char* name = offeredName( format );
+        if ( !name )
+            return 0;
+        if ( s_cachedBytes && s_cachedFormat == name )
+            return g_bytes_ref( s_cachedBytes );
+        Display* dpy = qt_xdisplay();
+        std::string bytes;
+        gint64 start = g_get_monotonic_time();
+        KWPEXSelection::Result result = KWPEXSelection::read( dpy, selectionAtom( s_pasteMode ), XInternAtom( dpy, name, False ),
+                                                              qt_x_time, dataLimits, bytes, 0, 0, serviceEvent );
+        if ( debugging() )
+            fprintf( stderr, "kwpe: clipboard %s: %s, %u byte(s) in %d ms\n", name, KWPEXSelection::resultName( result ),
+                     unsigned( bytes.size() ), int( ( g_get_monotonic_time() - start ) / 1000 ) );
+        if ( result != KWPEXSelection::Ok || bytes.empty() )
+            return 0;
+        dropCache();
+        s_cachedFormat = name;
+        s_cachedBytes = g_bytes_new( bytes.data(), bytes.size() );
+        return g_bytes_ref( s_cachedBytes );
     }
     if ( data.isNull() )
         return 0;
@@ -181,6 +290,7 @@ static void kwpeClipboardDispose( GObject* object )
         if ( s_localContent )
             wpe_clipboard_content_unref( s_localContent );
         s_localContent = 0;
+        dropCache();
     }
     G_OBJECT_CLASS( kwpe_clipboard_x11_parent_class )->dispose( object );
 }
@@ -210,6 +320,7 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
 {
     if ( !s_clipboard || !qApp )
         return false;
+    dropCache();
     QClipboard* cb = QApplication::clipboard();
     QMimeSource* source = cb->data( mode );
     // WebKit's own copy, still in the X CLIPBOARD: WebKit pastes it from
@@ -227,11 +338,24 @@ bool KWPEClipboard::preparePaste( QClipboard::Mode mode )
 
     // The formats WebKit sees: text (both of WebKit's names), HTML, URI
     // lists and images; not every private format of other programs.
+    // Another program's targets are read here directly (Qt 3 would wait 5 s
+    // for an owner that does not answer, and claim text then).
+    s_pasteOwn = ownsSelection( mode );
+    s_offered.clear();
+    if ( s_pasteOwn ) {
+        for ( int i = 0; source && source->format( i ); ++i )
+            s_offered.append( QCString( source->format( i ) ) );
+    } else if ( !readTargets( mode, s_offered ) ) {
+        s_offered.clear();   // no owner, or it does not answer: nothing to paste
+    } else if ( s_offered.isEmpty() ) {
+        s_offered.append( "text/plain" );
+    }
     GPtrArray* formats = g_ptr_array_new();
     bool text = false;
-    for ( int i = 0; source && source->format( i ); ++i ) {
-        const char* format = source->format( i );
-        if ( qstrnicmp( format, "text/plain", 10 ) == 0 )
+    for ( QValueList<QCString>::ConstIterator it = s_offered.begin(); it != s_offered.end(); ++it ) {
+        const char* format = ( *it ).data();
+        if ( qstrnicmp( format, "text/plain", 10 ) == 0 || qstrcmp( format, "UTF8_STRING" ) == 0
+             || qstrcmp( format, "STRING" ) == 0 || qstrcmp( format, "TEXT" ) == 0 || qstrcmp( format, "COMPOUND_TEXT" ) == 0 )
             text = true;
         else if ( ( qstricmp( format, "text/html" ) == 0 || qstricmp( format, "text/uri-list" ) == 0
                     || qstrnicmp( format, "image/", 6 ) == 0 ) )

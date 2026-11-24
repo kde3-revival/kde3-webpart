@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html><head><title>paste an image</title>
+<style> textarea, #rich { display: block; width: 600px; height: 100px; margin: 8px 0; border: 1px solid #888; }
+  #log { font: 12px monospace; white-space: pre; } img { max-width: 200px; } </style>
+</head><body>
+<h3>Paste an image (Ctrl+V) into a box</h3>
+<textarea id="area" placeholder="Ctrl+V here"></textarea>
+<div id="rich" contenteditable="true"></div>
+<div>the page is alive: <span id="beat">0</span></div>
+<div id="log"></div>
+<script>
+// What a chat web app does with a pasted screenshot: the file from the
+// paste event, read, shown, scaled on a canvas.  The counter must keep
+// running while it happens.
+function log(s) { document.getElementById('log').textContent += s + '\n'; }
+var n = 0;
+setInterval(function () { document.getElementById('beat').textContent = ++n; }, 250);
+document.addEventListener('paste', function (e) {
+  var dt = e.clipboardData, t0 = performance.now();
+  log('paste: types [' + Array.prototype.join.call(dt.types, ', ') + '], ' + dt.files.length + ' file(s)');
+  Array.prototype.forEach.call(dt.files, function (f) {
+    log('  ' + f.name + ' ' + f.type + ' ' + f.size + ' bytes');
+    var img = new Image();
+    img.onload = function () {
+      log('  shown ' + img.naturalWidth + 'x' + img.naturalHeight);
+      var c = document.createElement('canvas'), s = Math.min(1, 1000 / Math.max(img.naturalWidth, img.naturalHeight));
+      c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      c.toBlob(function (b) { log('  scaled to ' + c.width + 'x' + c.height + ', ' + (b ? b.size : 0) + ' bytes'); }, 'image/jpeg', 0.9);
+    };
+    img.src = URL.createObjectURL(f);
+    document.body.appendChild(img);
+  });
+  log('  handler done in ' + Math.round(performance.now() - t0) + ' ms');
+});
+</script>
+</body></html>
