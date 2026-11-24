@@ -1828,13 +1828,17 @@ bool KWPEWidgetPrivate::isAppDocument( const char* uri ) const
 gboolean KWPEWidgetPrivate::onShowNotification( WebKitWebView*, WebKitNotification* notification, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
-    // A long-running page: the oldest go (their clicks do nothing then),
-    // reported closed to the host (outside WebKit's signal).
+    // A long-running page: the oldest go, closed in WebKit too (its
+    // provider keeps every notification until it is closed; the page gets
+    // its close event), reported closed to the host once (outside
+    // WebKit's signal: our "closed" handler is off first).
     while ( d->notifications.count() >= 100 ) {
         QMap<int, WebKitNotification*>::Iterator oldest = d->notifications.begin();
         int old = oldest.key();
-        g_signal_handlers_disconnect_by_data( oldest.data(), d );
-        g_object_unref( oldest.data() );
+        WebKitNotification* evicted = oldest.data();
+        g_signal_handlers_disconnect_by_data( evicted, d );
+        webkit_notification_close( evicted );
+        g_object_unref( evicted );
         d->notificationShownAt.remove( old );
         d->notificationsToShow.remove( old );
         for ( QValueList<NotificationIcon>::Iterator icon = d->notificationIcons.begin(); icon != d->notificationIcons.end(); ++icon )
