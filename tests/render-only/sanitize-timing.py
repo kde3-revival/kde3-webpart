@@ -14,10 +14,11 @@
 # may hold 256 MB at most), its output under 8 MB plus 8 times the input
 # (reconstructed formatting elements copy their attributes: a long one
 # cloned for every word must not make gigabytes).
-# Then the CPU time limit (2 s plus 0.25 us per byte), the net under the
-# estimate: a shape the estimate does not count (Gumbo's search for a
-# duplicate attribute, quadratic in the attributes of a tag) shown as
-# source text within that limit, abandoned for time (not for memory).
+# Then the CPU time limit (2 s plus 0.25 us per byte, 4 s at most), the
+# net under the estimate: a shape the estimate does not count (Gumbo
+# comparing the attributes of a new formatting element with those in its
+# list, byte by byte) shown as source text within that limit, abandoned
+# for time (not for memory).
 # Last, with the limit lowered to 1 ms, an ordinary message must be
 # shown as source text.  Exit 0 if all passed.
 import os, re, subprocess, sys, time
@@ -112,6 +113,10 @@ cases = [
     ('p-flood-8M', SOURCE, '<p>' * (8 * MB // 3)),
     ('br-flood-20M', SOURCE, '<br>' * (20 * MB // 4)),
     ('a-flood-20M', SOURCE, '<a>' * (20 * MB // 3)),
+    # Gumbo looks for a duplicate of each attribute among those before it
+    # in the tag: quadratic (once 7.7 s for 21 MB, the CPU limit's)
+    ('duplicate-attributes-21M', SOURCE,
+     '<b ' + ' '.join('a%d' % i for i in range(30000)) + ' a29999' * 3000000 + '>x'),
     # ordinary: parsed (nesting below the bound; KMail's plain text)
     ('nested-div-1500', PARSED, '<div>' * 1500 + 'x' + '</div>' * 1500),
     ('kmail-2300-lines', PARSED, kmail(2300)),
@@ -179,24 +184,25 @@ for name, expected, doc in cases:
     failed |= bool(why)
     print('%-4s %-30s %8d bytes %7.1f ms %4d MB %9d out %s%s' % ('FAIL' if why else 'ok', name, len(data), ms,
           rss(p), len(out), verdict, (' -> ' + ', '.join(why)) if why else ''))
-# the safety net under the estimate: 20000 attributes in a tag, then the
-# last one 300000 times (each compared with all before it), which the
-# estimate does not count: abandoned by the CPU time limit (within it and
-# a second), not by the allocation budget or the memory bound
-names = ['a%d' % i for i in range(20000)]
-data = ('<b ' + ' '.join(names) + (' ' + names[-1]) * 300000 + '>x').encode()
+# the safety net under the estimate: 8000 nested <b>, each with a style
+# of 2500 bytes differing in its last characters; Gumbo compares each
+# new one with all in its list (the Noah's Ark clause), byte by byte,
+# which the estimate does not count: abandoned by the CPU time limit
+# (within it and 2 s for the rest), not by the allocation budget or the
+# memory bound
+data = (''.join('<b style="%s%d">' % ('x' * 2500, i) for i in range(8000)) + 'x').encode()
 p, ms = run(data)
-cpuLimit = 2000 + 0.25e-3 * len(data)
+cpuLimit = min(2000 + 0.25e-3 * len(data), 4000)
 why = bounds(p, data)
 if p.returncode != 0 or FALLBACK not in p.stdout:
     why.append('expected: source text (exit %d)' % p.returncode)
-if ms > cpuLimit + 1000:
-    why.append('%.0f ms > %.0f ms' % (ms, cpuLimit + 1000))
+if ms > cpuLimit + 2000:
+    why.append('%.0f ms > %.0f ms' % (ms, cpuLimit + 2000))
 m = re.search(rb'parse abandoned: allocated (\d+) of (\d+), held (\d+) at most', p.stderr)
 if not m or int(m.group(1)) > int(m.group(2)) or int(m.group(3)) > 256 * MB:
     why.append('not abandoned for time')
 failed |= bool(why)
-print('%-4s %-30s %8d bytes %7.1f ms %4d MB %9d out %s%s' % ('FAIL' if why else 'ok', 'duplicate-attributes-cpu-limit',
+print('%-4s %-30s %8d bytes %7.1f ms %4d MB %9d out %s%s' % ('FAIL' if why else 'ok', 'formatting-attributes-cpu-limit',
       len(data), ms, rss(p), len(p.stdout), SOURCE if FALLBACK in p.stdout else PARSED,
       (' -> ' + ', '.join(why)) if why else ''))
 # the same net, lowered to 1 ms by the test tool

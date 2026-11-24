@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -1177,6 +1180,7 @@ private:
     {
         std::string name;
         std::string tag;       // the start tag as written (for the Noah's Ark clause)
+        size_t hash;           // of tag (most compare unequal at once, however long)
         size_t attributes;     // in it
         unsigned long serial;  // its element; 0: a marker
         bool open;             // its element is on the stack
@@ -1186,6 +1190,9 @@ private:
     // a character makes Gumbo search the stack: the list ends with an element
     bool searchesStack() const { return m_fakeFormatting || ( !m_list.empty() && m_list.back().serial != 0 ); }
     void charge() { m_work += double( m_stack.size() + m_list.size() ); }
+    // Gumbo compares each attribute's name with those before it in the
+    // tag (to drop a duplicate): a tag with a attributes, a(a-1)/2 steps
+    void chargeAttributes( size_t a ) { m_work += double( a ) * double( a ? a - 1 : 0 ) / 2; }
     void text( size_t length );
     size_t tagEnd( size_t pos, bool* fontAttributes = 0, bool* selfClosing = 0, size_t* attributes = 0 ) const;
     size_t rawEnd( size_t pos, const std::string& name, size_t& endTag, bool& unsure );
@@ -1351,8 +1358,9 @@ void ParseCost::addFormatting( const std::string& name, const std::string& tag, 
 {
     // Noah's Ark: three alike after the last marker at most
     size_t alike = 0, earliest = 0;
+    size_t hash = std::hash<std::string>()( tag );
     for ( size_t i = m_list.size(); i-- > 0 && m_list[i].serial != 0; )
-        if ( m_list[i].tag == tag ) {
+        if ( m_list[i].hash == hash && m_list[i].tag == tag ) {
             ++alike;
             earliest = i;
         }
@@ -1361,6 +1369,7 @@ void ParseCost::addFormatting( const std::string& name, const std::string& tag, 
     Entry f;
     f.name = name;
     f.tag = tag;
+    f.hash = hash;
     f.attributes = attributes;
     f.serial = m_stack.back().serial;
     f.open = true;
@@ -1619,6 +1628,7 @@ void ParseCost::startTag( const std::string& name, size_t begin, size_t end, boo
     if ( flags & Marker ) {
         Entry m;
         m.attributes = 0;
+        m.hash = 0;
         m.serial = 0;
         m.open = false;
         m_list.push_back( m );
@@ -1874,6 +1884,7 @@ bool ParseCost::run()
             size_t end = tagEnd( pos, name == "font" ? &fontAttributes : 0, &selfClosing, &attributes );
             if ( end == std::string::npos )
                 break;   // the input ends in the tag: it is dropped
+            chargeAttributes( attributes );
             startTag( name, lt, end, fontAttributes, selfClosing, attributes );
             i = end;
             if ( ( elementFlags( name ) & Raw ) && !m_stack.empty() && m_stack.back().name == name ) {
@@ -1901,9 +1912,11 @@ bool ParseCost::run()
                     m_stack.erase( m_stack.begin() + long( element ) );   // the start tags in it stay
                 else
                     popTo( element );
-                end = tagEnd( endTagName );
+                size_t attributes = 0;
+                end = tagEnd( endTagName, 0, 0, &attributes );
                 if ( end == std::string::npos )
                     break;
+                chargeAttributes( attributes );
                 i = end;
             }
         } else if ( c == '/' ) {
@@ -1914,9 +1927,11 @@ bool ParseCost::run()
             if ( isAlpha( h[i + 1] ) ) {
                 size_t pos = i + 1;
                 std::string name = tagName( pos );
-                size_t end = tagEnd( pos );
+                size_t attributes = 0;
+                size_t end = tagEnd( pos, 0, 0, &attributes );
                 if ( end == std::string::npos )
                     break;
+                chargeAttributes( attributes );
                 endTag( name );
                 i = end;
             } else if ( h[i + 1] == '>' )
@@ -2013,11 +2028,14 @@ static void escapeSource( std::string& out, const std::string& text )
 // safety net under the estimate (ParseCost), should Gumbo find work it
 // does not foresee.  An ordinary message stays far below it (7.5 MB of
 // KMail's plain text HTML: 0.4 s, 3.9 s allowed; the time per byte allowed
-// is 4-5 times what that takes, for slower or throttled machines); every
+// is 4-5 times what that takes, for slower or throttled machines), but
+// never more than maxParseCpuTotal (what the net lets a hostile message
+// hold KMail's thread for, whatever its size); every
 // 64th allocation looks at the clock, so the net holds where Gumbo
 // allocates (every tag does), not within one long run of text.
 static const double maxParseCpu = 2.0;
 static const double maxParseCpuPerByte = 0.25e-6;
+static const double maxParseCpuTotal = 4.0;
 
 // What the sanitized document may grow to (sanitizeHtml()).
 static const size_t maxOutput = 8 * 1024 * 1024;
@@ -2150,7 +2168,7 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * cost.elements() + 256 * cost.attributes() +
                    512 * cost.clones() + 2 * cost.cloneBytes();
     arena.calls = 0;
-    double cpuLimit = maxParseCpu + maxParseCpuPerByte * double( html.size() );
+    double cpuLimit = std::min( maxParseCpu + maxParseCpuPerByte * double( html.size() ), maxParseCpuTotal );
 #ifdef KWPE_SANITIZE_TESTING
     // the test tool alone (tests/render-only/kwpe-sanitize) may lower it
     const char* ms = getenv( "KWPE_SANITIZE_CPU_LIMIT_MS" );
