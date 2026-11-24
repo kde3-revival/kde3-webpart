@@ -14,6 +14,7 @@
 #include <gumbo.h>
 
 #include <setjmp.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1994,8 +1995,10 @@ static void escapeSource( std::string& out, const std::string& text )
     size_t limit = out.size() + 4 * 1024 * 1024 + 2 * text.size();
     for ( size_t i = 0; i < text.size(); ++i ) {
         if ( out.size() >= limit ) {
-            // not in the middle of a character
-            while ( i > 0 && ( static_cast<unsigned char>( text[i] ) & 0xc0 ) == 0x80 ) {
+            // not in the middle of a character (of at most 4 bytes: a
+            // longer run of continuation bytes is no character)
+            for ( int back = 0; back < 3 && i > 0 && ( static_cast<unsigned char>( text[i] ) & 0xc0 ) == 0x80;
+                  ++back ) {
                 --i;
                 out.erase( out.size() - 1 );
             }
@@ -2018,9 +2021,9 @@ static void escapeSource( std::string& out, const std::string& text )
 // a budget of what Gumbo may allocate (in all, freed or not): beyond it
 // the parse is abandoned (longjmp out of Gumbo, which is C: no destructors
 // are skipped; every block it holds is in the list "blocks") and the
-// document is shown as its source text.  So it is too beyond
-// maxGumboMemory held at once, whatever the document (each block counted
-// with the list's header and malloc's), and when malloc fails.
+// document is shown as its source text.  So it is too beyond what Gumbo
+// may hold at once (each block counted with the list's header and
+// malloc's: see maxHeld), and when malloc fails.
 //
 // The same happens when the parse and the walk have taken more than
 // maxParseCpu seconds plus maxParseCpuPerByte per byte of input of this
@@ -2041,13 +2044,20 @@ static const double maxParseCpuTotal = 4.0;
 static const size_t maxOutput = 8 * 1024 * 1024;
 static const size_t maxOutputPerByte = 8;
 
-// 256 MB: ordinary mail stays far below (KMail's HTML of a 7.5 MB log
-// holds 50 MB at most; of 200000 one-character lines, 4.4 MB, 75 MB).
-static const size_t maxGumboMemory = 256 * 1024 * 1024;
+// What Gumbo may hold at once: maxHeld plus maxHeldPerByte per byte of
+// input, maxHeldTotal at most.  KMail's plain text holds 36 bytes per byte
+// of one-character lines (780 per line), less for longer ones: a 7.5 MB
+// log (100000 lines) 84 MB; 300000 one-character lines (6.6 MB) 235 MB,
+// 400000 (8.8 MB) 312 MB, of 550 allowed; 640000 (14 MB) 501 MB.  Empty
+// elements take more, 75 bytes per byte of "<br>", 80-120 of "<p>": a
+// flood of them stops at half of what it would hold or at maxHeldTotal.
+static const size_t maxHeld = 128 * 1024 * 1024;
+static const size_t maxHeldPerByte = 48;
+static const size_t maxHeldTotal = 512 * 1024 * 1024;
 
-// Each block Gumbo gets is preceded by a Block (32 bytes: what follows
-// stays aligned as malloc's), in a list: no allocation of ours that could
-// fail within Gumbo.
+// Each block Gumbo gets is preceded by a Block (32 bytes on LP64, a
+// multiple of malloc's alignment: what follows stays aligned), in a list:
+// no allocation of ours that could fail within Gumbo.
 struct Block
 {
     Block* prev;
@@ -2058,6 +2068,7 @@ struct Block
 // what a block costs beyond its size: the Block, malloc's header and
 // rounding
 static const size_t blockOverhead = sizeof( Block ) + 16;
+static_assert( sizeof( Block ) % alignof( max_align_t ) == 0, "a block's header keeps malloc's alignment" );
 
 struct Allocations
 {
@@ -2065,6 +2076,7 @@ struct Allocations
     size_t allocated;   // in all, freed or not
     size_t budget;
     size_t held;   // now, with blockOverhead each
+    size_t maxHeld;
     size_t peak;
     unsigned calls;
     double cpuDeadline;
@@ -2076,7 +2088,7 @@ static void* allocate( void* userdata, size_t size )
     Allocations* a = static_cast<Allocations*>( userdata );
     a->allocated += size;
     a->held += size + blockOverhead;
-    if ( a->allocated > a->budget || a->held > maxGumboMemory )
+    if ( a->allocated > a->budget || a->held > a->maxHeld )
         longjmp( a->abandon, 1 );
     if ( ( ++a->calls & 63 ) == 0 && threadCpuSeconds() > a->cpuDeadline )
         longjmp( a->abandon, 1 );
@@ -2157,6 +2169,7 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     arena.blocks = 0;
     arena.allocated = 0;
     arena.held = 0;
+    arena.maxHeld = std::min( maxHeld + maxHeldPerByte * html.size(), maxHeldTotal );
     arena.peak = 0;
     // Gumbo makes an element for each start tag that is not ignored
     // (175-500 bytes with its attributes and text: KMail's plain text, one

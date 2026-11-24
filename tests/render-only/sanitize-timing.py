@@ -10,8 +10,9 @@
 # else), as expected where a verdict is expected: what the parser would
 # work on too long (or allocate too much for) shown as source text, the
 # ordinary ones parsed; the source text must keep a NUL's neighbours.
-# Every run's peak RSS must stay under 320 MB plus twice the input (Gumbo
-# may hold 256 MB at most), its output under 8 MB plus 8 times the input
+# Every run's peak RSS must stay under what Gumbo may hold (128 MB plus 48
+# bytes per byte of input, 512 MB at most) plus 64 MB and twice the
+# input, its output under 8 MB plus 8 times the input
 # (reconstructed formatting elements copy their attributes: a long one
 # cloned for every word must not make gigabytes).
 # Then the CPU time limit (2 s plus 0.25 us per byte, 4 s at most), the
@@ -124,6 +125,9 @@ cases = [
     ('kmail-100000-lines', PARSED, kmail(100000)),
     ('kmail-200000-empty-lines', PARSED, kmail(200000, lambda i: '<br>')),
     ('kmail-200000-short-lines', PARSED, kmail(200000, lambda i: '<div dir="ltr">%d</div>' % i)),
+    # about 780 bytes held per line (of one character), allowed 48 per byte
+    ('kmail-300000-1-char-lines', PARSED, kmail(300000, lambda i: '<div dir="ltr">x</div>')),
+    ('kmail-400000-1-char-lines', PARSED, kmail(400000, lambda i: '<div dir="ltr">x</div>')),
 ]
 
 
@@ -143,7 +147,7 @@ def bounds(p, data):
     m = re.search(rb'VmHWM:\s*(\d+) kB', p.stderr)
     if not m:
         why.append('no peak RSS')
-    elif int(m.group(1)) * 1024 > 320 * MB + 2 * len(data):
+    elif int(m.group(1)) * 1024 > min(128 * MB + 48 * len(data), 512 * MB) + 64 * MB + 2 * len(data):
         why.append('peak RSS %d MB' % (int(m.group(1)) // 1024))
     if len(p.stdout) > 8 * MB + 8 * len(data):
         why.append('output %d bytes' % len(p.stdout))
