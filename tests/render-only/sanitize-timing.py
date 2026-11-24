@@ -10,8 +10,9 @@
 # else), as expected where a verdict is expected: what the parser would
 # work on too long (or allocate too much for) shown as source text, the
 # ordinary ones parsed; the source text must keep a NUL's neighbours.
-# Exit 0 if all passed.
-import subprocess, sys, time
+# Last, with the parse's CPU time limit lowered to 1 ms, an ordinary
+# message must be shown as source text.  Exit 0 if all passed.
+import os, subprocess, sys, time
 
 tool = sys.argv[1]
 limit = float(sys.argv[2]) if len(sys.argv) > 2 else 100.0
@@ -96,9 +97,10 @@ cases = [
 ]
 
 
-def run(data):
+def run(data, env=None):
     start = time.monotonic()
-    p = subprocess.run([tool, 'html', 'content', 'render-only'], input=data, capture_output=True, timeout=120)
+    p = subprocess.run([tool, 'html', 'content', 'render-only'], input=data, capture_output=True, timeout=120,
+                       env=env)
     return p, (time.monotonic() - start) * 1000
 
 
@@ -130,5 +132,13 @@ for name, expected, doc in cases:
     failed |= bool(why)
     print('%-4s %-30s %8d bytes %7.1f ms %s%s' % ('FAIL' if why else 'ok', name, len(data), ms, verdict,
           (' -> ' + ', '.join(why)) if why else ''))
+# the safety net under the estimate: a parse over its CPU time limit is
+# abandoned (the test tool may lower the limit, 2 s, to 1 ms)
+env = dict(os.environ, KWPE_SANITIZE_CPU_LIMIT_MS='1')
+p, ms = run(reference, env)
+why = [] if p.returncode == 0 and FALLBACK in p.stdout else ['expected: source text (exit %d)' % p.returncode]
+failed |= bool(why)
+print('%-4s %-30s %8d bytes %7.1f ms %s%s' % ('FAIL' if why else 'ok', 'cpu-limit-1ms', len(reference), ms,
+      SOURCE if FALLBACK in p.stdout else PARSED, (' -> ' + ', '.join(why)) if why else ''))
 print('PASS' if not failed else 'FAILED')
 sys.exit(failed)

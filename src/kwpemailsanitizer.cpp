@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1897,19 +1898,41 @@ static void escapeSource( std::string& out, const std::string& text )
 // the parse is abandoned (longjmp out of Gumbo, which is C: no destructors
 // are skipped; everything it allocated is in "pointers") and the document
 // is shown as its source text.
+//
+// The same happens when the parse has taken more than maxParseCpu seconds
+// of this thread's CPU time (load elsewhere on the machine counts little):
+// a safety net under the estimate (tooMuchParsing()), should Gumbo find
+// work it does not foresee.  An ordinary message stays far below it (7.5 MB
+// of KMail's plain text HTML: under 1 s); every 64th allocation looks at
+// the clock, so the net holds where Gumbo allocates (every tag does), not
+// within one long run of text.
+static const double maxParseCpu = 2.0;
+
 struct Allocations
 {
     std::unordered_set<void*> pointers;
     size_t allocated;
     size_t budget;
+    unsigned calls;
+    double cpuDeadline;
     jmp_buf abandon;
 };
+
+static double threadCpuSeconds()
+{
+    struct timespec t;
+    if ( clock_gettime( CLOCK_THREAD_CPUTIME_ID, &t ) != 0 )
+        return 0;   // no clock: no limit
+    return double( t.tv_sec ) + double( t.tv_nsec ) * 1e-9;
+}
 
 static void* allocate( void* userdata, size_t size )
 {
     Allocations* a = static_cast<Allocations*>( userdata );
     a->allocated += size;
     if ( a->allocated > a->budget )
+        longjmp( a->abandon, 1 );
+    if ( ( ++a->calls & 63 ) == 0 && threadCpuSeconds() > a->cpuDeadline )
         longjmp( a->abandon, 1 );
     void* p = malloc( size ? size : 1 );
     if ( p )
@@ -1955,6 +1978,15 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     // newsletters: 5-6 times theirs).  Elements beyond that are clones of
     // formatting elements.
     arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * startTags;
+    arena.calls = 0;
+    double cpuLimit = maxParseCpu;
+#ifdef KWPE_SANITIZE_TESTING
+    // the test tool alone (tests/render-only/kwpe-sanitize) may lower it
+    const char* ms = getenv( "KWPE_SANITIZE_CPU_LIMIT_MS" );
+    if ( ms && *ms )
+        cpuLimit = atof( ms ) / 1000;
+#endif
+    arena.cpuDeadline = threadCpuSeconds() + cpuLimit;
     options.allocator = allocate;
     options.deallocator = deallocate;
     options.userdata = &arena;
