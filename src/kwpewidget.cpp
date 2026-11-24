@@ -215,7 +215,10 @@ static const char mailStateHandler[] = "kwpeMailState";
 // page's own origin, data: or blob: (nothing of another site) into the
 // picture's pixels: drawn into a canvas of at most 96 pixels in the web
 // process, sent as RGBA (width x height x 4 bytes, base64); the host
-// fetches nothing and decodes no image format.  Every message carries
+// fetches nothing and decodes no image format.  Title, body and tag
+// are taken up to 4096 characters, the icon's URL up to 512 KiB (a
+// data: URL; what reaches the host is bounded by the pixels anyway).
+// Every message carries
 // the document's token (random, made by the script when the document
 // starts, sent first as "hello"): the host takes only the current
 // document's messages.  "pending" comes before WebKit shows the
@@ -335,10 +338,10 @@ static const char appNotificationBridge[] =
     "  doc.addEventListener('kwpe-notification', function (e) {\n"
     "    try {\n"
     "      var a = e.detail;\n"
-    "      if (e.target !== doc || typeof a !== 'string' || a.length > 65536) return;\n"
+    "      if (e.target !== doc || typeof a !== 'string' || a.length > 1048576) return;\n"
     "      a = parse(a);\n"
     "      if (!isArray(a) || a.length !== 4) return;\n"
-    "      for (var i = 0; i < 4; ++i) if (typeof a[i] !== 'string' || a[i].length > 4096) return;\n"
+    "      for (var i = 0; i < 4; ++i) if (typeof a[i] !== 'string' || a[i].length > (i < 3 ? 4096 : 524288)) return;\n"
     "      announce(a[0], a[1], a[2], a[3]);\n"
     "    } catch (x) {}\n"
     "  }, true);\n"
