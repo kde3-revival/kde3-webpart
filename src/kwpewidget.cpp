@@ -197,9 +197,10 @@ static const char mailStateHandler[] = "kwpeMailState";
 // site, before the page's scripts) wraps the Notification constructor:
 // options.icon of the page's own origin, data: or blob: (nothing of
 // another site) is drawn into a canvas of at most 96 pixels in the web
-// process and handed to us as a PNG data: URL; the host fetches nothing.
+// process and handed to us as its pixels (RGBA, width x height x 4
+// bytes, base64): the host fetches nothing and decodes no image format.
 // "pending" comes before the notification itself (the constructor), the
-// picture or "" when it is ready (at most 1.5 seconds later).
+// picture or none when it is ready (at most 1.5 seconds later).
 static const char appNotificationHandler[] = "kwpeNotification";
 static const char appNotificationScript[] =
     "(function () {\n"
@@ -224,19 +225,26 @@ static const char appNotificationScript[] =
     "    if (!src) return;\n"
     "    var s = ++serial, done = false, img = new Image();\n"
     "    post({ kind: 'pending', serial: s, title: String(title), body: text(options.body), tag: text(options.tag) });\n"
-    "    function finish(data) { if (!done) { done = true; post({ kind: 'icon', serial: s, data: data }); } }\n"
+    "    function finish(w, h, pixels) {\n"
+    "      if (!done) { done = true; post({ kind: 'icon', serial: s, width: w, height: h, pixels: pixels }); }\n"
+    "    }\n"
     "    img.onload = function () {\n"
     "      try {\n"
     "        var w = img.naturalWidth, h = img.naturalHeight;\n"
-    "        if (!w || !h) { finish(''); return; }\n"
+    "        if (!w || !h) { finish(0, 0, ''); return; }\n"
     "        var k = Math.min(1, size / Math.max(w, h)), c = document.createElement('canvas');\n"
-    "        c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));\n"
-    "        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);\n"
-    "        finish(c.toDataURL('image/png'));\n"
-    "      } catch (e) { finish(''); }\n"
+    "        w = c.width = Math.min(size, Math.max(1, Math.round(w * k)));\n"
+    "        h = c.height = Math.min(size, Math.max(1, Math.round(h * k)));\n"
+    "        var g = c.getContext('2d');\n"
+    "        g.drawImage(img, 0, 0, w, h);\n"
+    "        var data = g.getImageData(0, 0, w, h).data, bytes = '';\n"
+    "        for (var i = 0; i < data.length; i += 8192)\n"
+    "          bytes += String.fromCharCode.apply(null, data.subarray(i, i + 8192));\n"
+    "        finish(w, h, btoa(bytes));\n"
+    "      } catch (e) { finish(0, 0, ''); }\n"
     "    };\n"
-    "    img.onerror = function () { finish(''); };\n"
-    "    setTimeout(function () { finish(''); }, 1500);\n"
+    "    img.onerror = function () { finish(0, 0, ''); };\n"
+    "    setTimeout(function () { finish(0, 0, ''); }, 1500);\n"
     "    img.src = src;\n"
     "  }\n"
     "  function Notification(title, options) {\n"
@@ -248,8 +256,8 @@ static const char appNotificationScript[] =
     "  Object.defineProperty(Notification, 'prototype', { value: N.prototype });\n"
     "  Object.defineProperty(window, 'Notification', { value: Notification, writable: true, configurable: true, enumerable: false });\n"
     "})();\n";
-// The picture: a PNG of at most this size (the script makes 96 pixels).
-static const int appNotificationIconMax = 256;
+// The picture: at most this size each way (the script's size).
+static const int appNotificationIconMax = 96;
 
 struct KWPEMailDocument
 {
@@ -900,7 +908,7 @@ public:
     static void onNotificationClosed( WebKitNotification* notification, gpointer data );
     void forgetNotifications();
     static void onAppNotification( WebKitUserContentManager*, JSCValue* value, gpointer data );
-    static QImage notificationImage( const QString& dataURL );
+    static QImage notificationImage( JSCValue* value );
     static gboolean onQueryPermissionState( WebKitWebView*, WebKitPermissionStateQuery* query, gpointer data );
     static void onDropDone( GObject* view, GAsyncResult* result, gpointer data );
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
@@ -1782,9 +1790,9 @@ static QString jsString( JSCValue* object, const char* name )
 }
 
 // Our script's message: a picture announced ("pending") or ready
-// ("icon"; data: a PNG data: URL or empty).  The page can post anything
-// here (its own world): only for the application's site, a bounded
-// list, a small PNG or nothing.
+// ("icon"; its pixels or none).  The page can post anything here (its
+// own world): only for the application's site, a bounded list, a small
+// picture of exactly its bytes or nothing.
 void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* value, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
@@ -1811,7 +1819,7 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
             if ( ( *it ).serial != serial || ( *it ).done )
                 continue;
             ( *it ).done = true;
-            ( *it ).image = notificationImage( jsString( value, "data" ) );
+            ( *it ).image = notificationImage( value );
             if ( ( *it ).id )
                 QTimer::singleShot( 0, d->q, SLOT( emitNotifications() ) );
             break;
@@ -1819,28 +1827,74 @@ void KWPEWidgetPrivate::onAppNotification( WebKitUserContentManager*, JSCValue* 
     }
 }
 
-// A PNG data: URL (base64) of at most appNotificationIconMax pixels each
-// way (from the IHDR, before anything is decoded); a null image else.
-QImage KWPEWidgetPrivate::notificationImage( const QString& dataURL )
+static int jsInt( JSCValue* object, const char* name )
 {
-    static const char prefix[] = "data:image/png;base64,";
-    if ( !dataURL.startsWith( prefix ) || dataURL.length() > 400000 )
+    JSCValue* value = jsc_value_object_get_property( object, name );
+    int result = -1;
+    if ( jsc_value_is_number( value ) ) {
+        double number = jsc_value_to_double( value );
+        if ( number >= 0 && number <= 65536 && number == int( number ) )
+            result = int( number );
+    }
+    g_object_unref( value );
+    return result;
+}
+
+// The picture of an "icon" message: width x height (1 to
+// appNotificationIconMax each) RGBA pixels, not premultiplied (canvas'
+// getImageData()), base64; exactly that many bytes, or a null image.
+// No image decoder: the host builds the image from the bytes itself.
+QImage KWPEWidgetPrivate::notificationImage( JSCValue* value )
+{
+    int width = jsInt( value, "width" );
+    int height = jsInt( value, "height" );
+    if ( width < 1 || height < 1 || width > appNotificationIconMax || height > appNotificationIconMax )
         return QImage();
-    QByteArray png;
-    QCString encoded = dataURL.mid( sizeof( prefix ) - 1 ).latin1();
-    KCodecs::base64Decode( encoded, png );
-    static const unsigned char signature[] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
-    if ( png.size() < 24 || memcmp( png.data(), signature, sizeof( signature ) ) != 0
-         || memcmp( png.data() + 12, "IHDR", 4 ) != 0 )
+    uint bytes = uint( width ) * uint( height ) * 4;
+    QString encoded = jsString( value, "pixels" );
+    if ( encoded.length() != ( bytes + 2 ) / 3 * 4 )
         return QImage();
-    const unsigned char* header = reinterpret_cast<const unsigned char*>( png.data() );
-    unsigned long width = ( (unsigned long)header[16] << 24 ) | ( header[17] << 16 ) | ( header[18] << 8 ) | header[19];
-    unsigned long height = ( (unsigned long)header[20] << 24 ) | ( header[21] << 16 ) | ( header[22] << 8 ) | header[23];
-    if ( width == 0 || height == 0 || width > appNotificationIconMax || height > appNotificationIconMax )
+    // base64 (decoded here: the length is known, nothing else is taken)
+    QByteArray pixels( bytes );
+    uint out = 0, bits = 0, count = 0;
+    for ( uint i = 0; i < encoded.length(); ++i ) {
+        ushort c = encoded[i].unicode();
+        uint v;
+        if ( c >= 'A' && c <= 'Z' )
+            v = c - 'A';
+        else if ( c >= 'a' && c <= 'z' )
+            v = c - 'a' + 26;
+        else if ( c >= '0' && c <= '9' )
+            v = c - '0' + 52;
+        else if ( c == '+' )
+            v = 62;
+        else if ( c == '/' )
+            v = 63;
+        else if ( c == '=' && i + 2 >= encoded.length() && out == bytes )
+            continue;   // the padding, after all the bytes
+        else
+            return QImage();
+        bits = ( ( bits << 6 ) | v ) & 0xffff;
+        count += 6;
+        if ( count >= 8 ) {
+            count -= 8;
+            if ( out == bytes )
+                return QImage();
+            pixels[out++] = char( ( bits >> count ) & 0xff );
+        }
+    }
+    if ( out != bytes )
         return QImage();
-    QImage image;
-    if ( !image.loadFromData( png, "PNG" ) || image.width() != int( width ) || image.height() != int( height ) )
+    QImage image( width, height, 32 );
+    if ( image.isNull() )
         return QImage();
+    image.setAlphaBuffer( true );
+    const unsigned char* p = reinterpret_cast<const unsigned char*>( pixels.data() );
+    for ( int y = 0; y < height; ++y ) {
+        QRgb* line = reinterpret_cast<QRgb*>( image.scanLine( y ) );
+        for ( int x = 0; x < width; ++x, p += 4 )
+            line[x] = qRgba( p[0], p[1], p[2], p[3] );
+    }
     return image;
 }
 
