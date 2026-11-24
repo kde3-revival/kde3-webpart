@@ -2007,14 +2007,17 @@ static void escapeSource( std::string& out, const std::string& text )
 // maxGumboMemory held at once, whatever the document (each block counted
 // with the list's header and malloc's), and when malloc fails.
 //
-// The same happens when the parse has taken more than maxParseCpu seconds
-// of this thread's CPU time (load elsewhere on the machine counts little):
-// a safety net under the estimate (tooMuchParsing()), should Gumbo find
-// work it does not foresee.  An ordinary message stays far below it (7.5 MB
-// of KMail's plain text HTML: under 1 s); every 64th allocation looks at
-// the clock, so the net holds where Gumbo allocates (every tag does), not
-// within one long run of text.
+// The same happens when the parse and the walk have taken more than
+// maxParseCpu seconds plus maxParseCpuPerByte per byte of input of this
+// thread's CPU time (load elsewhere on the machine counts little): a
+// safety net under the estimate (ParseCost), should Gumbo find work it
+// does not foresee.  An ordinary message stays far below it (7.5 MB of
+// KMail's plain text HTML: 0.4 s, 3.9 s allowed; the time per byte allowed
+// is 4-5 times what that takes, for slower or throttled machines); every
+// 64th allocation looks at the clock, so the net holds where Gumbo
+// allocates (every tag does), not within one long run of text.
 static const double maxParseCpu = 2.0;
+static const double maxParseCpuPerByte = 0.25e-6;
 
 // What the sanitized document may grow to (sanitizeHtml()).
 static const size_t maxOutput = 8 * 1024 * 1024;
@@ -2147,7 +2150,7 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * cost.elements() + 256 * cost.attributes() +
                    512 * cost.clones() + 2 * cost.cloneBytes();
     arena.calls = 0;
-    double cpuLimit = maxParseCpu;
+    double cpuLimit = maxParseCpu + maxParseCpuPerByte * double( html.size() );
 #ifdef KWPE_SANITIZE_TESTING
     // the test tool alone (tests/render-only/kwpe-sanitize) may lower it
     const char* ms = getenv( "KWPE_SANITIZE_CPU_LIMIT_MS" );
