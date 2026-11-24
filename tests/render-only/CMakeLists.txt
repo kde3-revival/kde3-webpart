@@ -55,3 +55,5 @@ kde3_add_executable(kwpe-sanitize
   NO_INSTALL
 )
 target_include_directories(kwpe-sanitize PRIVATE ${_src})
+# KWPE_SANITIZE_CPU_LIMIT_MS may lower the parse's CPU time limit
+target_compile_definitions(kwpe-sanitize PRIVATE KWPE_SANITIZE_TESTING)

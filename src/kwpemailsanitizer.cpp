@@ -14,10 +14,18 @@
 #include <gumbo.h>
 
 #include <setjmp.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unordered_set>
+#include <time.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 namespace KWPEMailSanitizer
@@ -557,6 +565,15 @@ std::string sanitizeCss( const std::string& css, Profile profile, bool external 
 // ---------------------------------------------------------------------
 // HTML
 
+// This thread's CPU time (load elsewhere on the machine counts little).
+static double threadCpuSeconds()
+{
+    struct timespec t;
+    if ( clock_gettime( CLOCK_THREAD_CPUTIME_ID, &t ) != 0 )
+        return 0;   // no clock: no limit
+    return double( t.tv_sec ) + double( t.tv_nsec ) * 1e-9;
+}
+
 namespace
 {
 
@@ -564,10 +581,15 @@ enum ElementAction { Keep, Unwrap, Drop, RenameToPre };
 
 struct Serializer
 {
-    Serializer( Profile p, bool e ) : profile( p ), external( e ), depth( 0 ) {}
+    Serializer( Profile p, bool e, size_t mo, double dl )
+        : profile( p ), external( e ), depth( 0 ), maxOut( mo ), deadline( dl ), abandoned( false ), steps( 0 ),
+          checkedAt( 0 )
+    {
+    }
 
     void open( const GumboNode* n, std::string& close, bool& descend );
     void walk( const GumboNode* root );
+    bool overLimits();
     void text( const char* t );
     void attribute( const char* name, const std::string& value );
     ElementAction actionFor( const GumboElement& e, std::string& name ) const;
@@ -578,6 +600,13 @@ struct Serializer
     std::string out;
     unsigned depth;   // elements written and open
     static const unsigned maxDepth = 400;
+    // beyond maxOut bytes written, or past the deadline (this thread's CPU
+    // time), the walk stops: abandoned
+    size_t maxOut;
+    double deadline;
+    bool abandoned;
+    unsigned steps;
+    size_t checkedAt;   // the output's size when the clock was last read
 };
 
 static bool inList( const std::string& s, const char* const* list )
@@ -841,9 +870,23 @@ void Serializer::open( const GumboNode* n, std::string& close, bool& descend )
     descend = true;
 }
 
+// Whether the output has grown beyond maxOut or the deadline has passed:
+// the clock is read every 64th node and after every 256 KB written (a
+// long style attribute sanitized).
+bool Serializer::overLimits()
+{
+    if ( out.size() > maxOut )
+        return true;
+    if ( ( ++steps & 63 ) != 0 && out.size() - checkedAt < 256 * 1024 )
+        return false;
+    checkedAt = out.size();
+    return threadCpuSeconds() > deadline;
+}
+
 // The tree without recursion: a message may nest elements 100000 deep
 // (Gumbo builds that tree; WebKit's parser would flatten it at 512).  The
 // stack lives on the heap; elements deeper than maxDepth are unwrapped.
+// Over the limits (overLimits()) it stops, abandoned.
 void Serializer::walk( const GumboNode* root )
 {
     struct Frame
@@ -859,6 +902,10 @@ void Serializer::walk( const GumboNode* root )
     f.next = 0;
     bool descend = false;
     open( root, f.close, descend );
+    if ( overLimits() ) {
+        abandoned = true;
+        return;
+    }
     if ( !descend ) {
         out += f.close;
         return;
@@ -879,6 +926,10 @@ void Serializer::walk( const GumboNode* root )
         const GumboNode* child = static_cast<const GumboNode*>( c.data[top.next++] );
         if ( child->type == GUMBO_NODE_TEXT || child->type == GUMBO_NODE_WHITESPACE ) {
             text( child->v.text.text );
+            if ( overLimits() ) {
+                abandoned = true;
+                return;
+            }
             continue;
         }
         if ( child->type != GUMBO_NODE_ELEMENT )
@@ -887,6 +938,10 @@ void Serializer::walk( const GumboNode* root )
         g.node = child;
         g.next = 0;
         open( child, g.close, descend );
+        if ( overLimits() ) {
+            abandoned = true;
+            return;
+        }
         if ( !descend ) {
             out += g.close;
             continue;
@@ -899,60 +954,1072 @@ void Serializer::walk( const GumboNode* root )
 
 } // namespace
 
-// Gumbo's work grows with the depth of its stack of open elements times
-// the number of tags (100000 nested <div>: 12 s), and reconstructing
-// formatting elements multiplies nodes (1000 open <font> before 1000
-// paragraphs: a million elements).  A bound that nothing in the document
-// can lower: D, every start tag of an element that can hold others (not
-// void, not one whose end tag is implied by a sibling: those nest only
-// inside elements that count), times T, every tag; both counted without
-// regard to quotes, comments or raw text (counting too many is safe,
-// skipping one is not).  Above the bound the document is not parsed: it
-// is shown as its source text.  The corpus's newsletters (35-45 KB) have
-// D x T = 2e4-4e4; at 5e6 the worst shapes measured take a few ms.  What
-// the bound cannot see, the nodes Gumbo makes by reconstructing formatting
-// elements, the allocation budget below stops (parseBudget()).
+// ---------------------------------------------------------------------
+// What parsing will cost, before Gumbo is asked
+//
+// Gumbo's work is linear in the input except where it walks its stack of
+// open elements or its list of active formatting elements: scope checks
+// and implied end tags for every tag (100000 nested <div>: 12 s), and,
+// for every character, a search of the stack for the last active
+// formatting element (1500 open <div> and a <b>, then 1 MB of text:
+// 0.4 s).  Reconstructing formatting elements also adds elements no tag
+// opened (1000 open <font> before 1000 paragraphs: a million elements).
+//
+// ParseCost follows the document as Gumbo will, in one pass, and adds up
+// that work: for every tag the depth of the stack plus the length of the
+// list; for every character of text the depth of the stack while the
+// last entry of the list is an element (an eighth of a tag's: a step of
+// that search costs a fraction of a step of a scope check); cloneWork
+// for every element reconstructed.  The depth is that of the stack as
+// the tree builder keeps it, approximated so that it is never lower than
+// Gumbo's:
+//  - the tokenizer is the standard's where it decides what is a tag
+//    (quoted attribute values, comments, bogus comments, doctypes), so an
+//    end tag counts only where Gumbo sees one: "</div>" in an attribute
+//    value or in a comment closes nothing;
+//  - a start tag opens an element, an end tag closes back to its element
+//    only where the tree builder would (in scope: special elements and
+//    scope boundaries stop it; </body>, </html> close nothing; </form>
+//    removes the form alone); a formatting end tag with a block opened
+//    after its element (the adoption agency moves elements) closes
+//    nothing;
+//  - the end tags implied by p, li, dd, dt, option, h1-h6, button, a,
+//    nobr and a table in a table; cells, rows, row groups, captions and
+//    column groups only in a table (else ignored), with the tbody and tr
+//    a table implies;
+//  - formatting elements (a, b, font, ...) as the list keeps them: closed
+//    by an end tag not theirs, they come back (are reconstructed) before
+//    the next text or inline start tag, three alike at most (only
+//    identical start tags are taken to be alike); markers as the list
+//    keeps them (a table closing an object leaves its marker);
+//  - in svg and math every start tag opens an element ("<.../>" one that
+//    closes at once) and nothing implies an end tag; what leaves them (b,
+//    div, p, font with color, face or size, ...; </br> and </p>, as in
+//    Gumbo 0.14) closes their elements; an end tag closes one of theirs
+//    by name, else it is taken as in HTML, where theirs never match;
+//  - raw text (script, style, textarea, title, xmp, iframe, noembed,
+//    noframes, plaintext) holds no tags.  Where that is not sure (inside
+//    svg or math these may be ordinary elements, CDATA there may be a
+//    bogus comment, a <script> holding "<!--" and "<script" may not end
+//    where it seems to), every start tag in it counts as an element
+//    that never closes.
+// Counting too much is safe, too little is not: where Gumbo might do
+// either, the higher count is taken.  Checked against Gumbo 0.14.1 built
+// to count its steps over the stack and the list, on the hostile shapes
+// of tests/render-only/sanitize-timing.py and 35000 random tag soups
+// repeated 300-2000 times: none grew faster than the estimate.
+//
+// Above maxParseWork plus maxParseWorkPerByte per byte of input the
+// document is not parsed: it is shown as its source text.  The size term
+// keeps large ordinary documents parsed (KMail's HTML of a 7.5 MB log,
+// 100000 lines, costs 6e5); what it lets a hostile one buy costs less
+// than parsing it at all (at most 4 ns per unit measured: 20 ms, then
+// 30 ns per byte, where Gumbo takes 60-200 ns per byte).  The corpus's
+// newsletters (35-45 KB) cost 3e3-4e3.
+//
+// A clone also copies the attributes of its start tag, and the tree
+// holds every copy (written out again for each): a few characters of
+// text after a long start tag closed early cost its length again.  Above
+// maxCloneBytes plus maxCloneBytesPerByte per byte of input in the start
+// tags cloned the document is not parsed either.  What elements and
+// clones allocate, the allocation budget bounds (sanitizeHtml()).
 static const double maxParseWork = 5e6;
+static const double maxParseWorkPerByte = 8;
+static const double maxCloneBytes = 4 * 1024 * 1024;
+static const double maxCloneBytesPerByte = 2;
+// An element no tag opened (a clone of a formatting element): about what
+// Gumbo spends on an element, allocating it and its attributes, in steps
+// of a scope check.
+static const double cloneWork = 256;
 
-static bool isTagNameChar( char c )
+namespace
 {
-    return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '-';
-}
 
-static bool tooMuchParsing( const std::string& html )
+enum ElementFlag {
+    Void = 1 << 0,            // no end tag, never on the stack
+    NotOnStack = 1 << 1,      // html, head, body: there once, at the bottom
+    Formatting = 1 << 2,      // in the list of active formatting elements
+    Marker = 1 << 3,          // puts a marker in that list
+    Special = 1 << 4,         // the standard's special category
+    Scope = 1 << 5,           // a boundary of every scope
+    ListScope = 1 << 6,       // ... of the list item scope (ol, ul)
+    ButtonScope = 1 << 7,     // ... of the button scope
+    TableScope = 1 << 8,      // ... of the table scope (html, table, template)
+    ClosesP = 1 << 9,         // its start tag closes an open p
+    NoReconstruct = 1 << 10,  // its start tag does not reconstruct the list
+    Raw = 1 << 11,            // raw text or RCDATA follows its start tag
+    Heading = 1 << 12,        // h1-h6
+    BlockEnd = 1 << 13,       // its end tag closes it when in scope
+    Cell = 1 << 14,           // td, th
+    RowGroup = 1 << 15,       // tbody, thead, tfoot
+    Row = 1 << 16,            // tr
+    TableElement = 1 << 17,   // table
+    TablePart = 1 << 18,      // inserted only in a table: caption, colgroup, col, row groups, rows, cells
+    TableEnd = 1 << 19,       // its end tag closes it when in table scope
+    ClosesTable = 1 << 20,    // a <table> here closes the table: table, row groups, tr
+    Foreign = 1 << 21,        // svg, math
+    Breakout = 1 << 22,       // its start tag leaves svg and math (font: with color, face or size)
+    IntegrationPoint = 1 << 23,  // (on the stack only) of svg or math, holds HTML
+    InForeign = 1 << 24,      // (on the stack only) an element of svg or math
+    InSvg = 1 << 27,          // (on the stack only) ... of svg
+    MarkerOnPop = 1 << 25,    // the list loses its marker whenever it is closed (td, th, caption, template)
+    Fake = 1 << 26            // (on the stack only) a start tag maybe not one
+};
+
+// Every boundary at once: what a start tag seen in raw text is taken to be.
+static const unsigned FakeFlags = Special | Scope | ListScope | ButtonScope | TableScope | Fake;
+
+typedef std::unordered_map<std::string, unsigned> FlagTable;
+
+static FlagTable flagTable()
 {
-    static const char* const noContentNesting[] = {
-        // void
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
-        "wbr", "keygen", "basefont", "bgsound", "frame", "image", "isindex",
-        // end tag implied by a sibling; nested only inside counted elements
-        "p", "li", "dt", "dd", "tr", "td", "th", "tbody", "thead", "tfoot", "colgroup", "option", "optgroup",
-        "rt", "rp", "rb", "rtc", "html", "head", "body", 0
+    FlagTable table;
+    struct Group { unsigned flags; const char* names; };
+    static const Group groups[] = {
+        { Void, "area base br col embed hr img input link meta param source track wbr keygen basefont bgsound "
+                "frame image" },
+        { NotOnStack, "html head body" },
+        { Formatting, "a b big code em font i nobr s small strike strong tt u" },
+        { Marker, "applet object marquee template td th caption" },
+        { MarkerOnPop, "template td th caption" },
+        { Special, "address applet area article aside base basefont bgsound blockquote body br button caption "
+                   "center col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form "
+                   "frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input keygen li link "
+                   "listing main marquee menu meta nav noembed noframes noscript object ol p param plaintext pre "
+                   "script search section select source style summary table tbody td template textarea tfoot th "
+                   "thead title tr track ul wbr xmp mi mo mn ms mtext annotation-xml foreignobject desc" },
+        // select: a boundary too (an older Gumbo ignores end tags inside it)
+        { Scope, "applet caption html table td th marquee object template mi mo mn ms mtext annotation-xml "
+                 "foreignobject desc title select" },
+        { ListScope, "ol ul" },
+        { ButtonScope, "button" },
+        { TableScope, "html table template" },
+        { ClosesP, "address article aside blockquote center details dialog dir div dl fieldset figcaption figure "
+                   "footer header hgroup main menu nav ol p search section summary ul h1 h2 h3 h4 h5 h6 pre "
+                   "listing form plaintext hr xmp li dd dt" },
+        { NoReconstruct, "address article aside blockquote center details dialog dir div dl fieldset figcaption "
+                         "figure footer header hgroup main menu nav ol p search section summary ul h1 h2 h3 h4 "
+                         "h5 h6 pre listing form li dd dt plaintext table hr caption col colgroup tbody td tfoot "
+                         "th thead tr base basefont bgsound link meta noframes script style template title "
+                         "textarea iframe noembed param source track frame frameset rb rp rt rtc html head "
+                         "body" },
+        { Raw, "script style xmp iframe noembed noframes textarea title plaintext" },
+        { Heading, "h1 h2 h3 h4 h5 h6" },
+        { BlockEnd, "address article aside blockquote button center details dialog dir div dl fieldset "
+                    "figcaption figure footer header hgroup listing main menu nav ol pre search section summary "
+                    "ul applet marquee object template dd dt" },
+        { Cell, "td th" },
+        { RowGroup, "tbody thead tfoot" },
+        { Row, "tr" },
+        { TableElement, "table" },
+        { TablePart, "caption colgroup col tbody thead tfoot tr td th" },
+        { TableEnd, "caption table tbody thead tfoot tr td th" },
+        { ClosesTable, "table tbody thead tfoot tr" },
+        { Foreign, "svg math" },
+        { Breakout, "b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 head hr i img li "
+                    "listing menu meta nobr ol p pre ruby s small span strong strike sub sup table tt u ul var font" },
     };
-    double containers = 0, tags = 0;
-    size_t n = html.size();
-    for ( size_t i = html.find( '<' ); i != std::string::npos && i + 1 < n; i = html.find( '<', i + 1 ) ) {
-        char c = html[i + 1];
-        if ( c == '/' || c == '!' || c == '?' ) {
-            tags += 1;
-            continue;
+    for ( size_t g = 0; g < sizeof groups / sizeof *groups; ++g ) {
+        const char* p = groups[g].names;
+        while ( *p ) {
+            const char* e = strchr( p, ' ' );
+            if ( !e )
+                e = p + strlen( p );
+            table[std::string( p, e )] |= groups[g].flags;
+            p = *e ? e + 1 : e;
         }
-        if ( !( ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) ) )
-            continue;
-        tags += 1;
-        size_t end = i + 1;
-        while ( end < n && end - i <= 16 && isTagNameChar( html[end] ) )
-            ++end;
-        if ( !inList( lower( html.substr( i + 1, end - i - 1 ) ), noContentNesting ) )
-            containers += 1;
     }
-    return containers * tags > maxParseWork;
+    return table;
 }
 
-// The source text in a <pre>: every character as text, NUL as U+FFFD.
+static unsigned elementFlags( const std::string& name )
+{
+    static const FlagTable table = flagTable();
+    FlagTable::const_iterator it = table.find( name );
+    return it == table.end() ? 0 : it->second;
+}
+
+static bool isSpace( char c )
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r';
+}
+
+static bool isAlpha( char c )
+{
+    return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' );
+}
+
+class ParseCost
+{
+public:
+    ParseCost( const std::string& html, double limit, double cloneLimit )
+        : m_html( html ), m_limit( limit ), m_cloneLimit( cloneLimit ), m_work( 0 ), m_textWork( 0 ),
+          m_elements( 0 ), m_attributes( 0 ), m_clones( 0 ), m_cloneBytes( 0 ), m_serial( 0 ),
+          m_foreign( 0 ), m_fakeFormatting( false ), m_frameset( false ), m_commentEnd( "-->" ), m_commentBangEnd( "--!>" ),
+          m_cdataEnd( "]]>" ), m_scriptComment( "<!--" )
+    {
+    }
+
+    // false: the work, or what clones copy, exceeds its limit (the pass
+    // stops there)
+    bool run();
+    double work() const { return m_work + m_textWork / 8; }
+    // elements start tags make (not clones), their attributes and those
+    // of the clones
+    size_t elements() const { return m_elements; }
+    size_t attributes() const { return m_attributes; }
+    // elements no tag opened (reconstructed formatting elements) and the
+    // length of the start tags they copy
+    size_t clones() const { return m_clones; }
+    size_t cloneBytes() const { return m_cloneBytes; }
+
+private:
+    struct Element
+    {
+        std::string name;
+        unsigned flags;
+        unsigned long serial;
+    };
+    struct Entry   // of the list of active formatting elements
+    {
+        std::string name;
+        std::string tag;       // the start tag as written (for the Noah's Ark clause)
+        size_t hash;           // of tag (most compare unequal at once, however long)
+        size_t attributes;     // in it
+        unsigned long serial;  // its element; 0: a marker
+        bool open;             // its element is on the stack
+    };
+
+    bool over() const { return work() > m_limit || double( m_cloneBytes ) > m_cloneLimit; }
+    // a character makes Gumbo search the stack: the list ends with an element
+    bool searchesStack() const { return m_fakeFormatting || ( !m_list.empty() && m_list.back().serial != 0 ); }
+    void charge() { m_work += double( m_stack.size() + m_list.size() ); }
+    // Gumbo compares each attribute's name with those before it in the
+    // tag (to drop a duplicate): a tag with a attributes, a(a-1)/2 steps
+    void chargeAttributes( size_t a ) { m_work += double( a ) * double( a ? a - 1 : 0 ) / 2; }
+    void text( size_t length );
+    size_t tagEnd( size_t pos, bool* fontAttributes = 0, bool* selfClosing = 0, size_t* attributes = 0 ) const;
+    size_t rawEnd( size_t pos, const std::string& name, size_t& endTag, bool& unsure );
+    std::string tagName( size_t& pos ) const;
+    void startTag( const std::string& name, size_t begin, size_t end, bool fontAttributes, bool selfClosing,
+                   size_t attributes );
+    void ignored( size_t attributes );
+    void pushForeign( const std::string& name, unsigned flags, bool selfClosing );
+    void fakeStartTag( const std::string& name );
+    void endTag( const std::string& name );
+    void endFormatting( const std::string& name );
+    long find( const std::string* name, unsigned anyOf, unsigned boundary ) const;
+    long tableContext( unsigned anyOf ) const;
+    bool topIs( unsigned anyOf, const std::string* name = 0 ) const;
+    bool inForeignContent() const;
+    void fakeStartTags( size_t from, size_t to );
+    void push( const std::string& name, unsigned flags );
+    void popTo( size_t index );
+    void pop();
+    void clearToMarker();
+    void addFormatting( const std::string& name, const std::string& tag, size_t attributes );
+    void reconstruct();
+    long lastFormatting( const std::string& name ) const;
+
+    // std::string::find() for a position that only grows: the last answer
+    // is kept (searching anew each time from each comment for a "--!>"
+    // that is not there would be quadratic)
+    struct Finder
+    {
+        explicit Finder( const char* n ) : needle( n ), from( 0 ), at( std::string::npos ), valid( false ) {}
+        size_t find( const std::string& s, size_t pos )
+        {
+            if ( !valid || pos < from || ( at != std::string::npos && at < pos ) ) {
+                at = s.find( needle, pos );
+                from = pos;
+                valid = true;
+            }
+            return at;
+        }
+        const char* needle;
+        size_t from, at;
+        bool valid;
+    };
+
+    const std::string& m_html;
+    double m_limit, m_cloneLimit;
+    double m_work, m_textWork;
+    size_t m_elements, m_attributes, m_clones, m_cloneBytes;
+    unsigned long m_serial;
+    unsigned m_foreign;   // svg and math on the stack
+    bool m_fakeFormatting;
+    bool m_frameset;   // a <frameset> seen
+    std::vector<Element> m_stack;
+    std::vector<Entry> m_list;
+    Finder m_commentEnd, m_commentBangEnd, m_cdataEnd, m_scriptComment;
+};
+
+void ParseCost::push( const std::string& name, unsigned flags )
+{
+    Element e;
+    e.name = name;
+    e.flags = flags;
+    e.serial = ++m_serial;
+    m_stack.push_back( e );
+    if ( flags & Foreign )
+        ++m_foreign;
+}
+
+void ParseCost::pop()
+{
+    const Element& e = m_stack.back();
+    if ( e.flags & Foreign )
+        --m_foreign;
+    if ( ( e.flags & ( Formatting | Fake ) ) == Formatting ) {
+        m_work += double( m_list.size() );
+        for ( size_t i = m_list.size(); i-- > 0; )
+            if ( m_list[i].serial == e.serial ) {
+                m_list[i].open = false;
+                break;
+            }
+    }
+    if ( ( e.flags & ( MarkerOnPop | Fake ) ) == MarkerOnPop )
+        clearToMarker();
+    m_stack.pop_back();
+}
+
+// The list up to its last marker.
+void ParseCost::clearToMarker()
+{
+    while ( !m_list.empty() ) {
+        bool marker = m_list.back().serial == 0;
+        m_list.pop_back();
+        if ( marker )
+            break;
+    }
+}
+
+void ParseCost::popTo( size_t index )
+{
+    while ( m_stack.size() > index )
+        pop();
+}
+
+// The topmost HTML element (not a fake) named @p name or with one of the
+// flags @p anyOf, if no element with one of the flags @p boundary is
+// above it; -1: none.
+long ParseCost::find( const std::string* name, unsigned anyOf, unsigned boundary ) const
+{
+    for ( size_t i = m_stack.size(); i-- > 0; ) {
+        const Element& e = m_stack[i];
+        if ( !( e.flags & ( Fake | InForeign ) ) && ( ( name && e.name == *name ) || ( e.flags & anyOf ) ) )
+            return long( i );
+        if ( e.flags & boundary )
+            return -1;
+    }
+    return -1;
+}
+
+// The topmost HTML element with one of the flags @p anyOf or a template,
+// whatever is above it; -1: none.
+long ParseCost::tableContext( unsigned anyOf ) const
+{
+    static const std::string templ( "template" );
+    for ( size_t i = m_stack.size(); i-- > 0; ) {
+        const Element& e = m_stack[i];
+        if ( !( e.flags & ( Fake | InForeign ) ) && ( ( e.flags & anyOf ) || e.name == templ ) )
+            return long( i );
+    }
+    return -1;
+}
+
+// Whether the current node is an HTML element (not a fake) with one of
+// the flags @p anyOf or named @p name.
+bool ParseCost::topIs( unsigned anyOf, const std::string* name ) const
+{
+    if ( m_stack.empty() || ( m_stack.back().flags & ( Fake | InForeign ) ) )
+        return false;
+    return ( m_stack.back().flags & anyOf ) || ( name && m_stack.back().name == *name );
+}
+
+// Whether tags are svg's or math's: the current node is an element of
+// theirs that does not hold HTML (or maybe not a tag at all).
+bool ParseCost::inForeignContent() const
+{
+    if ( m_stack.empty() )
+        return false;
+    unsigned flags = m_stack.back().flags;
+    return ( flags & Fake ) || ( ( flags & InForeign ) && !( flags & IntegrationPoint ) );
+}
+
+long ParseCost::lastFormatting( const std::string& name ) const
+{
+    for ( size_t i = m_list.size(); i-- > 0; ) {
+        if ( m_list[i].serial == 0 )
+            return -1;
+        if ( m_list[i].name == name )
+            return long( i );
+    }
+    return -1;
+}
+
+void ParseCost::addFormatting( const std::string& name, const std::string& tag, size_t attributes )
+{
+    // Noah's Ark: three alike after the last marker at most
+    size_t alike = 0, earliest = 0;
+    size_t hash = std::hash<std::string>()( tag );
+    for ( size_t i = m_list.size(); i-- > 0 && m_list[i].serial != 0; )
+        if ( m_list[i].hash == hash && m_list[i].tag == tag ) {
+            ++alike;
+            earliest = i;
+        }
+    if ( alike >= 3 )
+        m_list.erase( m_list.begin() + long( earliest ) );
+    Entry f;
+    f.name = name;
+    f.tag = tag;
+    f.hash = hash;
+    f.attributes = attributes;
+    f.serial = m_stack.back().serial;
+    f.open = true;
+    m_list.push_back( f );
+}
+
+void ParseCost::reconstruct()
+{
+    if ( m_list.empty() || m_list.back().serial == 0 || m_list.back().open )
+        return;
+    size_t i = m_list.size() - 1;
+    while ( i > 0 && m_list[i - 1].serial != 0 && !m_list[i - 1].open )
+        --i;
+    // a search of the stack for each entry looked at, then the clones:
+    // elements no tag opened, each with a copy of the attributes
+    m_work += double( m_list.size() - i + 1 ) * double( m_stack.size() ) + cloneWork * double( m_list.size() - i );
+    for ( ; i < m_list.size(); ++i ) {
+        ++m_clones;
+        m_cloneBytes += m_list[i].tag.size();
+        m_attributes += m_list[i].attributes;
+        push( m_list[i].name, elementFlags( m_list[i].name ) );
+        m_list[i].serial = m_stack.back().serial;
+        m_list[i].open = true;
+    }
+}
+
+void ParseCost::text( size_t length )
+{
+    if ( !length )
+        return;
+    reconstruct();
+    if ( searchesStack() )
+        m_textWork += double( length ) * double( m_stack.size() );
+}
+
+// The adoption agency, as far as the depth goes.
+void ParseCost::endFormatting( const std::string& name )
+{
+    long f = lastFormatting( name );
+    if ( f < 0 ) {
+        // as any other end tag
+        long i = find( &name, 0, Special );
+        if ( i >= 0 )
+            popTo( size_t( i ) );
+        return;
+    }
+    if ( !m_list[f].open ) {
+        m_list.erase( m_list.begin() + f );
+        return;
+    }
+    size_t s = m_stack.size();
+    while ( s-- > 0 && m_stack[s].serial != m_list[f].serial )
+        ;
+    for ( size_t i = s + 1; i < m_stack.size(); ++i ) {
+        if ( m_stack[i].flags & Scope )
+            return;   // not in scope: ignored
+    }
+    for ( size_t i = s + 1; i < m_stack.size(); ++i ) {
+        if ( m_stack[i].flags & Special ) {
+            // a furthest block: elements move, up to eight rounds; the
+            // depth is taken to stay.  The formatting element is cloned
+            // (the clone takes its place).
+            m_work += 8 * double( m_stack.size() + m_list.size() );
+            ++m_clones;
+            m_cloneBytes += m_list[f].tag.size();
+            m_attributes += m_list[f].attributes;
+            return;
+        }
+    }
+    m_list.erase( m_list.begin() + f );
+    popTo( s );
+}
+
+void ParseCost::fakeStartTag( const std::string& name )
+{
+    charge();
+    ++m_elements;   // maybe one
+    unsigned flags = elementFlags( name );
+    if ( flags & Void )
+        return;
+    reconstruct();
+    push( name, FakeFlags | ( flags & Foreign ) );
+    if ( flags & Formatting )
+        m_fakeFormatting = true;
+}
+
+// Every start tag in [@p from, @p to) as a fake one.
+// Their attributes are charged as a real tag's (Gumbo's search for
+// duplicates), except for those starting within a tag already measured
+// (each byte is scanned for that once at most).
+void ParseCost::fakeStartTags( size_t from, size_t to )
+{
+    size_t measured = from;
+    for ( size_t s = m_html.find( '<', from ); s < to && !over(); s = m_html.find( '<', s + 1 ) ) {
+        if ( s + 1 < to && isAlpha( m_html[s + 1] ) ) {
+            size_t q = s + 1;
+            std::string name = tagName( q );
+            if ( q >= measured ) {
+                size_t attributes = 0;
+                measured = tagEnd( q, 0, 0, &attributes );
+                chargeAttributes( attributes );
+            }
+            fakeStartTag( name );
+        }
+    }
+}
+
+// An element of svg or math: of the namespace of the current node, or of
+// its own (svg, math); those that hold HTML are special and scope
+// boundaries.  Written "<.../>", it closes at once.
+void ParseCost::pushForeign( const std::string& name, unsigned flags, bool selfClosing )
+{
+    if ( selfClosing )
+        return;
+    bool svg = name == "svg" || ( name != "math" && !m_stack.empty() && ( m_stack.back().flags & InSvg ) );
+    unsigned f = ( flags & Foreign ) | InForeign | ( svg ? InSvg : 0 );
+    if ( svg ? ( name == "foreignobject" || name == "desc" || name == "title" )
+             : ( name == "mi" || name == "mo" || name == "mn" || name == "ms" || name == "mtext" ) )
+        f |= IntegrationPoint | Special | Scope;
+    push( name, f );
+}
+
+// A start tag that makes no element after all (with @p attributes).
+void ParseCost::ignored( size_t attributes )
+{
+    --m_elements;
+    m_attributes -= attributes;
+}
+
+// The start tag @p name written at [@p begin, @p end); @p fontAttributes:
+// it has an attribute color, face or size; @p selfClosing: "/>";
+// @p attributes: how many it has.
+void ParseCost::startTag( const std::string& name, size_t begin, size_t end, bool fontAttributes,
+                          bool selfClosing, size_t attributes )
+{
+    charge();
+    ++m_elements;
+    m_attributes += attributes;
+    unsigned flags = elementFlags( name );
+    static const std::string font( "font" );
+    if ( inForeignContent() ) {
+        if ( !( flags & Breakout ) || ( name == font && !fontAttributes ) ) {
+            // an element of svg or math, whatever its name: no implied
+            // end tags, no formatting elements (nor, for a fake current
+            // node, the HTML that it may be: the list, but nothing closes)
+            bool fake = m_stack.back().flags & Fake;
+            if ( fake ) {
+                reconstruct();
+                if ( flags & Formatting )
+                    m_fakeFormatting = true;
+            }
+            pushForeign( name, flags, selfClosing && !fake );
+            return;
+        }
+        // an HTML element: the elements of svg and math above close
+        if ( !( m_stack.back().flags & Fake ) )
+            while ( !m_stack.empty() && ( m_stack.back().flags & ( InForeign | IntegrationPoint ) ) == InForeign )
+                pop();
+    }
+    if ( name == "frameset" )
+        m_frameset = true;
+    if ( flags & NotOnStack ) {
+        ignored( attributes );   // html, head, body: theirs, if new, go to the one there
+        return;
+    }
+    static const std::string a( "a" ), nobr( "nobr" ), li( "li" ), dd( "dd" ), dt( "dt" ), p( "p" ),
+        button( "button" ), option( "option" ), optgroup( "optgroup" ), select( "select" ), tr( "tr" ),
+        table( "table" ), col( "col" ), colgroup( "colgroup" ), tbody( "tbody" );
+    long i;
+    if ( name == a ) {
+        long f = lastFormatting( a );
+        if ( f >= 0 ) {
+            // closed as by </a>; if that left it in the list, it leaves the
+            // list (the element stays open)
+            unsigned long serial = m_list[f].serial;
+            endFormatting( a );
+            for ( size_t k = m_list.size(); k-- > 0; )
+                if ( m_list[k].serial == serial ) {
+                    m_list.erase( m_list.begin() + long( k ) );
+                    break;
+                }
+        }
+    } else if ( name == nobr ) {
+        if ( find( &nobr, 0, Scope ) >= 0 )
+            endFormatting( nobr );
+    } else if ( name == li || name == dd || name == dt ) {
+        for ( size_t k = m_stack.size(); k-- > 0; ) {
+            const Element& e = m_stack[k];
+            if ( !( e.flags & ( Fake | InForeign ) ) &&
+                 ( name == li ? e.name == li : ( e.name == dd || e.name == dt ) ) ) {
+                popTo( k );
+                break;
+            }
+            if ( ( e.flags & Special ) && e.name != "address" && e.name != "div" && e.name != "p" )
+                break;
+        }
+    } else if ( name == button ) {
+        if ( ( i = find( &button, 0, Scope ) ) >= 0 )
+            popTo( size_t( i ) );
+    } else if ( name == select ) {
+        if ( ( i = find( &select, 0, Scope ) ) >= 0 ) {
+            popTo( size_t( i ) );
+            ignored( attributes );
+            return;
+        }
+    } else if ( name == option || name == optgroup ) {
+        if ( topIs( 0, &option ) )
+            pop();
+    } else if ( flags & TablePart ) {
+        // the cell, row or row group open closes, then the stack back to
+        // the table, row group or row it goes in; outside a table (or a
+        // template) the tag is ignored
+        unsigned context = TableElement;
+        if ( flags & Cell ) {
+            i = find( 0, Cell, TableScope );
+            context |= Row | RowGroup;
+        } else if ( flags & Row ) {
+            i = find( 0, Row, TableScope );
+            context |= RowGroup;
+        } else if ( flags & RowGroup )
+            i = find( 0, RowGroup, TableScope );
+        else
+            i = -1;
+        if ( i >= 0 )
+            popTo( size_t( i ) );
+        long c = tableContext( context );
+        if ( c < 0 ) {
+            ignored( attributes );
+            return;
+        }
+        popTo( size_t( c ) + 1 );
+        // the row group and row a table implies, the colgroup of a col
+        if ( ( flags & ( Cell | Row ) ) && topIs( TableElement ) ) {
+            push( tbody, elementFlags( tbody ) );
+            ++m_elements;
+        }
+        if ( ( flags & Cell ) && topIs( RowGroup ) ) {
+            push( tr, elementFlags( tr ) );
+            ++m_elements;
+        }
+        if ( name == col && !topIs( 0, &colgroup ) ) {
+            push( colgroup, elementFlags( colgroup ) );
+            ++m_elements;
+        }
+    } else if ( name == table ) {
+        if ( topIs( ClosesTable ) && ( i = find( &table, 0, TableScope ) ) >= 0 )
+            popTo( size_t( i ) );
+    }
+    if ( flags & ClosesP ) {
+        if ( ( i = find( &p, 0, Scope | ButtonScope ) ) >= 0 )
+            popTo( size_t( i ) );
+        if ( ( flags & Heading ) && topIs( Heading ) )
+            pop();
+    }
+    if ( !( flags & NoReconstruct ) )
+        reconstruct();
+    if ( flags & Void )
+        return;
+    if ( flags & Foreign ) {
+        pushForeign( name, flags, selfClosing );
+        return;
+    }
+    push( name, flags );
+    if ( flags & Formatting )
+        addFormatting( name, m_html.substr( begin, end - begin ), attributes );
+    if ( flags & Marker ) {
+        Entry m;
+        m.attributes = 0;
+        m.hash = 0;
+        m.serial = 0;
+        m.open = false;
+        m_list.push_back( m );
+    }
+}
+
+void ParseCost::endTag( const std::string& name )
+{
+    charge();
+    unsigned flags = elementFlags( name );
+    static const std::string p( "p" ), li( "li" ), br( "br" ), form( "form" ), colgroup( "colgroup" );
+    long i = -1;
+    if ( !m_stack.empty() && ( m_stack.back().flags & Fake ) )
+        return;   // maybe no element: nothing closes
+    if ( ( name == br || name == p ) && inForeignContent() ) {
+        // leaves svg and math (as Gumbo 0.14 does): their elements above
+        // close, then as in HTML
+        while ( !m_stack.empty() && ( m_stack.back().flags & ( InForeign | IntegrationPoint ) ) == InForeign )
+            pop();
+    } else {
+        // svg's or math's: closes the element of that name above the
+        // first HTML element, else as in HTML
+        for ( size_t k = m_stack.size(); k-- > 0 && ( m_stack[k].flags & InForeign ); ) {
+            if ( m_stack[k].name == name ) {
+                popTo( k );
+                return;
+            }
+        }
+    }
+    if ( flags & NotOnStack )
+        return;   // </body>, </html>: nothing closes
+    if ( name == br ) {
+        // as <br> (void: only the list is reconstructed)
+        reconstruct();
+        return;
+    }
+    if ( flags & Formatting ) {
+        endFormatting( name );
+        return;
+    }
+    if ( name == p )
+        i = find( &p, 0, Scope | ButtonScope );
+    else if ( name == li )
+        i = find( &li, 0, Scope | ListScope );
+    else if ( name == form ) {
+        // the form element alone leaves the stack
+        if ( ( i = find( &form, 0, Scope ) ) >= 0 )
+            m_stack.erase( m_stack.begin() + i );
+        return;
+    } else if ( name == colgroup ) {
+        if ( topIs( 0, &colgroup ) )
+            pop();
+        return;
+    } else if ( flags & Heading )
+        i = find( 0, Heading, Scope );
+    else if ( flags & TableEnd )
+        i = find( &name, 0, TableScope );
+    else if ( flags & BlockEnd )
+        i = find( &name, 0, Scope );
+    else
+        i = find( &name, 0, Special );   // any other end tag
+    if ( i >= 0 ) {
+        popTo( size_t( i ) );
+        // applet, marquee, object: their marker leaves the list only
+        // with their own end tag (not when a table closes them)
+        if ( ( flags & ( Marker | MarkerOnPop ) ) == Marker )
+            clearToMarker();
+    }
+}
+
+// The name of the tag whose name starts at @p pos, in lower case; @p pos
+// ends after it.
+std::string ParseCost::tagName( size_t& pos ) const
+{
+    size_t n = m_html.size(), b = pos;
+    while ( pos < n && !isSpace( m_html[pos] ) && m_html[pos] != '/' && m_html[pos] != '>' )
+        ++pos;
+    return lower( m_html.substr( b, pos - b ) );
+}
+
+// After the tag's '>', from just after its name (the standard's states
+// from "tag name" on); npos: the input ends in the tag.  @p fontAttributes:
+// whether it has an attribute color, face or size; @p selfClosing: whether
+// it ends with "/>"; @p attributes: how many it has (duplicates too).
+size_t ParseCost::tagEnd( size_t pos, bool* fontAttributes, bool* selfClosing, size_t* attributes ) const
+{
+    enum State { BeforeName, Name, AfterName, BeforeValue, Quoted, Unquoted, AfterQuoted, SelfClosing };
+    State state = BeforeName;
+    char quote = 0;
+    size_t n = m_html.size(), name = 0;
+    if ( fontAttributes )
+        *fontAttributes = false;
+    if ( selfClosing )
+        *selfClosing = false;
+    if ( attributes )
+        *attributes = 0;
+    if ( pos < n && m_html[pos] == '/' ) {
+        state = SelfClosing;
+        ++pos;
+    }
+    for ( ; pos < n; ++pos ) {
+        char c = m_html[pos];
+        if ( state == Name && fontAttributes && ( isSpace( c ) || c == '/' || c == '=' || c == '>' ) ) {
+            std::string a = lower( m_html.substr( name, pos - name ) );
+            if ( a == "color" || a == "face" || a == "size" )
+                *fontAttributes = true;
+        }
+        switch ( state ) {
+        case BeforeName:
+            if ( isSpace( c ) )
+                break;
+            if ( c == '/' )
+                state = SelfClosing;
+            else if ( c == '>' )
+                return pos + 1;
+            else {
+                state = Name;   // '=' too: the first character of the name
+                name = pos;
+                if ( attributes )
+                    ++*attributes;
+            }
+            break;
+        case Name:
+            if ( isSpace( c ) )
+                state = AfterName;
+            else if ( c == '/' )
+                state = SelfClosing;
+            else if ( c == '=' )
+                state = BeforeValue;
+            else if ( c == '>' )
+                return pos + 1;
+            break;
+        case AfterName:
+            if ( isSpace( c ) )
+                break;
+            if ( c == '/' )
+                state = SelfClosing;
+            else if ( c == '=' )
+                state = BeforeValue;
+            else if ( c == '>' )
+                return pos + 1;
+            else {
+                state = Name;
+                name = pos;
+                if ( attributes )
+                    ++*attributes;
+            }
+            break;
+        case BeforeValue:
+            if ( isSpace( c ) )
+                break;
+            if ( c == '"' || c == '\'' ) {
+                quote = c;
+                state = Quoted;
+            } else if ( c == '>' )
+                return pos + 1;
+            else
+                state = Unquoted;
+            break;
+        case Quoted:
+            if ( c == quote )
+                state = AfterQuoted;
+            break;
+        case Unquoted:
+            if ( isSpace( c ) )
+                state = BeforeName;
+            else if ( c == '>' )
+                return pos + 1;
+            break;
+        case AfterQuoted:
+            if ( isSpace( c ) )
+                state = BeforeName;
+            else if ( c == '/' )
+                state = SelfClosing;
+            else if ( c == '>' )
+                return pos + 1;
+            else {
+                state = BeforeName;
+                --pos;   // reconsumed
+            }
+            break;
+        case SelfClosing:
+            if ( c == '>' ) {
+                if ( selfClosing )
+                    *selfClosing = true;
+                return pos + 1;
+            }
+            state = BeforeName;
+            --pos;   // reconsumed
+            break;
+        }
+    }
+    return std::string::npos;
+}
+
+// Where the raw text of element @p name starting at @p pos ends: at the
+// '<' of its end tag (@p endTag after that tag's name), npos: it holds
+// the rest of the input (@p unsure: or maybe not).
+size_t ParseCost::rawEnd( size_t pos, const std::string& name, size_t& endTag, bool& unsure )
+{
+    unsure = false;
+    if ( name == "plaintext" )
+        return std::string::npos;
+    size_t n = m_html.size(), len = name.size();
+    for ( size_t i = m_html.find( "</", pos ); i != std::string::npos; i = m_html.find( "</", i + 1 ) ) {
+        if ( i + 2 + len >= n )
+            return std::string::npos;
+        if ( lower( m_html.substr( i + 2, len ) ) != name )
+            continue;
+        char c = m_html[i + 2 + len];
+        if ( !isSpace( c ) && c != '/' && c != '>' )
+            continue;
+        if ( name == "script" ) {
+            // "<!--" then "<script": maybe double escaped, this end tag
+            // maybe text
+            size_t comment = m_scriptComment.find( m_html, pos );
+            if ( comment < i ) {
+                for ( size_t s = m_html.find( '<', comment + 4 ); s < i; s = m_html.find( '<', s + 1 ) )
+                    if ( lower( m_html.substr( s + 1, 6 ) ) == "script" ) {
+                        unsure = true;
+                        return std::string::npos;
+                    }
+            }
+        }
+        endTag = i + 2 + len;
+        return i;
+    }
+    return std::string::npos;
+}
+
+bool ParseCost::run()
+{
+    const std::string& h = m_html;
+    size_t n = h.size(), i = 0;
+    while ( i < n ) {
+        size_t lt = h.find( '<', i );
+        if ( lt == std::string::npos ) {
+            text( n - i );
+            break;
+        }
+        text( lt - i );
+        i = lt + 1;
+        if ( i >= n ) {
+            text( 1 );
+            break;
+        }
+        char c = h[i];
+        if ( isAlpha( c ) ) {
+            size_t pos = i;
+            std::string name = tagName( pos );
+            bool fontAttributes = false, selfClosing = false;
+            size_t attributes = 0;
+            size_t end = tagEnd( pos, name == "font" ? &fontAttributes : 0, &selfClosing, &attributes );
+            if ( end == std::string::npos )
+                break;   // the input ends in the tag: it is dropped
+            chargeAttributes( attributes );
+            startTag( name, lt, end, fontAttributes, selfClosing, attributes );
+            i = end;
+            if ( ( elementFlags( name ) & Raw ) && !m_stack.empty() && m_stack.back().name == name ) {
+                size_t element = m_stack.size() - 1;
+                size_t endTagName = 0;
+                bool unsure;
+                size_t rawStop = rawEnd( i, name, endTagName, unsure );
+                // after a <frameset> Gumbo may ignore the raw text element
+                if ( m_frameset )
+                    unsure = true;
+                size_t stop = rawStop == std::string::npos ? n : rawStop;
+                if ( m_foreign || unsure ) {
+                    // maybe an ordinary element, maybe not the end: its
+                    // start tags count
+                    fakeStartTags( i, stop );
+                    if ( over() )
+                        return false;
+                }
+                if ( searchesStack() )
+                    m_textWork += double( stop - i ) * double( m_stack.size() );
+                if ( rawStop == std::string::npos )
+                    break;
+                charge();
+                if ( m_foreign )
+                    m_stack.erase( m_stack.begin() + long( element ) );   // the start tags in it stay
+                else
+                    popTo( element );
+                size_t attributes = 0;
+                end = tagEnd( endTagName, 0, 0, &attributes );
+                if ( end == std::string::npos )
+                    break;
+                chargeAttributes( attributes );
+                i = end;
+            }
+        } else if ( c == '/' ) {
+            if ( i + 1 >= n ) {
+                text( 2 );
+                break;
+            }
+            if ( isAlpha( h[i + 1] ) ) {
+                size_t pos = i + 1;
+                std::string name = tagName( pos );
+                size_t attributes = 0;
+                size_t end = tagEnd( pos, 0, 0, &attributes );
+                if ( end == std::string::npos )
+                    break;
+                chargeAttributes( attributes );
+                endTag( name );
+                i = end;
+            } else if ( h[i + 1] == '>' )
+                i += 2;   // "</>": nothing
+            else {
+                size_t gt = h.find( '>', i );   // a bogus comment
+                if ( gt == std::string::npos )
+                    break;
+                i = gt + 1;
+            }
+        } else if ( c == '!' ) {
+            if ( h.compare( i, 3, "!--" ) == 0 ) {
+                size_t b = i + 3, e;
+                if ( b < n && h[b] == '>' )
+                    e = b + 1;   // "<!-->"
+                else if ( b + 1 < n && h[b] == '-' && h[b + 1] == '>' )
+                    e = b + 2;   // "<!--->"
+                else {
+                    size_t d = m_commentEnd.find( h, b ), x = m_commentBangEnd.find( h, b );
+                    if ( d == std::string::npos && x == std::string::npos )
+                        break;
+                    e = d < x ? d + 3 : x + 4;
+                }
+                i = e;
+            } else if ( h.compare( i, 8, "![CDATA[" ) == 0 && m_foreign ) {
+                // CDATA in svg or math, else a bogus comment: either way
+                // ends at its "]]>", the start tags up to there count
+                size_t e = m_cdataEnd.find( h, i );
+                fakeStartTags( i, e == std::string::npos ? n : e );
+                if ( e == std::string::npos )
+                    break;
+                i = e + 3;
+            } else {
+                // a doctype or a bogus comment: ends at the first '>'
+                size_t e = h.find( '>', i );
+                if ( e == std::string::npos )
+                    break;
+                i = e + 1;
+            }
+        } else if ( c == '?' ) {
+            size_t gt = h.find( '>', i );
+            if ( gt == std::string::npos )
+                break;
+            i = gt + 1;
+        } else
+            text( 1 );   // the '<'
+        if ( over() )
+            return false;
+    }
+    return !over();
+}
+
+} // namespace
+
+// The source text in a <pre>: every character as text, NUL as U+FFFD;
+// what would make it longer than 4 MB plus twice the source's length (up
+// to 5 times: "&amp;") is left out, with a note.
 static void escapeSource( std::string& out, const std::string& text )
 {
+    size_t limit = out.size() + 4 * 1024 * 1024 + 2 * text.size();
     for ( size_t i = 0; i < text.size(); ++i ) {
+        if ( out.size() >= limit ) {
+            // not in the middle of a character (of at most 4 bytes: a
+            // longer run of continuation bytes is no character)
+            for ( int back = 0; back < 3 && i > 0 && ( static_cast<unsigned char>( text[i] ) & 0xc0 ) == 0x80;
+                  ++back ) {
+                --i;
+                out.erase( out.size() - 1 );
+            }
+            char note[96];
+            snprintf( note, sizeof note, "\n[... %zu more bytes not shown]", text.size() - i );
+            out += note;
+            return;
+        }
         switch ( text[i] ) {
         case '&': out += "&amp;"; break;
         case '<': out += "&lt;"; break;
@@ -966,13 +2033,67 @@ static void escapeSource( std::string& out, const std::string& text )
 // Gumbo's memory, freed in one go after the tree has been written, and
 // a budget of what Gumbo may allocate (in all, freed or not): beyond it
 // the parse is abandoned (longjmp out of Gumbo, which is C: no destructors
-// are skipped; everything it allocated is in "pointers") and the document
-// is shown as its source text.
+// are skipped; every block it holds is in the list "blocks") and the
+// document is shown as its source text.  So it is too beyond what Gumbo
+// may hold at once (each block counted with the list's header and
+// malloc's: see maxHeld), and when malloc fails.
+//
+// The same happens when the parse and the walk have taken more than
+// maxParseCpu seconds plus maxParseCpuPerByte per byte of input of this
+// thread's CPU time (load elsewhere on the machine counts little): a
+// safety net under the estimate (ParseCost), should Gumbo find work it
+// does not foresee.  An ordinary message stays far below it (7.5 MB of
+// KMail's plain text HTML: 0.4 s, 3.9 s allowed; the time per byte allowed
+// is 4-5 times what that takes, for slower or throttled machines), but
+// never more than maxParseCpuTotal (what the net lets a hostile message
+// hold KMail's thread for, whatever its size); every
+// 64th allocation looks at the clock, so the net holds where Gumbo
+// allocates (every tag does), not within one long run of text.
+static const double maxParseCpu = 2.0;
+static const double maxParseCpuPerByte = 0.25e-6;
+static const double maxParseCpuTotal = 4.0;
+
+// What the sanitized document may grow to (sanitizeHtml()).
+static const size_t maxOutput = 8 * 1024 * 1024;
+static const size_t maxOutputPerByte = 8;
+
+// What Gumbo may hold at once: maxHeld plus maxHeldPerByte per byte of
+// input, maxHeldTotal at most.  KMail's plain text holds 36 bytes per byte
+// of one-character lines (780 per line), less for longer ones: a 7.5 MB
+// log (100000 lines) 84 MB; 300000 one-character lines (6.6 MB) 235 MB,
+// 400000 (8.8 MB) 312 MB, of 550 allowed; about 640000 (14 MB) reach the
+// ceiling.  Empty elements take more, 75 bytes per byte of "<br>", 80-120
+// of "<p>": a flood of them stops at half of what it would hold or at
+// maxHeldTotal.
+static const size_t maxHeld = 128 * 1024 * 1024;
+static const size_t maxHeldPerByte = 48;
+static const size_t maxHeldTotal = 512 * 1024 * 1024;
+
+// Each block Gumbo gets is preceded by a Block (32 bytes on LP64, a
+// multiple of malloc's alignment: what follows stays aligned), in a list:
+// no allocation of ours that could fail within Gumbo.
+struct Block
+{
+    Block* prev;
+    Block* next;
+    size_t size;
+    size_t unused;
+};
+// what a block costs beyond its size: the Block, malloc's header and
+// rounding
+static const size_t blockOverhead = sizeof( Block ) + 16;
+static_assert( sizeof( Block ) % alignof( max_align_t ) == 0, "a block's header keeps malloc's alignment" );
+
 struct Allocations
 {
-    std::unordered_set<void*> pointers;
-    size_t allocated;
+    Block* blocks;
+    size_t allocated;   // in all, freed or not
     size_t budget;
+    size_t held;   // now, with blockOverhead each
+    size_t maxHeld;
+    size_t peak;
+    unsigned calls;
+    double cpuDeadline;
     jmp_buf abandon;
 };
 
@@ -980,55 +2101,132 @@ static void* allocate( void* userdata, size_t size )
 {
     Allocations* a = static_cast<Allocations*>( userdata );
     a->allocated += size;
-    if ( a->allocated > a->budget )
+    a->held += size + blockOverhead;
+    if ( a->allocated > a->budget || a->held > a->maxHeld )
         longjmp( a->abandon, 1 );
-    void* p = malloc( size ? size : 1 );
-    if ( p )
-        a->pointers.insert( p );
-    return p;
+    if ( ( ++a->calls & 63 ) == 0 && threadCpuSeconds() > a->cpuDeadline )
+        longjmp( a->abandon, 1 );
+    Block* b = static_cast<Block*>( malloc( sizeof( Block ) + size ) );
+    if ( !b )
+        longjmp( a->abandon, 1 );   // out of memory
+    if ( a->held > a->peak )
+        a->peak = a->held;
+    b->size = size;
+    b->prev = 0;
+    b->next = a->blocks;
+    if ( a->blocks )
+        a->blocks->prev = b;
+    a->blocks = b;
+    return b + 1;
 }
 
 static void deallocate( void* userdata, void* p )
 {
     if ( !p )
         return;
-    static_cast<Allocations*>( userdata )->pointers.erase( p );
-    free( p );
+    Allocations* a = static_cast<Allocations*>( userdata );
+    Block* b = static_cast<Block*>( p ) - 1;
+    if ( b->prev )
+        b->prev->next = b->next;
+    else
+        a->blocks = b->next;
+    if ( b->next )
+        b->next->prev = b->prev;
+    a->held -= b->size + blockOverhead;
+    free( b );
 }
 
 static void freeAll( Allocations* arena )
 {
-    for ( std::unordered_set<void*>::const_iterator it = arena->pointers.begin(); it != arena->pointers.end(); ++it )
-        free( *it );
-    arena->pointers.clear();
+    while ( Block* b = arena->blocks ) {
+        arena->blocks = b->next;
+        free( b );
+    }
+    arena->held = 0;
+#ifdef __GLIBC__
+    // glibc keeps freed small blocks for reuse: after a large parse (up to
+    // maxHeldTotal) the process (KMail) would stay that large.  Given back
+    // to the system (a few ms).
+    if ( arena->peak > 64 * 1024 * 1024 )
+        malloc_trim( 0 );
+#endif
 }
 
 static std::string sourceText( const std::string& html )
 {
     std::string out = "<!DOCTYPE html>\n<html><body><p>[This message is too complex to be shown; its source:]</p><pre>\n";
+    // one block of the most it can take (no copies left behind growing)
+    out.reserve( out.size() + 4 * 1024 * 1024 + 2 * html.size() + 256 );
     escapeSource( out, html );
-    return out + "</pre></body></html>\n";
+    out += "</pre></body></html>\n";
+    return out;
+}
+
+// The test tool alone, with KWPE_SANITIZE_STATS set: how it went, on
+// stderr.
+static void stats( const char* what, const Allocations& arena, const ParseCost& cost, size_t out )
+{
+#ifdef KWPE_SANITIZE_TESTING
+    if ( getenv( "KWPE_SANITIZE_STATS" ) )
+        fprintf( stderr,
+                 "%s: allocated %zu of %zu, held %zu at most, output %zu; elements %zu, attributes %zu, "
+                 "clones %zu (%zu bytes)\n",
+                 what, arena.allocated, arena.budget, arena.peak, out, cost.elements(), cost.attributes(),
+                 cost.clones(), cost.cloneBytes() );
+#else
+    (void)what;
+    (void)arena;
+    (void)cost;
+    (void)out;
+#endif
 }
 
 std::string sanitizeHtml( const std::string& html, Profile profile, bool external )
 {
-    if ( tooMuchParsing( html ) )
-        return sourceText( html );   // not parsed (see maxParseWork)
+    double n = double( html.size() );
+    ParseCost cost( html, maxParseWork + maxParseWorkPerByte * n, maxCloneBytes + maxCloneBytesPerByte * n );
+    if ( !cost.run() )
+        return sourceText( html );   // Gumbo would work or clone too much (see maxParseWork)
     GumboOptions options = kGumboDefaultOptions;
     options.max_errors = 0;   // no error list: not needed, can be large
     Allocations arena;
+    arena.blocks = 0;
     arena.allocated = 0;
-    // The corpus's newsletters: 5-6 times their size (0.2 MB for 40 KB).
-    arena.budget = 4 * 1024 * 1024 + 16 * html.size();
+    arena.held = 0;
+    arena.maxHeld = std::min( maxHeld + maxHeldPerByte * html.size(), maxHeldTotal );
+    arena.peak = 0;
+    // Gumbo makes an element for each start tag that is not ignored
+    // (175-500 bytes with its attributes and text: KMail's plain text, one
+    // <div dir="ltr"> per line, 450-490 bytes per tag; an empty line, <br>,
+    // 175 bytes for 4), and keeps text and attributes 3-7 times their size
+    // (the corpus's newsletters: 5-6 times theirs).  A clone of a
+    // formatting element is an element with a copy of its attributes.
+    // Tags Gumbo ignores (a <td> outside a table) count nothing.
+    arena.budget = 4 * 1024 * 1024 + 16 * html.size() + 512 * cost.elements() + 256 * cost.attributes() +
+                   512 * cost.clones() + 2 * cost.cloneBytes();
+    arena.calls = 0;
+    double cpuLimit = std::min( maxParseCpu + maxParseCpuPerByte * double( html.size() ), maxParseCpuTotal );
+#ifdef KWPE_SANITIZE_TESTING
+    // the test tool alone (tests/render-only/kwpe-sanitize) may lower it
+    const char* ms = getenv( "KWPE_SANITIZE_CPU_LIMIT_MS" );
+    if ( ms && *ms )
+        cpuLimit = atof( ms ) / 1000;
+#endif
+    arena.cpuDeadline = threadCpuSeconds() + cpuLimit;
     options.allocator = allocate;
     options.deallocator = deallocate;
     options.userdata = &arena;
     if ( setjmp( arena.abandon ) ) {
         freeAll( &arena );
+        stats( "parse abandoned", arena, cost, 0 );
         return sourceText( html );
     }
     GumboOutput* output = gumbo_parse_with_options( &options, html.data(), html.size() );
-    Serializer s( profile, external );
+    // The output: KMail's plain text grows by a third at most (an empty
+    // line's <br> becomes <br />, entities stay); beyond maxOutput plus
+    // maxOutputPerByte per byte of input, or past the CPU deadline, the
+    // walk is abandoned as the parse is.
+    Serializer s( profile, external, maxOutput + maxOutputPerByte * html.size(), arena.cpuDeadline );
     // The document's mode as Gumbo found it (tables of mails depend on
     // quirks mode): no doctype is quirks mode.
     switch ( output->document->v.document.doc_type_quirks_mode ) {
@@ -1048,6 +2246,11 @@ std::string sanitizeHtml( const std::string& html, Profile profile, bool externa
     // message would exhaust the stack there).  Everything Gumbo allocated
     // is ours to free.
     freeAll( &arena );
+    stats( s.abandoned ? "walk abandoned" : "written", arena, cost, s.out.size() );
+    if ( s.abandoned ) {
+        std::string().swap( s.out );
+        return sourceText( html );
+    }
     return s.out;
 }
 

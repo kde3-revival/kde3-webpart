@@ -11,7 +11,15 @@
 
 // kwpe-sanitize [html|css] [content|host] [render-only|external] < in > out:
 // the mail mode's first layer alone (what WebKit gets of a message).
+// With KWPE_SANITIZE_STATS set, on stderr: what the parse allocated (see
+// sanitizeHtml()) and this process's peak RSS ("VmHWM: ... kB", of this
+// program alone: getrusage() would count what the parent held when it
+// forked) and its RSS once done ("VmRSS: ... kB");
+// KWPE_SANITIZE_CPU_LIMIT_MS replaces the parse's CPU time limit.
 
+#include <stdlib.h>
+
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string>
@@ -28,5 +36,13 @@ int main( int argc, char** argv )
     bool external = mode == "external";
     std::cout << ( kind == "css" ? KWPEMailSanitizer::sanitizeCss( in, p, external )
                                  : KWPEMailSanitizer::sanitizeHtml( in, p, external ) );
+    std::cout.flush();
+    if ( getenv( "KWPE_SANITIZE_STATS" ) ) {
+        std::ifstream status( "/proc/self/status" );
+        std::string line;
+        while ( std::getline( status, line ) )
+            if ( line.compare( 0, 6, "VmHWM:" ) == 0 || line.compare( 0, 6, "VmRSS:" ) == 0 )
+                std::cerr << line << std::endl;
+    }
     return 0;
 }
