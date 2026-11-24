@@ -1,23 +1,217 @@
-# kde3-wpepart
+# kde3-webpart
 
-A browser part for Konqueror (KDE 3.5, kde3-revival) that shows web
-pages with [WPE WebKit](https://wpewebkit.org/): `KWPEPart`, a
-`KParts::ReadOnlyPart` with a `BrowserExtension`, as KHTML's part.
+`KWPEPart`, a KDE 3 component (KPart) that shows web content with
+[WPE WebKit](https://wpewebkit.org/) on X11. It is part of the
+[kde3-revival](https://github.com/kde3-revival) project, which maintains
+KDE 3.5 for today's Linux systems.
 
-Status: **stage 2 in progress.**  Pages load and render, links, forms,
-scripts, back/forward through Konqueror's history, title, progress,
-padlock, status bar text and wheel scrolling work, on
-the GPU (DMA-BUF) or through shared memory.  Stage 2 so far: downloads
-through KDE's save dialog and KIO's progress window, Konqueror's context
-menus, find in page, zoom, persistent cookies, HTTP authentication,
-recovery from web process crashes, an ad blocker (EasyList and friends
-as WebKit content filters).  See "Next stages" for what is missing.
+The part is used in three ways:
 
-Why WPE WebKit: it is GLib based and embeddable without a toolkit (the
-embedder implements a small "platform": display, view, buffers,
-events), and it gets its security updates from the distribution.
+- **Konqueror** (in [kde3-base](https://github.com/kde3-revival/kde3-base))
+  uses it as its browser view for web pages, in place of KHTML.
+- **KMail** (in [kde3-pim](https://github.com/kde3-revival/kde3-pim)) uses
+  it as its message reader, in a *mail mode* that only renders: messages
+  are sanitized and nothing in them can load anything or run scripts.
+- **Applications** use it in an *app mode* that wraps one web site as a
+  desktop application, for example KWhatsApp in
+  [kde3-apps](https://github.com/kde3-revival/kde3-apps).
 
-## Architecture
+The repository is called kde3-webpart; the distribution packages and older
+documents call it kde3-wpepart. How the project works is described on the
+[organisation page](https://github.com/kde3-revival).
+
+## What WPE WebKit is, and why
+
+[WPE WebKit](https://wpewebkit.org/) is the WebKit port for embedded
+systems and for hosts that are not GTK applications. It is developed by
+Igalia as part of upstream WebKit, the engine of Safari and GNOME Web.
+
+It was chosen over the alternatives for these reasons:
+
+- **KHTML** cannot keep up with current web standards.
+- **QtWebKit** is no longer maintained and needs Qt 5.
+- **CEF** (Chromium Embedded Framework) is a large bundle built outside
+  the distribution, so its security updates would have to come from
+  this project.
+
+WPE, by contrast:
+
+- implements current web standards and is maintained upstream; security
+  updates come from the distribution;
+- needs no toolkit. The embedder implements a small "platform" (display,
+  view, buffers, input events), so it fits a Qt 3 host;
+- runs web content in separate, sandboxed processes (bubblewrap).
+
+How the part uses it: WebKit's web process renders off screen into GPU
+buffers (DMA-BUF). The part shows them in its X11 window through DRI3
+and Present, without copying pixels through the CPU. Where the X server
+has no DRI3 (Xvfb, Xephyr, remote displays), it falls back to shared
+memory. Qt's mouse, keyboard and focus events are forwarded to WebKit.
+
+## Features
+
+- **Browsing in Konqueror**: Konqueror's history, back and forward,
+  title, progress, padlock (including "partially encrypted"), status bar,
+  context menus, find (Ctrl+F, F3), zoom, View Document Source (Ctrl+U),
+  favicons, new windows and tabs. Links to `mailto:` and other schemes go
+  to KDE. Content WebKit cannot show (archives, PDF, ...) goes back to
+  Konqueror.
+- **Downloads** through KDE's save dialog and KIO's progress window, to
+  any KIO destination.
+- **Clipboard**: copy, and paste from the X CLIPBOARD and PRIMARY (text,
+  HTML, URI lists, images) with a bounded selection reader. Pages cannot
+  read the clipboard on their own.
+- **Page dialogs**: `alert`, `confirm`, `prompt`, `onbeforeunload`, and
+  KDE's file dialog for `<input type=file>`. The dialogs are modal to
+  the page only.
+- **HTTP authentication** with KDE's password dialog.
+- **Cookies and storage**: persistent cookies (WebKit's policy, no
+  third-party cookies) and site data, kept in
+  `$KDEHOME/share/apps/kwpepart/`. The cache goes to KDE's cache
+  directory. `KWPE_EPHEMERAL=1` keeps everything in memory.
+- **Ad blocking**: Adblock Plus lists (EasyList, EasyPrivacy, uBlock
+  filters, ...) are converted into WebKit content filters. uBlock
+  scriptlets (for example against YouTube ads) are supported. Lists are
+  updated daily over HTTPS, and blocking can be switched off per site.
+- **User agent**: WebKit's user agent with `Konqueror/3.5.10` appended.
+  `KWPE_USER_AGENT` replaces it.
+- **Mail mode** for KMail:
+  - isolated sessions, no scripts, no remote content unless allowed;
+  - a Gumbo-based HTML sanitizer with bounds on depth, memory, CPU time
+    and output;
+  - Content-Security-Policy, content filters and a dead proxy as further
+    independent layers.
+- **App mode** for applications:
+  - its own WebKit context and storage;
+  - only the application's sites in the main frame;
+  - notifications with their pictures, permissions decided by the host,
+    dropped files.
+- **Recovery** from web process crashes, and a settings dialog ("Configure
+  WPE WebKit...") for smooth scrolling and ad blocking.
+
+## Requirements
+
+- kde3-qt and [kde3-libs](https://github.com/kde3-revival/kde3-libs)
+  installed (the part uses kparts and kutils and the `KDE3Libs` CMake
+  package), CMake 3.20 or later, a C++ compiler, pkg-config.
+- WPE WebKit 2.50 or later with the WPEPlatform API (`wpe-webkit-2.0`,
+  `wpe-platform-2.0`). It was developed with 2.54.3. The older libwpe API
+  is not used.
+- Gumbo 0.10 or later (the mail mode's HTML parser).
+- libX11, libX11-xcb, libXext, libXfixes, libXpresent, libXrandr, libxcb,
+  libxcb-dri3 and libdrm.
+- At run time: an X server, preferably with DRI3 and Present (GPU path).
+  Konqueror and KMail from this project, to use the part there.
+
+## Building and installing
+
+    cmake -S . -B build
+    cmake --build build -j"$(nproc)"
+    sudo cmake --install build
+    kbuildsycoca
+
+The part installs into the prefix of the kdelibs it found (by default
+`/opt/kde3`). Pass `-DCMAKE_PREFIX_PATH=/opt/kde3` if kdelibs is not in a
+standard place.
+
+It installs the following:
+
+- `lib/kde3/libkwpepart.so` and `share/services/kwpepart.desktop`;
+- the XML GUI files;
+- `bin/kwpeview`, which shows a URL in the part in a window of its own;
+- `bin/kwpe-filterconv`, the ad blocker's list converter:
+  `kwpe-filterconv --store DIR --id NAME [--json DIR] [--verbose] LIST...`
+  converts and compiles lists by hand, and `--verbose` names every
+  dropped filter.
+
+`-DKWPE_RENDER_ONLY_TEST=ON` also builds the mail mode's render-only
+test (not installed).
+
+Once installed, Konqueror prefers the part for `text/html` and
+`application/xhtml+xml` (`InitialPreference=12`, above KHTML's 10). KHTML
+can be chosen again in Control Center > File Associations, or per view
+with View > View Mode. KMail uses the part when it is installed, unless
+its settings choose KHTML.
+
+## Packages
+
+[kde3-packaging](https://github.com/kde3-revival/kde3-packaging) builds
+the part as **`kde3-wpepart`** for Fedora and Arch Linux.
+
+- **Arch Linux**: WPE WebKit comes from the distribution's `wpewebkit`.
+- **Fedora**: Fedora has no WPE WebKit package, so kde3-packaging also
+  builds `wpewebkit` from the upstream release, with this repository's
+  image scaling patch (see "WebKit patches").
+
+## Diagnostics
+
+| Variable | Effect |
+| --- | --- |
+| `KWPE_DEBUG=1` | The platform's decisions: extensions, DRM device, formats, imports; every paste and clipboard read |
+| `KWPE_DEBUG=2` / `3` | Also every Present completion / every damage rectangle |
+| `KWPE_NETLOG=1` | With the time of day: the network state pages get as `navigator.onLine` (and its changes), failed subresources (fetch, XHR, streams), long streams when they end (scheme, host and path only), the view shown or hidden and its window active or inactive. Use it to match a web app's "connection lost" with what happened |
+| `KWPE_STATS=1` | Per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel latency; time to commit, first paint and load end |
+| `KWPE_FORCE_SHM=1` | Shared memory even when DRI3 is there (to compare) |
+| `KWPE_EPHEMERAL=1` | No data or cache directories |
+| `KWPE_USER_AGENT=...` | A user agent of one's choice (app mode keeps its own) |
+| `KWPE_CANVAS_ACCELERATION=1` | GPU 2D canvas (off by default, see "Known problems") |
+| `KWPE_DEVELOPER_EXTRAS=1` | WebKit's developer extras. With WebKit's own `WEBKIT_INSPECTOR_HTTP_SERVER=127.0.0.1:PORT`, the Web Inspector can be opened from a browser at that address |
+
+## Tests
+
+`tests/` holds manual and automated tests:
+
+| Path | What it holds |
+| --- | --- |
+| `pages/` and `server.py` | Test pages, and a server for downloads, POST, cookies, Basic authentication and answers of any type |
+| `xinject.py`, `xselection.py` | XTest input and a foreign X selection owner, for a nested X server |
+| `bench.sh`, `scrollbench.sh`, `wpemem.sh` | Frame statistics, wheel latency, memory and CPU |
+| `adblock/` | The filter converter's tests and the scriptlet check |
+| `clipboard/` | `xseltest`: the X selection reader against well-behaved and hostile owners |
+| `render-only/` | The mail mode's contract that a message cannot make a DNS query or a connection, in a network namespace, with each defence layer switched off in turn; sanitizer timing on hostile documents |
+| `imagescale/`, `deadlock/` | The two WebKit patches |
+
+Details are in "Debugging and testing" below.
+
+## Status
+
+The part is used in Konqueror, as KMail's default reader and in
+KWhatsApp. Its version is 0.1.0. The main limitations:
+
+- no printing (WPE has no print API), so KMail prints with KHTML;
+- no password manager;
+- no input method preedit.
+
+The full list is under "Known problems" below.
+
+## License
+
+GNU Lesser General Public License, version 2.1 or later, see
+`COPYING.LIB`. The patches in `webkit/` are under WebKit's licenses. The
+scriptlet library (`src/scriptlets.js`) was written for this project
+from the documented behaviour of uBlock's scriptlets and contains no
+uBlock code. Contributions are accepted under the same terms.
+
+## Related repositories
+
+- [kde3-qt](https://github.com/kde3-revival/kde3-qt): Qt 3.3.8b, the base
+  of everything
+- [kde3-libs](https://github.com/kde3-revival/kde3-libs): the KDE core
+  libraries
+- [kde3-base](https://github.com/kde3-revival/kde3-base): the desktop,
+  with Konqueror
+- [kde3-pim](https://github.com/kde3-revival/kde3-pim): KMail, KOrganizer,
+  KAddressBook, Kontact
+- [kde3-apps](https://github.com/kde3-revival/kde3-apps): applications,
+  with KWhatsApp
+- [kde3-packaging](https://github.com/kde3-revival/kde3-packaging): Fedora
+  and Arch Linux packages (`kde3-wpepart`)
+
+---
+
+## Technical details
+
+### Architecture
 
 ```
  Konqueror (Qt 3, Qt's GLib main loop)                     WebKit's processes
@@ -48,7 +242,7 @@ events), and it gets its security updates from the distribution.
   types cannot be unregistered and the part installs a Qt X11 event
   filter.
 
-### The X11 platform (`wpex11platform.cpp`)
+#### The X11 platform (`wpex11platform.cpp`)
 
 WebKit 2.54's WPEPlatform API lets the embedder subclass `WPEDisplay`,
 `WPEView`, `WPEToplevel` and `WPEScreen` (GObject).  Our own platform
@@ -97,7 +291,7 @@ server's GPU, its formats and its frame timing.
   modifiers.  Qt-synthesized key events (input-method text) are
   translated from the Qt event instead.
 
-### The widget (`kwpewidget.cpp`)
+#### The widget (`kwpewidget.cpp`)
 
 One `WebKitWebContext` and `WebKitNetworkSession` per process (data in
 `$KDEHOME/share/apps/kwpepart`, cache in KDE's cache directory), one
@@ -122,7 +316,7 @@ While the page has the focus, keys without Ctrl/Alt/Meta go to the page
 rather than to Konqueror's single-key shortcuts (`AccelOverride`), F-keys
 and Escape stay Konqueror's; Tab moves inside the page.
 
-### History: who navigates
+#### History: who navigates
 
 WebKit navigates by itself (links, forms, scripts, redirects) and keeps
 its own back/forward list; Konqueror keeps the history the user sees.
@@ -151,7 +345,7 @@ same-document navigation and double every request, so:
 * tokens are unique in the process (Konqueror copies history entries
   between views) and are checked against the item's URL.
 
-### Downloads, menus, find, zoom (`kwpedownload.cpp`, `kwpepart.cpp`)
+#### Downloads, menus, find, zoom (`kwpedownload.cpp`, `kwpepart.cpp`)
 
 * **Downloads** WebKit makes (attachments, `<a download>`, POST
   answers, "Save Link/Image As..."), with WebKit's cookies: KDE's save
@@ -185,7 +379,7 @@ same-document navigation and double every request, so:
   within 30 s or an out-of-memory kill leaves the last frame and a
   status bar message.
 
-### Clipboard, page dialogs, favicons, source (`kwpeclipboard.cpp`, `kwpedialogs.cpp`)
+#### Clipboard, page dialogs, favicons, source (`kwpeclipboard.cpp`, `kwpedialogs.cpp`)
 
 * **Paste** (`KWPEClipboard`, the X11 platform's `WPEClipboard`): Ctrl+V,
   Ctrl+Shift+V and Shift+Insert paste the X CLIPBOARD, a middle click
@@ -238,7 +432,7 @@ same-document navigation and double every request, so:
   unless `[Settings] PDFInPage=true` (WebKit's PDF.js, a check box in
   the settings dialog).
 
-### Ad blocking (`kwpeadblock.cpp`, `abpconverter.cpp`, `kwpe-filterconv`)
+#### Ad blocking (`kwpeadblock.cpp`, `abpconverter.cpp`, `kwpe-filterconv`)
 
 Adblock Plus filter lists become WebKit **content filters**
 (`WebKitUserContentFilterStore`, Safari's content blocker format): WebKit
@@ -332,7 +526,7 @@ in the web process; the part is not called per request.
   signal, no failed resource), so there is no count.  No Konqueror
   control center page yet.
 
-### Scriptlets (`scriptlets.js`, `abpconverter.cpp`, `kwpeadblock.cpp`)
+#### Scriptlets (`scriptlets.js`, `abpconverter.cpp`, `kwpeadblock.cpp`)
 
 Some ads cannot be blocked as requests: YouTube sends them in the same
 answers as the video (`ytInitialPlayerResponse` in an inline script, the
@@ -401,7 +595,7 @@ before the page's own scripts.
   a rebuilt `Response` keeps `url`/`type`/`redirected` but its `clone()`
   does not.
 
-### Which part Konqueror uses
+#### Which part Konqueror uses
 
 KDE 3 chooses parts by mime type: `kwpepart.desktop` registers for
 `text/html` and `application/xhtml+xml` with `InitialPreference=12`,
@@ -414,13 +608,55 @@ Konqueror normally asks KIO for the mime type of a typed (or otherwise
 opened) http URL first (KonqRun): a request of its own, and KDE's cookie
 or certificate dialogs, before the part loads the page again.
 `kwpepart.desktop` says `X-KDE-BrowserView-FetchesProtocols=http,https`:
-the Konqueror of kde3-kdebase's `konq-wpe` branch then opens such URLs as
+the Konqueror of kde3-base then opens such URLs as
 `text/html` directly when this part would show them (the view's part,
 or the preferred text/html part), except POST requests; KHTML views
 keep the probe.  Whatever WebKit cannot show still reaches Konqueror
 (`openURLRequest()` with the mime type: other parts, applications, the
 save dialog; KIO fetches it once more), attachments are downloaded by
 WebKit, and the location bar returns to the page on screen.
+
+### Mail mode: a render-only message reader for KMail
+
+KMail creates the part with the argument `mode=mail`. A message may only
+be laid out and painted. Nothing in it may load anything or act; the
+user's link clicks go to KMail. Several independent layers enforce
+this, and each holds on its own:
+
+1. **Sanitizer** (`kwpemailsanitizer.cpp`). Every HTML file of the
+   message is parsed with Gumbo (the WHATWG algorithm) and written again
+   from a white list of elements and attributes.
+   - **Dropped**: scripts, frames, objects, forms, media, SVG, MathML,
+     event handlers, `srcset` and `ping`.
+   - **Links** only to http(s), mailto, ftp, news and anchors.
+   - **Images** only `data:image/*` (not SVG) and `cid:`.
+   - **CSS** goes through a tokenizer that replaces every URL that is not
+     allowed.
+   - **Bounds**: the parse is non-recursive, with nesting limited to 400.
+     A linear cost estimate runs before Gumbo; nothing in the message can
+     lower it.
+   - **Budgets** grow with the input: memory held by Gumbo
+     128 MB + 48 bytes per input byte, at most 512 MB; CPU time
+     2 s + 0.25 µs per byte, at most 4 s; output and clones are bounded
+     too.
+   - A document beyond a bound is shown as source text.
+2. **WebKit settings**: its own context, an ephemeral session, no page
+   JavaScript or storage. The features that load by themselves (preconnect,
+   prefetch, speculation rules, beacon, WebSocket, workers, ...) are
+   switched off.
+3. **Content-Security-Policy** on every response: `default-src 'none'`,
+   no scripts, forms or frames, CSP sandbox.
+4. **Network**: a content filter on every mail view blocks everything but
+   the message's own `kwpemail:` scheme and `data:`. The render-only
+   session's proxy is a local port that closes every connection.
+
+Remote images, style sheets and fonts load only when KMail allows
+external references. Such a message gets a new view with a new
+ephemeral session, dropped with the next message. Each message has its
+own origin (`kwpemail://m<n>/`), which serves only the files KMail wrote
+for it. The host reads the scroll position and the selection through the
+properties `mailAtBottom` and `mailSelectedText`.
+`tests/render-only/` checks the contract in a network namespace.
 
 ### App mode: an application around one web site
 
@@ -496,43 +732,12 @@ of its own:
   part's GUI (`kwpeapppart.rc`): find, zoom, reload.  The property
   `appMode` tells an older part (without the app mode) apart.
 
-## Building
-
-Needs kde3-qt and kdelibs (CMake port), WPE WebKit ≥ 2.50 with the
-WPEPlatform API (`wpe-webkit-2.0`, `wpe-platform-2.0`; developed with
-2.54.3) and libX11, libX11-xcb, libXext, libXfixes, libXpresent,
-libXrandr, libxcb-dri3, libdrm.
-
-```sh
-cmake -G Ninja -S . -B build \
-      -DCMAKE_PREFIX_PATH=/opt/kde3 -DCMAKE_INSTALL_PREFIX=/opt/kde3
-ninja -C build && ninja -C build install
-kbuildsycoca
-```
-
-It installs `lib/kde3/libkwpepart.so`, `share/services/kwpepart.desktop`,
-`bin/kwpeview` and `bin/kwpe-filterconv` (the ad blocker's converter;
-`kwpe-filterconv --store DIR --id NAME [--json DIR] [--verbose] LIST...`
-converts and compiles lists by hand, `--verbose` names every dropped
-filter).
-
-## Debugging and testing
+### Debugging and testing
 
 `kwpeview URL` loads the part like Konqueror does (KLibLoader, KParts
 factory) in a window of its own.
 
-Environment variables:
-
-| variable | effect |
-| --- | --- |
-| `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports; every paste and clipboard read |
-| `KWPE_NETLOG=1` | with the time of day: the network state pages get as `navigator.onLine` (and its changes), subresources (fetch, XHR, streams) that failed or got an HTTP error, streams of 60 s or more when they end (scheme, host, path only), the view shown/hidden and its window active/inactive: to match a web app's "connection lost" with what happened |
-| `KWPE_DEBUG=2` / `3` | also every Present completion / every damage rectangle |
-| `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel event → first frame on screen, last wheel event of a burst → page at rest; time to commit, first paint and load end |
-| `KWPE_FORCE_SHM=1` | shared memory even when DRI3 is there (to compare) |
-| `KWPE_EPHEMERAL=1` | no data or cache directories |
-| `KWPE_CANVAS_ACCELERATION=1` | GPU 2D canvas (off by default, see below) |
-| `KWPE_DEVELOPER_EXTRAS=1` | WebKit's developer extras |
+The environment variables are listed under "Diagnostics" above.
 
 `tests/` has test pages (`pages/`, serve them with
 `python3 -m http.server`), `xinject.py` (XTest input for a nested X
@@ -568,7 +773,7 @@ dbus-run-session -- sh -c 'mutter --headless --no-x11 --wayland-display=wl-test 
     -geometry 1920x1080 -fullscreen -noreset'
 ```
 
-## Measurements (stage 1, 2026-11-21)
+### Measurements (stage 1, 2026-11-21)
 
 Arch Linux, AMD GPU (radeonsi), WPE WebKit 2.54.3, kwpeview 1600×1000,
 X server: rootful Xwayland with glamor on a headless mutter (DRI3 1.4,
@@ -592,7 +797,7 @@ copy of the damage in the part; the DMA-BUF path costs neither.  In
 Xephyr (SHM, software X server) wheel scrolling of Wikipedia also runs
 at 55–60 fps.
 
-### Wheel latency (2026-11-21)
+#### Wheel latency (2026-11-21)
 
 Xephyr (SHM path, software X server), kwpeview 1600×1000, `long.html`,
 `tests/scrollbench.sh`: the time from Qt's wheel event to the first
@@ -605,7 +810,7 @@ last wheel event of a burst to the last such frame (the page at rest).
 | single notch: page at rest | 141 ms | 40 ms |
 | 25 notches 12 ms apart: page at rest after the last one | 261 ms | 56 ms |
 
-### Ad blocking (2026-11-21)
+#### Ad blocking (2026-11-21)
 
 `kwpe-filterconv`, EasyList + EasyPrivacy (135 486 filters): 108 995
 network blocks, 1 606 exceptions, 13 638 generic and 10 268 site
@@ -620,21 +825,21 @@ first update (downloads included) takes about 6 s.
 In use: the set is read from the store in 20 ms; kwpeview with a still
 page, filters off/on: RSS 347 / 352 MiB, PSS 183 / 188 MiB (+5 MiB, in
 the web process).  dailymail.co.uk: 1586 → 1060 MiB RSS, no ad slots
-and no consent wall (screenshots in `build/wpepart-tests/adblock/`).
+and no consent wall.
 
 Scriptlets (2026-11-22): EasyList, EasyPrivacy, uBlock filters and Quick
 fixes give 9 092 scriptlet injections (828 unsupported, 76 exceptions
 applied), 22 of them for www.youtube.com.  Three videos without
 scriptlets: pre-rolls on two (a skippable "Sponsored" ad, then a second
 one); with them: no ad, the video plays (autoplay needs a click in a new
-profile either way) — screenshots in `/var/tmp/kwpe-scriptlets/`.
+profile either way).
 Google, Wikipedia, BBC, CNN (5 scriptlets), Daily Mail (frames with
 their own), Twitch, digi24 render as before.
 
-## Known problems
+### Known problems
 
 * **Images scaled down by a page look jagged** (screenshots lose their
-  text, photos alias; e.g. the screenshot on icesoft.ro).  This is WebKit
+  text, photos alias).  This is WebKit
   itself, not the part: the Skia port draws `InterpolationQuality::Default`
   with bilinear filtering and no mipmaps, which point samples anything
   shown at less than half its size (the Cairo port box-filtered).  The
@@ -663,9 +868,9 @@ their own), Twitch, digi24 render as before.
 * WebKit 2.54 drops the contents of GPU-accelerated 2D canvases of pages
   in the back/forward cache (going back shows them empty), so 2D canvas
   acceleration is off by default.
-* Without the `konq-wpe` Konqueror, typed http/https URLs are still
-  fetched by kio_http first (the mime type probe, KDE's cookie dialog).
-  With it, a file WebKit cannot show is fetched twice (WebKit, then
+* With a Konqueror older than kde3-base's, typed http/https URLs are
+  still fetched by kio_http first (the mime type probe, KDE's cookie
+  dialog).  With kde3-base's, a file WebKit cannot show is fetched twice (WebKit, then
   KIO) and KDE's save dialog does not know the server's file name
   (`Content-Disposition` on a non-attachment).
 * WebKit's frames are paced by its own refresh-rate timer, not by the
@@ -673,7 +878,7 @@ their own), Twitch, digi24 render as before.
 * POST data handed over by Konqueror (`URLArgs::postData`, e.g. a form
   submitted in KHTML and reloaded here) is not passed to WebKit.
 * Printing: WPE WebKit has no print API (`WebKitPrintOperation` is
-  GTK-only); Konqueror's Print stays disabled.
+  GTK-only); Konqueror's Print stays disabled and KMail prints with KHTML.
 * `WebKitEditorState` never changes with the WPE platform API, so
   Konqueror's Copy is always enabled.
 * Unsupported GET responses are fetched again by KIO for Konqueror
@@ -707,9 +912,9 @@ their own), Twitch, digi24 render as before.
   gesture and KDE's URL policy.
 * Favicons go through KDE's cache at 16 pixels (kded's favicons module
   downloads them once more); SVG icons need kdelibs' SVG kimgio plugin;
-  the module and the ICO reader needed fixes (kde3-kdebase and
-  kde3-kdelibs, branches `favicons`: a kded crash with icons over 64 KiB,
-  PNG entries in ICO files, error pages taken for icons).  The icon
+  the module and the ICO reader needed fixes, which are in kde3-base and
+  kde3-libs (a kded crash with icons over 64 KiB, PNG entries in ICO
+  files, error pages taken for icons).  The icon
   arrives after the page and is taken for the page shown then.
 * No password manager yet (KWallet for forms; the `submit-form` hook is
   a stub).
@@ -720,17 +925,15 @@ their own), Twitch, digi24 render as before.
   redirect it keeps the previous site's element hiding instead);
   `$document`/`$elemhide` exceptions and site element hiding follow the
   top page, also inside frames of other sites.
-* The DMA-BUF path was tested on Xwayland (AMD), not yet on a real Xorg
-  (Fedora 44 does not package WPE WebKit; the Arch build needs glibc
-  2.44).
+* The DMA-BUF path was measured on Xwayland (AMD); see "Measurements".
 
-## Next stages
+### Plans
 
 1. **Konqueror integration**: a Konqueror setting for the web engine
    (per protocol); PRIMARY from page selections, middle click to open a
    URL; printing (no WPE API: maybe a snapshot or a PDF via a headless
    GTK WebKit).  Done: context menus, find, zoom, copy, paste (X
-   CLIPBOARD and PRIMARY), no KIO probe (Konqueror `konq-wpe`), file
+   CLIPBOARD and PRIMARY), no KIO probe (kde3-base's Konqueror), file
    chooser, script dialogs, favicons, view source, other schemes.
 2. **Downloads**: `URLArgs::postData`; unsupported GET content
    downloaded by WebKit when no part embeds it.  Done: downloads via
@@ -752,10 +955,16 @@ their own), Twitch, digi24 render as before.
    agent, fonts, cache; the ad blocker's page (now a dialog of the
    part).
 
-## WebKit deadlock under memory pressure
+### WebKit patches
+
+`webkit/` holds two patches for WPE WebKit 2.54.3.
+`0001-Skia-Sample-scaled-down-images-from-mipmaps.patch` is described
+under "Known problems" (images scaled down by a page); kde3-packaging's
+Fedora `wpewebkit` applies it.
 
 `webkit/0002-Skia-Don-t-deadlock-when-releasing-GPU-resources-und.patch`
 (applies to 2.54.3 after 0001): stock WebKit hangs the web process when it
 frees GPU resources under critical memory pressure while display lists with
 promise images are pending (seen while playing YouTube, above 1.5 GB).
 `tests/deadlock` reproduces it.
+
