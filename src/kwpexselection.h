@@ -1,0 +1,90 @@
+/*
+    This file is part of kde3-wpepart, a WPE WebKit browser part for KDE 3.
+
+    Copyright (C) 2026 Serghei Amelian
+
+    This library is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published
+    by the Free Software Foundation; either version 2.1 of the License, or
+    (at your option) any later version.
+*/
+
+#ifndef KWPEXSELECTION_H
+#define KWPEXSELECTION_H
+
+#include <X11/Xlib.h>
+
+#include <stddef.h>
+#include <string>
+
+/**
+ * Reading another program's X selection (ICCCM), with the INCR protocol for
+ * large data (a screenshot PNG is several MB, the owner sends it in pieces
+ * of about 256 KB), bounded in time.
+ *
+ * WebKit asks for clipboard data synchronously, so the caller waits; this
+ * waits on the X connection itself (no polling with sleeps, as Qt 3's
+ * reader does: 50 ms per piece) and gives up after a time without
+ * progress and after a total time, instead of 5 s per step.  Plain Xlib,
+ * no Qt (tests/clipboard runs it alone).
+ */
+namespace KWPEXSelection
+{
+
+enum Result
+{
+    Ok,
+    Refused,      // the owner cannot convert to that target, or no owner
+    Timeout,      // no answer / no progress in time
+    TooLarge,     // more than maxBytes
+    Failed        // a protocol error (the property vanished, ...)
+};
+
+/**
+ * Events that must not wait while we do: requests to this program's own
+ * selections, the steps of its own outgoing INCR transfers.  wants() is
+ * called inside Xlib's queue scan (no Xlib calls there); handle() gets the
+ * event taken off the queue.  The reader's own window never gets here.
+ */
+struct Service
+{
+    bool ( *wants )( const XEvent* event, void* data );
+    void ( *handle )( XEvent* event, void* data );
+    void* data;
+};
+
+struct Limits
+{
+    int idleMs;        // longest wait for the next answer or piece
+    int totalMs;       // longest read in all
+    size_t maxBytes;
+};
+
+/**
+ * Converts @p selection to @p target and reads it into @p data (format 8
+ * data as bytes; format 32 items as 32-bit values in host order, e.g.
+ * TARGETS).  @p time is the time of the user's request (ICCCM).
+ * @p service, if given, gets the events it wants that arrive meanwhile.
+ * The total time is checked every round; the idle time restarts only on
+ * progress.  One read at a time: a nested call fails.
+ */
+Result read( Display* dpy, Atom selection, Atom target, Time time, const Limits& limits,
+             std::string& data, Atom* type = 0, int* format = 0, const Service* service = 0 );
+
+/**
+ * Our own outgoing transfers, for a Service: noteRequest() with every
+ * SelectionRequest this program gets (it answers it, maybe with INCR);
+ * isOutgoingStep() is true for a PropertyDelete by such a requestor on the
+ * property it asked for, within 10 s of its last step (the steps of an
+ * INCR transfer we send).  Other PropertyNotify events are not ours to
+ * handle.  Both are safe inside Xlib's queue scan (no Xlib calls).
+ */
+void noteRequest( const XEvent* event );
+bool isOutgoingStep( const XEvent* event );
+
+/** Text for logs: "ok", "refused", ... */
+const char* resultName( Result result );
+
+}
+
+#endif

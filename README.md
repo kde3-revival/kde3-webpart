@@ -196,7 +196,26 @@ same-document navigation and double every request, so:
   the web process asks, so other programs' data is served only during a
   paste the user started (the key or the click opens a one second
   window); scripts cannot paste (`javascript-can-access-clipboard` off,
-  DOM paste access denied by WPE).
+  DOM paste access denied by WPE).  WebKit waits for every read (and so
+  does the window), so another program's targets and data are read by
+  `kwpexselection.cpp`, not by Qt 3: INCR for large data (a screenshot
+  PNG of several MB arrives in pieces of about 256 KB; Qt 3 slept 50 ms
+  per piece), waits on the X connection, gives up after 2 s for the
+  targets and after 3 s without progress / 10 s in all for the data
+  (Qt 3 waited 5 s per step), only targets the owner offers are asked for,
+  and the last image read is reused within the same paste (WebKit reads
+  it two or three times per paste).  Text and HTML of other programs come the same way (UTF8_STRING,
+  COMPOUND_TEXT, STRING as Latin-1, `text/plain;charset=X` and
+  `text/html;charset=X` in any charset Qt or iconv knows; plain HTML in
+  UTF-16 or UTF-8), converted here, and only what can be read is offered
+  to the page; an owner offering only a PIXMAP gets its drawable copied as PNG
+  (16384 px a side, 32 Mpixels at most).  Every request of a paste uses
+  the key's time; the paste ends when the selection changes hands after
+  the key (also while its formats are asked for).  While we wait, Qt keeps
+  serving our own selections: requests, and the steps of its outgoing
+  INCR transfers (property deletions by programs that asked us within
+  10 s; other events stay queued).
+  A read slower than 300 ms keeps the window open one second more (once).
 * **Page dialogs** are modal to the page only: non-modal windows, the
   page takes no input while one is open, they hide with their tab and
   come back with it, closing the tab answers them (cancel) before the
@@ -433,6 +452,7 @@ Environment variables:
 | variable | effect |
 | --- | --- |
 | `KWPE_DEBUG=1` | the platform's decisions: extensions, DRM device, formats, imports; every paste and clipboard read |
+| `KWPE_NETLOG=1` | with the time of day: the network state pages get as `navigator.onLine` (and its changes), subresources (fetch, XHR, streams) that failed or got an HTTP error, streams of 60 s or more when they end (scheme, host, path only), the view shown/hidden and its window active/inactive: to match a web app's "connection lost" with what happened |
 | `KWPE_DEBUG=2` / `3` | also every Present completion / every damage rectangle |
 | `KWPE_STATS=1` | per second: frames shown (and how many DMA-BUF), Present latency, longest gap, SHM copy time, damaged pixels; wheel event → first frame on screen, last wheel event of a burst → page at rest; time to commit, first paint and load end |
 | `KWPE_FORCE_SHM=1` | shared memory even when DRI3 is there (to compare) |
@@ -455,7 +475,13 @@ PDF for `application/pdf`); its log says whether KIO or WebKit asked.
 of the same and of another site, with blocking off for the site, and on a
 site without scriptlets).
 Pages for stage 3: `probe.html` (PDF, archive, attachment, mailto:),
-`paste.html`, `upload.html`, `dialogs.html`.
+`paste.html`, `upload.html`, `dialogs.html`; `pasteimage.html` (a pasted
+screenshot: the file, shown and scaled, while a counter keeps running).
+`tests/clipboard/run.sh DISPLAY BUILD_DIR` runs `xseltest`: the X
+selection reader against owners that behave and that do not (silent,
+stalled INCR, too large, endless pieces, a flooded window, our own
+CLIPBOARD read by another client during a read while an unrelated
+foreign event stays queued).
 
 Xephyr has no DRI3, so it exercises the SHM path.  A rootful Xwayland
 in a headless compositor has DRI3 and Present (glamor) and exercises the

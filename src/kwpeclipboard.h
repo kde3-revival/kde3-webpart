@@ -14,6 +14,8 @@
 
 #include <qclipboard.h>
 
+union _XEvent;
+
 /**
  * WebKit's clipboard (a WPEClipboard of the X11 platform) on the X
  * selections, through QClipboard:
@@ -40,6 +42,13 @@ namespace KWPEClipboard
  * those of that selection.  Returns false if it has nothing.
  */
 bool preparePaste( QClipboard::Mode mode );
+
+/**
+ * Every X event this program gets (its event filter): requests for its
+ * selections are remembered, so that their INCR transfers can go on while
+ * a paste waits for another program.
+ */
+void noteXEvent( const _XEvent* event );
 
 }
 

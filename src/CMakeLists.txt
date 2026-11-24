@@ -11,6 +11,8 @@ kde3_add_module(libkwpepart
     kwpewidget.cpp
     kwpemailsanitizer.cpp
     kwpeclipboard.cpp
+    kwpexselection.cpp
+    kwpenetlog.cpp
     kwpedialogs.cpp
     kwpedownload.cpp
     kwpeadblock.cpp
@@ -64,4 +66,10 @@ kde3_add_executable(abptest
   NO_INSTALL
 )
 target_include_directories(abptest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# xseltest: the X selection reader against well and badly behaved owners
+# (not installed; run it on a nested X server: tests/clipboard/run.sh)
+add_executable(xseltest kwpexselection.cpp ../tests/clipboard/xseltest.cpp)
+target_include_directories(xseltest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xseltest PRIVATE PkgConfig::KWPEX11)
 
