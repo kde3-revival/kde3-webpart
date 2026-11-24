@@ -2198,11 +2198,17 @@ static void netNote( WebKitWebView* view, const char* what )
 {
     if ( !KWPENetLog::enabled() || !view )
         return;
+    // the host only, as sent (encoded), nothing unprintable
     const char* uri = webkit_web_view_get_uri( view );
-    GUri* parsed = uri ? g_uri_parse( uri, G_URI_FLAGS_NONE, 0 ) : 0;
-    KWPENetLog::note( "view %p (%s): %s", static_cast<void*>( view ), parsed && g_uri_get_host( parsed ) ? g_uri_get_host( parsed ) : "-", what );
+    GUri* parsed = uri ? g_uri_parse( uri, G_URI_FLAGS_ENCODED, 0 ) : 0;
+    QCString host( parsed && g_uri_get_host( parsed ) ? g_uri_get_host( parsed ) : "-" );
     if ( parsed )
         g_uri_unref( parsed );
+    host.truncate( 100 );
+    for ( uint i = 0; i < host.length(); ++i )
+        if ( (unsigned char) host[i] < 0x20 || (unsigned char) host[i] >= 0x7f )
+            host[i] = '?';
+    KWPENetLog::note( "view %p (%s): %s", static_cast<void*>( view ), host.data(), what );
 }
 
 void KWPEWidget::showEvent( QShowEvent* )

@@ -68,14 +68,48 @@ gint64 elapsedMs( WebKitWebResource* resource )
     return start ? ( g_get_monotonic_time() - *start ) / 1000 : -1;
 }
 
+// A description of our own for an error: its message can hold whole URLs
+// (redirects, with queries and user names), so it is never printed.
+const char* describe( const GError* error )
+{
+    if ( error->domain == WEBKIT_NETWORK_ERROR ) {
+        switch ( error->code ) {
+        case WEBKIT_NETWORK_ERROR_FAILED: return "network failure";
+        case WEBKIT_NETWORK_ERROR_TRANSPORT: return "transport error";
+        case WEBKIT_NETWORK_ERROR_UNKNOWN_PROTOCOL: return "unknown protocol";
+        case WEBKIT_NETWORK_ERROR_CANCELLED: return "cancelled";
+        case WEBKIT_NETWORK_ERROR_FILE_DOES_NOT_EXIST: return "no such file";
+        }
+        return "network error";
+    }
+    if ( error->domain == WEBKIT_POLICY_ERROR )
+        return "policy (blocked, CORS, content filter...)";
+    // GIO, resolver, TLS errors: the enum's own short name
+    GType type = G_TYPE_INVALID;
+    if ( error->domain == G_IO_ERROR )
+        type = G_TYPE_IO_ERROR_ENUM;
+    else if ( error->domain == G_RESOLVER_ERROR )
+        type = G_TYPE_RESOLVER_ERROR;
+    else if ( error->domain == G_TLS_ERROR )
+        type = G_TYPE_TLS_ERROR;
+    if ( type != G_TYPE_INVALID ) {
+        GEnumClass* klass = static_cast<GEnumClass*>( g_type_class_ref( type ) );
+        GEnumValue* value = g_enum_get_value( klass, error->code );
+        const char* nick = value ? value->value_nick : "unknown";   // static strings of GIO
+        g_type_class_unref( klass );
+        return nick;
+    }
+    return "other";
+}
+
 void onFailed( WebKitWebResource* resource, GError* error, gpointer )
 {
     // a load the page or WebKit gave up itself (navigation, abort())
     if ( g_error_matches( error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED ) )
         return;
     gchar* uri = shortURI( resource );
-    KWPENetLog::note( "FAILED %s after %lld ms: %s %d: %s", uri, (long long) elapsedMs( resource ),
-                      g_quark_to_string( error->domain ), error->code, error->message );
+    KWPENetLog::note( "FAILED %s after %lld ms: %s %d (%s)", uri, (long long) elapsedMs( resource ),
+                      g_quark_to_string( error->domain ), error->code, describe( error ) );
     g_free( uri );
 }
 
