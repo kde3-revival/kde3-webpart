@@ -981,8 +981,15 @@ static KWPEAppWebKit* ensureAppWebKit( const KWPEAppOptions& options )
                       G_CALLBACK( onInitializeNotificationPermissions ), app );
 
     app->settings = webkit_settings_new();
-    if ( !options.userAgent.isEmpty() )
+    if ( !options.userAgent.isEmpty() ) {
         webkit_settings_set_user_agent( app->settings, options.userAgent.utf8().data() );
+        // WebKit's site-specific quirks replace the user agent for some
+        // sites (web.whatsapp.com: a Mac's), whatever was set: the
+        // application's own is the one it chose.  (All of the quirks go:
+        // WebKit has one switch; none for web.whatsapp.com but the user
+        // agent.)
+        webkit_settings_set_enable_site_specific_quirks( app->settings, FALSE );
+    }
     webkit_settings_set_enable_developer_extras( app->settings, envFlag( "KWPE_DEVELOPER_EXTRAS" ) );
     webkit_settings_set_allow_file_access_from_file_urls( app->settings, FALSE );
     webkit_settings_set_allow_universal_access_from_file_urls( app->settings, FALSE );
