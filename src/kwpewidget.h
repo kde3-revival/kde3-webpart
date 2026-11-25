@@ -42,6 +42,10 @@ struct KWPEAppOptions
         with CORS (crossOrigin "anonymous"): a server that does not allow
         it gives no picture.  The host fetches nothing. */
     QStringList pictureOrigins;
+    /** Origins whose notifications are allowed from the start, as if the
+        user had allowed them, unless the user denied them (the site the
+        application is made for: it does not need to ask). */
+    QStringList notificationOrigins;
     /** On stderr: why a notification's picture was not taken, with only
         the scheme and host of its URL (refused: not an origin allowed;
         failed: not loaded, or CORS refused; timed out). */

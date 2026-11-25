@@ -89,6 +89,7 @@ static KWPEAppOptions appOptions( const QStringList& args )
     options.userAgent = argument( args, "userAgent" );
     options.sites = QStringList::split( ',', argument( args, "sites" ) );
     options.pictureOrigins = QStringList::split( ',', argument( args, "pictureOrigins" ) );
+    options.notificationOrigins = QStringList::split( ',', argument( args, "notifications" ) );
     options.debug = argument( args, "debug" ) == "true";
     return options;
 }

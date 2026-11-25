@@ -957,7 +957,8 @@ static KWPEAppWebKit* ensureAppWebKit( const KWPEAppOptions& options )
     // One rule everywhere, WebKit's: an origin both allowed and denied is
     // denied.
     app->deniedNotifications = canonicalOrigins( app->deniedNotifications );
-    app->allowedNotifications = canonicalOrigins( app->allowedNotifications );
+    // The application's own site: allowed unless the user denied it.
+    app->allowedNotifications = canonicalOrigins( app->allowedNotifications + options.notificationOrigins );
     for ( QStringList::ConstIterator it = app->deniedNotifications.begin(); it != app->deniedNotifications.end(); ++it )
         app->allowedNotifications.remove( *it );
     if ( getenv( "KWPE_DEBUG" ) )

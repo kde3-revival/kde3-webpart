@@ -91,7 +91,9 @@ public:
      * $KDEHOME/share/apps/NAME/webkit/; HTTP cache in KDE's cache
      * directory), optional "userAgent=STRING" and "sites=HOST,HOST" (the
      * hosts shown in the part; default: the host of the first URL
-     * opened).  Links to other sites, new windows, mailto: and other
+     * opened). "notifications=ORIGIN,ORIGIN": origins whose
+     * notifications are allowed from the start, unless the user denied
+     * them.  Links to other sites, new windows, mailto: and other
      * schemes go to the host through the browser extension's
      * openURLRequest(); downloads, uploads, the page's dialogs as in
      * Konqueror; notifications and permission requests are signals for
