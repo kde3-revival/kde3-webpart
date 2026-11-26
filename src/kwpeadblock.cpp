@@ -1093,7 +1093,7 @@ void KWPEAdBlock::convert()
                 md5.update( f );
         }
     }
-    md5.update( QCString( "kwpe-filterconv 3" ) );
+    md5.update( QCString( "kwpe-filterconv 4" ) );
     s.newHash = QString::fromLatin1( md5.hexDigest() );
     KConfig* c = KWPESettings::config();
     c->setGroup( "AdBlock" );

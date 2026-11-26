@@ -176,6 +176,8 @@ std::string toJSON( const std::vector<Converter::Rule>& rules )
             std::vector<std::string> l( 1, r.loadType );
             appendJSONList( out, "load-type", l );
         }
+        if ( !r.loadContext.empty() )
+            appendJSONList( out, "load-context", r.loadContext );
         // Sites as anchored top URL patterns, not WebKit's "if-domain":
         // that one finds the domain anywhere in the URL ("?next=http://
         // example.com/" would count as example.com).
@@ -1664,22 +1666,34 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
         r.urlFilter = ".*";
         r.action = "css-display-none";
         r.selector = c.selector;
-        // A rule for some sites only (or not for some): WebKit decides it
-        // on the loads of documents, not on every picture and script.
-        // Its top URL condition is no condition of the URL filter: every
-        // load of every page would gather all of these rules (tens of
-        // thousands) and look each one up among the top URL's; a page of
-        // a hundred resources paid tens of milliseconds for it before
-        // its first paint.  The page's selectors come with its own load,
-        // and with the load of each frame (the frame's document), as
-        // before.  (Generic rules without exceptions are WebKit's one
-        // style sheet for every page, they have no condition to check.)
-        if ( !c.include.empty() || !exclude.empty() )
+        // A rule for some sites only (or not for some): not decided on
+        // every load of the page.  Its top URL condition is no condition
+        // of the URL filter: every load of every page would gather all
+        // of these rules (tens of thousands) and look each one up among
+        // the top URL's; a page of a hundred resources paid tens of
+        // milliseconds for it before its first paint.  Two rules of the
+        // selector instead: one on the loads of documents (the page's
+        // own: its selectors come with it), one on every load in a
+        // frame, as before: a data: frame, or about:blank written by a
+        // script, has no document load WebKit decides on (an ad's
+        // favourite), its selectors come with its pictures and scripts.
+        // WebKit tests the type flags first and skips the rest of the
+        // page's loads.  (Generic rules without exceptions are WebKit's
+        // one style sheet for every page, they have no condition.)
+        bool conditional = !c.include.empty() || !exclude.empty();
+        if ( conditional )
             r.resourceTypes.push_back( "document" );
+        Rule inFrames = r;
+        inFrames.resourceTypes.clear();
+        inFrames.loadContext.push_back( "child-frame" );
         if ( c.include.empty() ) {
-            for ( size_t e = 0; e < exclude.size(); ++e )
+            for ( size_t e = 0; e < exclude.size(); ++e ) {
                 r.unlessDomain.push_back( exclude[e] );
+                inFrames.unlessDomain.push_back( exclude[e] );
+            }
             generic.push_back( r );
+            if ( conditional )
+                generic.push_back( inFrames );
             stats.cosmeticGeneric++;
             continue;
         }
@@ -1699,6 +1713,8 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
             continue;
         }
         specific.push_back( r );
+        inFrames.ifDomain = r.ifDomain;
+        specific.push_back( inFrames );
         stats.cosmeticSpecific++;
     }
 

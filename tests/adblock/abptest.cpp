@@ -291,8 +291,10 @@ int main()
     {
         std::vector<Rule> r = convert( "##.ad\nexample.com##.x\n@@||a.com^$generichide" );
         // generichide: only in the list of generic css rules
-        expectEq( "generichide placement", r.size() == 3 ? r[0].action + " " + r[1].action + " " + r[2].action : std::to_string( r.size() ),
-                  "css-display-none ignore-previous-rules css-display-none" );
+        // (a site's selector: two rules, see "cosmetic triggers")
+        expectEq( "generichide placement", r.size() == 4 ? r[0].action + " " + r[1].action + " " + r[2].action + " " + r[3].action
+                                                         : std::to_string( r.size() ),
+                  "css-display-none ignore-previous-rules css-display-none css-display-none" );
     }
     dropped( "@@*$document", "exception-everything" );
 
@@ -374,13 +376,18 @@ int main()
     }
     dropped( "a.com##.x[", "cosmetic-syntax" );
     {
-        // decided on document loads only; generic ones stay unconditioned
-        // (WebKit's style sheet for every page)
+        // decided on document loads and on every load in a frame;
+        // generic ones stay unconditioned (WebKit's style sheet for
+        // every page)
         std::vector<Rule> r = convert( "a.com##.ad\n##.x\n##.y\nb.org#@#.y" );
         std::string types;
         for ( size_t i = 0; i < r.size(); ++i )
-            types += ( i ? " " : "" ) + r[i].selector + ":" + join( r[i].resourceTypes );
-        expectEq( "cosmetic resource types", types, ".x: .y:document .ad:document" );
+            types += ( i ? " " : "" ) + r[i].selector + ":" + join( r[i].resourceTypes ) + "/" + join( r[i].loadContext )
+                     + "/" + join( r[i].ifDomain ) + join( r[i].unlessDomain );
+        expectEq( "cosmetic triggers", types,
+                  ".x:// .y:document//b.org .y:/child-frame/b.org .ad:document//a.com .ad:/child-frame/a.com" );
+        expectEq( "load-context in JSON", ABP::toJSON( convert( "a.com##.ad" ) ).find( "\"load-context\":[\"child-frame\"]" )
+                  != std::string::npos ? "ok" : "missing", "ok" );
     }
 
     // --- sites as top URL patterns (not WebKit's if-domain) -----------

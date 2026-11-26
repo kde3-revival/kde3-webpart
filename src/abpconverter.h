@@ -69,6 +69,7 @@ public:
         bool caseSensitive;
         std::vector<std::string> resourceTypes;   // empty: any
         std::string loadType;                      // "", "first-party", "third-party"
+        std::vector<std::string> loadContext;      // empty: any; "top-frame", "child-frame"
         std::vector<std::string> ifDomain;       // sites (and their subdomains)
         std::vector<std::string> unlessDomain;
         std::vector<std::string> ifTopURL;
