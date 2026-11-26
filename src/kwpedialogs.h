@@ -99,7 +99,7 @@ private:
 /**
  * The page's web process stopped responding: stop it, or wait?  Not
  * modal (no nested event loop: the view may go meanwhile); answered()
- * once, then the dialog deletes itself.
+ * once, its deletion already scheduled (deleteLater()).
  */
 class KWPEUnresponsiveDialog : public KDialogBase
 {

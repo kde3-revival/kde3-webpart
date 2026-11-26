@@ -270,8 +270,10 @@ KWPEUnresponsiveDialog::KWPEUnresponsiveDialog( const QString& site, QWidget* pa
 void KWPEUnresponsiveDialog::done( int result )
 {
     KDialogBase::done( result );
-    emit answered( result == Yes );
+    // Gone before the answer is told (its receiver is the view, whose
+    // child this is): not touched after the signal.
     deleteLater();
+    emit answered( result == Yes );
 }
 
 #include "kwpedialogs.moc"

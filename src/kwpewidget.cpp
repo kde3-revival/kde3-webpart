@@ -1098,7 +1098,7 @@ public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
           mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationGeneration( 0 ), announcementsLost( false ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), askingUnresponsive( false ), processGone( false ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), unresponsiveTimer( 0 ), stuck( false ), probing( false ), processGone( false ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -1280,9 +1280,14 @@ public:
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
     unsigned authSerial;         // counts the requests (a new one may reuse the address of an old one)
     gint64 lastCrashReload;      // when the page was reloaded after a crash
-    bool askingUnresponsive;     // askUnresponsive() is due or asking
+    // the question about a stuck web process: due (the timer runs) or open
+    QTimer* unresponsiveTimer;
     QGuardedPtr<KWPEUnresponsiveDialog> unresponsiveDialog;
-    void closeUnresponsiveDialog();
+    bool stuck;     // WebKit said "not responding", no life sign since
+    bool probing;   // a script was sent to see whether it answers
+    void scheduleUnresponsiveQuestion( int ms );
+    void closeUnresponsiveDialog( bool forget );
+    static void onProbeAnswered( GObject* view, GAsyncResult* result, gpointer data );
     bool processGone;            // the web process ended, no load since
     unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
@@ -1469,7 +1474,8 @@ void KWPEWidgetPrivate::destroy()
         return;
     // A dialog of the page answers WebKit (cancelled) while the view lives.
     closePageDialogs();
-    closeUnresponsiveDialog();
+    bool wasStuck = stuck;
+    closeUnresponsiveDialog( true );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_back_forward_list( view ), this );
     g_signal_handlers_disconnect_by_data( webkit_web_view_get_find_controller( view ), this );
     g_cancellable_cancel( cancellable );
@@ -1479,7 +1485,7 @@ void KWPEWidgetPrivate::destroy()
     g_object_set_data( G_OBJECT( view ), widgetKey, 0 );
     // A web process stuck in a script does not notice that its page is
     // gone (it kept a core after Konqueror quit): stopped with the view.
-    if ( !webkit_web_view_get_is_web_process_responsive( view ) )
+    if ( wasStuck || !webkit_web_view_get_is_web_process_responsive( view ) )
         webkit_web_view_terminate_web_process( view );
     KWPE::attachView( wpeView, 0, 0 );
     forgetItems( 0 );
@@ -1625,7 +1631,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
         // dialogs must not stay over it (WebKit closes them only when the
         // view goes).
         d->closePageDialogs();
-        d->closeUnresponsiveDialog();
+        d->closeUnresponsiveDialog( true );
         d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( view ) );
         d->tokenForItem( d->shownItem, &isNew );
         d->url = QString::fromUtf8( webkit_web_view_get_uri( view ) );
@@ -2511,7 +2517,7 @@ void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcess
     d->loading = false;
     d->failed = true;
     d->processGone = true;
-    d->closeUnresponsiveDialog();
+    d->closeUnresponsiveDialog( true );
     if ( reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API )
         return;
     fprintf( stderr, "kwpe: the web process of %s %s\n", d->url.utf8().data(),
@@ -2540,19 +2546,56 @@ static const int unresponsiveAskMs = 10000;
 // in an endless loop (or a page that keeps it that busy) takes a core,
 // the page stops painting and taking input, until its process is
 // stopped; Konqueror itself goes on.  The user is asked whether to stop
-// it if it stays so, outside WebKit's signal (and only for the page shown: a page in
-// another tab is asked about when it comes back).
+// it if it stays so, outside WebKit's signal (and only for the page
+// shown: a page in another tab is asked about when it comes back).
+// WebKit says "responding" again when the view is hidden, whatever the
+// process does (and checks no more: the input it waits for an answer to
+// is still queued): not taken for a life sign; when the page is shown
+// again, a script is sent, and the question comes if it gets no answer.
 void KWPEWidgetPrivate::onResponsiveChanged( WebKitWebView* view, GParamSpec*, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     bool responsive = webkit_web_view_get_is_web_process_responsive( view );
     netNote( view, responsive ? "web process responding again" : "web process not responding" );
-    if ( responsive )
-        d->closeUnresponsiveDialog();
-    if ( !responsive && !d->isMail() && !d->askingUnresponsive && d->q->isVisible() ) {
-        d->askingUnresponsive = true;
-        QTimer::singleShot( unresponsiveAskMs, d->q, SLOT( askUnresponsive() ) );
+    if ( !responsive ) {
+        d->stuck = true;
+        if ( d->q->isVisible() )
+            d->scheduleUnresponsiveQuestion( unresponsiveAskMs );
+    } else if ( d->q->isVisible() ) {
+        d->closeUnresponsiveDialog( true );
     }
+}
+
+void KWPEWidgetPrivate::onProbeAnswered( GObject* view, GAsyncResult* result, gpointer data )
+{
+    GError* error = 0;
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish( WEBKIT_WEB_VIEW( view ), result, &error );
+    if ( !value ) {
+        // Cancelled: the widget is gone (data is too).  Otherwise the
+        // process ended: the termination handler saw to it.
+        g_error_free( error );
+        return;
+    }
+    g_object_unref( value );
+    // A life sign: the page was busy, not stuck (also when it comes
+    // after the question was asked: WebKit, which no longer checks, would
+    // not say so).
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    if ( d->stuck )
+        d->closeUnresponsiveDialog( true );
+}
+
+// The question in @p ms, unless it is due or open already (or the view
+// is a message's: no page scripts).
+void KWPEWidgetPrivate::scheduleUnresponsiveQuestion( int ms )
+{
+    if ( isMail() || unresponsiveDialog || ( unresponsiveTimer && unresponsiveTimer->isActive() ) )
+        return;
+    if ( !unresponsiveTimer ) {
+        unresponsiveTimer = new QTimer( q );
+        QObject::connect( unresponsiveTimer, SIGNAL( timeout() ), q, SLOT( askUnresponsive() ) );
+    }
+    unresponsiveTimer->start( ms, true );
 }
 
 void KWPEWidgetPrivate::onInsecureContent( WebKitWebView*, WebKitInsecureContentEvent, gpointer data )
@@ -2643,12 +2686,17 @@ gboolean KWPEWidgetPrivate::onScriptDialog( WebKitWebView* view, WebKitScriptDia
     return TRUE;
 }
 
-// The question about a stuck web process, unanswered: gone (the process
-// answers again, another page, the process ended, the view goes, the
-// view is hidden); asked again when it is due.
-void KWPEWidgetPrivate::closeUnresponsiveDialog()
+// The question about a stuck web process, unanswered, and its timer:
+// gone.  @p forget: the process is not stuck any more (it answers
+// again, another page, the process ended, the view goes); otherwise
+// (the view is hidden) the question is asked when it is shown again.
+void KWPEWidgetPrivate::closeUnresponsiveDialog( bool forget )
 {
-    askingUnresponsive = false;
+    if ( forget )
+        stuck = false;
+    probing = false;
+    if ( unresponsiveTimer )
+        unresponsiveTimer->stop();
     if ( !unresponsiveDialog )
         return;
     unresponsiveDialog->disconnect( q );
@@ -3517,12 +3565,18 @@ void KWPEWidget::reloadAfterCrash()
 
 void KWPEWidget::askUnresponsive()
 {
-    if ( d->unresponsiveDialog )
+    if ( d->unresponsiveDialog || !d->view || !d->stuck || !isVisible() )
         return;
-    if ( !d->view || webkit_web_view_get_is_web_process_responsive( d->view ) || !isVisible() ) {
-        d->askingUnresponsive = false;
+    // WebKit's word is gone with a hidden view: a script tells, an
+    // answer within three seconds clears it (onProbeAnswered()).
+    if ( webkit_web_view_get_is_web_process_responsive( d->view ) && !d->probing ) {
+        d->probing = true;
+        webkit_web_view_evaluate_javascript( d->view, "0", -1, "kwpepart", 0, d->cancellable,
+                                             KWPEWidgetPrivate::onProbeAnswered, d );
+        d->unresponsiveTimer->start( 3000, true );
         return;
     }
+    d->probing = false;
     // Not modal: the part may go while the question is open (a tab
     // closed, Konqueror quitting), the dialog goes with it.
     QString host = KURL( d->url ).host();
@@ -3532,25 +3586,33 @@ void KWPEWidget::askUnresponsive()
     d->unresponsiveDialog->raise();
 }
 
+// Inside the dialog's signal: nothing here may delete the view (the
+// host may, on the signals of a stopped page): stopping comes after.
 void KWPEWidget::unresponsiveAnswered( bool stop )
 {
     d->unresponsiveDialog = 0;   // it deletes itself
-    // Answering again meanwhile (the dialog was closed then): nothing to do.
-    if ( !d->view || webkit_web_view_get_is_web_process_responsive( d->view ) ) {
-        d->askingUnresponsive = false;
+    // (answering again meanwhile closed the dialog: no answer then)
+    if ( !d->view || !d->stuck )
         return;
-    }
-    if ( stop ) {
-        bool wasLoading = d->loading;
-        webkit_web_view_terminate_web_process( d->view );
-        if ( wasLoading )
-            emit loadFailed( QString::null );
+    if ( stop )
+        QTimer::singleShot( 0, this, SLOT( stopUnresponsive() ) );
+    else   // asked again in a while if it is still stuck
+        d->scheduleUnresponsiveQuestion( 30000 );
+}
+
+void KWPEWidget::stopUnresponsive()
+{
+    if ( !d->view || !d->stuck )
+        return;
+    // Our state first: the host may delete this view on the signals.
+    bool wasLoading = d->loading;
+    webkit_web_view_terminate_web_process( d->view );
+    d->closeUnresponsiveDialog( true );
+    QGuardedPtr<KWPEWidget> self( this );
+    if ( wasLoading )
+        emit loadFailed( QString::null );
+    if ( self )
         emit webProcessStopped();
-        d->askingUnresponsive = false;
-        return;
-    }
-    // waiting: asked again in a while if it is still stuck
-    QTimer::singleShot( 30000, this, SLOT( askUnresponsive() ) );
 }
 
 void KWPEWidget::emitUnsupportedContent()
@@ -3774,10 +3836,10 @@ void KWPEWidget::showEvent( QShowEvent* )
     if ( d->pageDialog && !d->pageDialog->isVisible() )
         d->showPageDialog( d->pageDialog );
     // A page that stopped responding in another tab.
-    if ( !d->isMail() && !d->askingUnresponsive && !webkit_web_view_get_is_web_process_responsive( d->view ) ) {
-        d->askingUnresponsive = true;
-        QTimer::singleShot( unresponsiveAskMs, this, SLOT( askUnresponsive() ) );
-    }
+    if ( !webkit_web_view_get_is_web_process_responsive( d->view ) )
+        d->stuck = true;
+    if ( d->stuck )
+        d->scheduleUnresponsiveQuestion( unresponsiveAskMs );
     wpe_toplevel_state_changed( d->toplevel, isActiveWindow() ? WPE_TOPLEVEL_STATE_ACTIVE : WPE_TOPLEVEL_STATE_NONE );
     // WebKit takes the pointer as inside until it is told otherwise (the
     // overlay scrollbars stay shown and keep repainting).
@@ -3791,7 +3853,7 @@ void KWPEWidget::hideEvent( QHideEvent* )
     if ( d->pageDialog )
         d->pageDialog->hide();
     // (asked again if the page is still stuck when it comes back)
-    d->closeUnresponsiveDialog();
+    d->closeUnresponsiveDialog( false );
     if ( d->wpeView )
         wpe_view_unmap( d->wpeView );
     netNote( d->view, "hidden (the page is told it is not visible)" );
