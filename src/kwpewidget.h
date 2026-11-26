@@ -314,6 +314,7 @@ private slots:
     void answerQuietDialogs();
     void reloadAfterCrash();
     void askUnresponsive();
+    void unresponsiveAnswered( bool stop );
     void askAuthentication();
     void adBlockChanged();
     void reloadForFilters();

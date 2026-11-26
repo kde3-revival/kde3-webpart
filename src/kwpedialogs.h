@@ -96,4 +96,24 @@ private:
     QCheckBox* m_suppress;
 };
 
+/**
+ * The page's web process stopped responding: stop it, or wait?  Not
+ * modal (no nested event loop: the view may go meanwhile); answered()
+ * once, then the dialog deletes itself.
+ */
+class KWPEUnresponsiveDialog : public KDialogBase
+{
+    Q_OBJECT
+
+public:
+    KWPEUnresponsiveDialog( const QString& site, QWidget* page );
+
+signals:
+    /** @p stop: "Stop Page"; otherwise "Wait" (or the dialog closed). */
+    void answered( bool stop );
+
+protected:
+    virtual void done( int result );
+};
+
 #endif

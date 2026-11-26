@@ -249,4 +249,29 @@ void KWPEScriptDialog::done( int result )
     deleteLater();
 }
 
+KWPEUnresponsiveDialog::KWPEUnresponsiveDialog( const QString& site, QWidget* page )
+    : KDialogBase( i18n( "Page Not Responding" ), Yes | No, No, No, page, "kwpeunresponsivedialog", false, true,
+                   KGuiItem( i18n( "&Stop Page" ), "stop" ), KGuiItem( i18n( "&Wait" ) ) )
+{
+    QWidget* main = makeMainWidget();
+    QHBoxLayout* layout = new QHBoxLayout( main, 0, KDialog::spacingHint() );
+    QLabel* icon = new QLabel( main );
+    icon->setPixmap( DesktopIcon( "messagebox_warning", 32 ) );
+    layout->addWidget( icon, 0, AlignTop );
+    QLabel* text = new QLabel( main );
+    text->setTextFormat( PlainText );
+    text->setAlignment( AlignLeft | AlignTop | WordBreak );
+    text->setText( i18n( "The page %1 is not responding: a script on it may be busy, or caught in an endless loop. "
+                         "Stop the page, or wait for it?" ).arg( site ) );
+    text->setMinimumWidth( 300 );
+    layout->addWidget( text, 1 );
+}
+
+void KWPEUnresponsiveDialog::done( int result )
+{
+    KDialogBase::done( result );
+    emit answered( result == Yes );
+    deleteLater();
+}
+
 #include "kwpedialogs.moc"
