@@ -180,6 +180,7 @@ private slots:
     void slotFindPrevious();
     void slotFindResult( bool found, unsigned matches );
     void slotWebProcessFailed( bool crashed );
+    void slotWebProcessStopped();
     void updatePageSecurity();
     void slotZoomIn();
     void slotZoomOut();

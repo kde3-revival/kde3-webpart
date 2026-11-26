@@ -45,6 +45,7 @@
 #include <kmdcodec.h>
 #include <ksimpleconfig.h>
 #include <kio/passdlg.h>
+#include <kmessagebox.h>
 #include <klocale.h>
 #include <kmimetype.h>
 #include <kurl.h>
@@ -1098,7 +1099,7 @@ public:
     KWPEWidgetPrivate( KWPEWidget* widget, KWPEWidget::Mode m )
         : q( widget ), mode( m ), pendingMailExternal( false ), mailExternalSession( 0 ), viewExternal( false ),
           mailFilterAdded( false ), mailAtBottom( true ), app( 0 ), notificationHello( false ), notificationGeneration( 0 ), announcementsLost( false ), notificationSerial( 0 ), menuEditable( false ), lastReturnToApp( 0 ), ownBlank( false ), view( 0 ), wpeView( 0 ), toplevel( 0 ), contentManager( 0 ), reloadForFilters( false ), redirected( false ), loading( false ), failed( false ), ownBackForward( false ), shownItem( 0 ),
-          menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
+          menuSelection( false ), overEditable( false ), cancellable( 0 ), suppressDialogs( false ), insecureContent( false ), authRequest( 0 ), authSerial( 0 ), lastCrashReload( 0 ), askingUnresponsive( false ), processGone( false ), frameCallback( 0 ), statsTimer( 0 ), loadStart( 0 ), firstPaintPending( false ), statsEnabled( false )
     {
     }
 
@@ -1140,6 +1141,7 @@ public:
     static void onBackForwardChanged( WebKitBackForwardList*, WebKitBackForwardListItem*, GList* removed, gpointer data );
     static void onFrameDisplayed( WebKitWebView*, gpointer data );
     static void onWebProcessTerminated( WebKitWebView*, WebKitWebProcessTerminationReason reason, gpointer data );
+    static void onResponsiveChanged( WebKitWebView* view, GParamSpec*, gpointer data );
     static void onInsecureContent( WebKitWebView*, WebKitInsecureContentEvent, gpointer data );
     static gboolean onAuthenticate( WebKitWebView*, WebKitAuthenticationRequest* request, gpointer data );
     static void onAuthenticationCancelled( WebKitAuthenticationRequest*, gpointer data );
@@ -1279,6 +1281,8 @@ public:
     WebKitAuthenticationRequest* authRequest;   // waiting for the password dialog (ref)
     unsigned authSerial;         // counts the requests (a new one may reuse the address of an old one)
     gint64 lastCrashReload;      // when the page was reloaded after a crash
+    bool askingUnresponsive;     // askUnresponsive() is due or asking
+    bool processGone;            // the web process ended, no load since
     unsigned frameCallback;      // KWPE_STATS frame-displayed callback
 
     QTimer* statsTimer;
@@ -1401,6 +1405,7 @@ void KWPEWidgetPrivate::create()
                       G_CALLBACK( onBackForwardChanged ), this );
     g_signal_connect( view, "context-menu", G_CALLBACK( onContextMenu ), this );
     g_signal_connect( view, "web-process-terminated", G_CALLBACK( onWebProcessTerminated ), this );
+    g_signal_connect( view, "notify::is-web-process-responsive", G_CALLBACK( onResponsiveChanged ), this );
     g_signal_connect( view, "permission-request", G_CALLBACK( onPermissionRequest ), this );
     g_signal_connect( view, "insecure-content-detected", G_CALLBACK( onInsecureContent ), this );
     g_signal_connect( view, "authenticate", G_CALLBACK( onAuthenticate ), this );
@@ -1556,6 +1561,7 @@ void KWPEWidgetPrivate::onLoadChanged( WebKitWebView* view, WebKitLoadEvent even
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
     switch ( event ) {
     case WEBKIT_LOAD_STARTED:
+        d->processGone = false;
         d->notificationHello = false;
         d->reloadForFilters = false;
         d->redirected = false;
@@ -1671,6 +1677,10 @@ void KWPEWidgetPrivate::onUriChanged( GObject*, GParamSpec*, gpointer data )
     // LOAD_STARTED): is_loading() counts that pending request.
     if ( d->loading || webkit_web_view_is_loading( d->view ) || uri == d->url )
         return;
+    // The web process ended: WebKit forgets the URI, the page shown
+    // (its last frame) keeps it, for Reload.
+    if ( d->processGone && uri.isEmpty() )
+        return;
     d->ownBackForward = false;
     bool isNew = false;
     d->shownItem = webkit_back_forward_list_get_current_item( webkit_web_view_get_back_forward_list( d->view ) );
@@ -1689,6 +1699,9 @@ void KWPEWidgetPrivate::onTitleChanged( GObject*, GParamSpec*, gpointer data )
 void KWPEWidgetPrivate::onProgressChanged( GObject*, GParamSpec*, gpointer data )
 {
     KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    // (reset when the web process ended: no load to show)
+    if ( d->processGone )
+        return;
     emit d->q->loadProgress( int( webkit_web_view_get_estimated_load_progress( d->view ) * 100.0 + 0.5 ) );
 }
 
@@ -2490,6 +2503,7 @@ void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcess
     bool wasLoading = d->loading;
     d->loading = false;
     d->failed = true;
+    d->processGone = true;
     if ( reason == WEBKIT_WEB_PROCESS_TERMINATED_BY_API )
         return;
     fprintf( stderr, "kwpe: the web process of %s %s\n", d->url.utf8().data(),
@@ -2505,6 +2519,29 @@ void KWPEWidgetPrivate::onWebProcessTerminated( WebKitWebView*, WebKitWebProcess
         QTimer::singleShot( 0, d->q, SLOT( reloadAfterCrash() ) );
     } else {
         emit d->q->webProcessFailed( reason == WEBKIT_WEB_PROCESS_CRASHED );
+    }
+}
+
+static void netNote( WebKitWebView* view, const char* what );
+
+// A page busy for a while (a heavy script on a slow machine) is not
+// asked about at once: after WebKit's three seconds, ten more.
+static const int unresponsiveAskMs = 10000;
+
+// WebKit had no answer from the web process for a few seconds: a script
+// in an endless loop (or a page that keeps it that busy) takes a core,
+// the page stops painting and taking input, until its process is
+// stopped; Konqueror itself goes on.  The user is asked whether to stop
+// it if it stays so, outside WebKit's signal (and only for the page shown: a page in
+// another tab is asked about when it comes back).
+void KWPEWidgetPrivate::onResponsiveChanged( WebKitWebView* view, GParamSpec*, gpointer data )
+{
+    KWPEWidgetPrivate* d = static_cast<KWPEWidgetPrivate*>( data );
+    bool responsive = webkit_web_view_get_is_web_process_responsive( view );
+    netNote( view, responsive ? "web process responding again" : "web process not responding" );
+    if ( !responsive && !d->isMail() && !d->askingUnresponsive && d->q->isVisible() ) {
+        d->askingUnresponsive = true;
+        QTimer::singleShot( unresponsiveAskMs, d->q, SLOT( askUnresponsive() ) );
     }
 }
 
@@ -3454,6 +3491,33 @@ void KWPEWidget::reloadAfterCrash()
         webkit_web_view_reload( d->view );
 }
 
+void KWPEWidget::askUnresponsive()
+{
+    QGuardedPtr<KWPEWidget> self( this );
+    if ( d->view && !webkit_web_view_get_is_web_process_responsive( d->view ) && isVisible() ) {
+        QString host = KURL( d->url ).host();
+        int answer = KMessageBox::warningYesNo( this,
+            i18n( "The page %1 is not responding: a script on it may be busy, or caught in an endless loop. "
+                  "Stop the page, or wait for it?" ).arg( host.isEmpty() ? d->url : host ),
+            i18n( "Page Not Responding" ), KGuiItem( i18n( "&Stop Page" ), "stop" ), KGuiItem( i18n( "&Wait" ) ) );
+        if ( !self )
+            return;
+        // Answering again meanwhile: nothing to stop.
+        if ( answer == KMessageBox::Yes && d->view && !webkit_web_view_get_is_web_process_responsive( d->view ) ) {
+            bool wasLoading = d->loading;
+            webkit_web_view_terminate_web_process( d->view );
+            if ( wasLoading )
+                emit loadFailed( QString::null );
+            emit webProcessStopped();
+        } else if ( d->view && !webkit_web_view_get_is_web_process_responsive( d->view ) ) {
+            // waiting: asked again in a while if it is still stuck
+            QTimer::singleShot( 30000, this, SLOT( askUnresponsive() ) );
+            return;
+        }
+    }
+    d->askingUnresponsive = false;
+}
+
 void KWPEWidget::emitUnsupportedContent()
 {
     QString url = d->unsupportedUrl;
@@ -3674,6 +3738,11 @@ void KWPEWidget::showEvent( QShowEvent* )
     netNote( d->view, isActiveWindow() ? "shown, window active" : "shown, window inactive" );
     if ( d->pageDialog && !d->pageDialog->isVisible() )
         d->showPageDialog( d->pageDialog );
+    // A page that stopped responding in another tab.
+    if ( !d->isMail() && !d->askingUnresponsive && !webkit_web_view_get_is_web_process_responsive( d->view ) ) {
+        d->askingUnresponsive = true;
+        QTimer::singleShot( unresponsiveAskMs, this, SLOT( askUnresponsive() ) );
+    }
     wpe_toplevel_state_changed( d->toplevel, isActiveWindow() ? WPE_TOPLEVEL_STATE_ACTIVE : WPE_TOPLEVEL_STATE_NONE );
     // WebKit takes the pointer as inside until it is told otherwise (the
     // overlay scrollbars stay shown and keep repainting).

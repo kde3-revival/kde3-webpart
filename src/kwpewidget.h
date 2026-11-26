@@ -236,6 +236,11 @@ signals:
      * again within 30 s; otherwise: out of memory).  The last frame stays.
      */
     void webProcessFailed( bool crashed );
+    /**
+     * The web process stopped responding and the user had it stopped
+     * (the page is gone; a reload shows it again).
+     */
+    void webProcessStopped();
     /** hasInsecureContent() became true. */
     void insecureContentDetected();
     /** zoom() changed (setZoom(), Ctrl+wheel). */
@@ -308,6 +313,7 @@ private slots:
     void suppressDialogs();
     void answerQuietDialogs();
     void reloadAfterCrash();
+    void askUnresponsive();
     void askAuthentication();
     void adBlockChanged();
     void reloadForFilters();

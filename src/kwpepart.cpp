@@ -177,6 +177,7 @@ KWPEPart::KWPEPart( QWidget* parentWidget, const char* widgetName,
     connect( m_view, SIGNAL( sourceReady( const QString&, const QByteArray& ) ),
              SLOT( slotSourceReady( const QString&, const QByteArray& ) ) );
     connect( m_view, SIGNAL( webProcessFailed( bool ) ), SLOT( slotWebProcessFailed( bool ) ) );
+    connect( m_view, SIGNAL( webProcessStopped() ), SLOT( slotWebProcessStopped() ) );
     connect( m_view, SIGNAL( insecureContentDetected() ), SLOT( updatePageSecurity() ) );
 
     // Ad blocking: off for the site shown (a list in kwpepartrc), the
@@ -750,6 +751,14 @@ void KWPEPart::slotWebProcessFailed( bool crashed )
 {
     QString text = crashed ? i18n( "The page crashed again. Reload to try once more." )
                            : i18n( "The page used too much memory and was stopped. Reload to show it again." );
+    emit setStatusBarText( text );
+    if ( m_app )
+        emit statusMessage( text );
+}
+
+void KWPEPart::slotWebProcessStopped()
+{
+    QString text = i18n( "The page was stopped. Reload to show it again." );
     emit setStatusBarText( text );
     if ( m_app )
         emit statusMessage( text );
