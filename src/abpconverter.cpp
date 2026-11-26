@@ -1664,6 +1664,18 @@ std::vector<std::vector<Converter::Rule> > Converter::ruleLists( unsigned maxRul
         r.urlFilter = ".*";
         r.action = "css-display-none";
         r.selector = c.selector;
+        // A rule for some sites only (or not for some): WebKit decides it
+        // on the loads of documents, not on every picture and script.
+        // Its top URL condition is no condition of the URL filter: every
+        // load of every page would gather all of these rules (tens of
+        // thousands) and look each one up among the top URL's; a page of
+        // a hundred resources paid tens of milliseconds for it before
+        // its first paint.  The page's selectors come with its own load,
+        // and with the load of each frame (the frame's document), as
+        // before.  (Generic rules without exceptions are WebKit's one
+        // style sheet for every page, they have no condition to check.)
+        if ( !c.include.empty() || !exclude.empty() )
+            r.resourceTypes.push_back( "document" );
         if ( c.include.empty() ) {
             for ( size_t e = 0; e < exclude.size(); ++e )
                 r.unlessDomain.push_back( exclude[e] );

@@ -373,6 +373,15 @@ int main()
         expectEq( "entity cosmetic", c ? join( c->ifDomain ) : "", "example.*" );
     }
     dropped( "a.com##.x[", "cosmetic-syntax" );
+    {
+        // decided on document loads only; generic ones stay unconditioned
+        // (WebKit's style sheet for every page)
+        std::vector<Rule> r = convert( "a.com##.ad\n##.x\n##.y\nb.org#@#.y" );
+        std::string types;
+        for ( size_t i = 0; i < r.size(); ++i )
+            types += ( i ? " " : "" ) + r[i].selector + ":" + join( r[i].resourceTypes );
+        expectEq( "cosmetic resource types", types, ".x: .y:document .ad:document" );
+    }
 
     // --- sites as top URL patterns (not WebKit's if-domain) -----------
     {
