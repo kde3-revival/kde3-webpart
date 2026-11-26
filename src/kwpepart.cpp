@@ -751,16 +751,22 @@ void KWPEPart::slotWebProcessFailed( bool crashed )
 {
     QString text = crashed ? i18n( "The page crashed again. Reload to try once more." )
                            : i18n( "The page used too much memory and was stopped. Reload to show it again." );
+    // (the host may delete us while it shows the text)
+    const bool app = m_app;
+    QGuardedPtr<KWPEPart> self( this );
     emit setStatusBarText( text );
-    if ( m_app )
+    if ( self && app )
         emit statusMessage( text );
 }
 
 void KWPEPart::slotWebProcessStopped()
 {
     QString text = i18n( "The page was stopped. Reload to show it again." );
+    // (the host may delete us while it shows the text)
+    const bool app = m_app;
+    QGuardedPtr<KWPEPart> self( this );
     emit setStatusBarText( text );
-    if ( m_app )
+    if ( self && app )
         emit statusMessage( text );
 }
 
